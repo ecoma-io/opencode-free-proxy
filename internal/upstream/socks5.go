@@ -37,19 +37,19 @@ func (d *socks5Dialer) DialContext(ctx context.Context, _ string, addr string) (
 	// connect, and a proxy that accepts then never answers would otherwise
 	// strand the dial goroutine past any caller deadline (the HTTPS
 	// transport's ResponseHeaderTimeout never starts — Client.Do has not
-	// returned yet). Reads/watch below have no ctx of their own, hence the
-	// watcher: ctx cancellation mid-handshake closes the conn, aborting the
+	// returned yet). Reads below have no ctx of their own, hence the
+	// ctx-abort: cancellation mid-handshake closes the conn, aborting the
 	// in-flight ReadFull. The deadline clears once the tunnel is established.
 	_ = conn.SetDeadline(time.Now().Add(config.ConnectTimeout))
-	handshakeDone := make(chan struct{})
-	defer close(handshakeDone)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-handshakeDone:
-		}
-	}()
+	// context.AfterFunc, not a select-watcher goroutine: a watcher selecting
+	// between ctx.Done() and a handshake-done channel may pick ctx.Done() —
+	// and Close() the just-returned LIVE tunnel — when both channels are
+	// ready simultaneously (Go's select picks randomly). AfterFunc arms only
+	// on ctx cancellation and stop() disarms it deterministically, so a
+	// completed handshake can never race its own teardown; stop() runs on
+	// every return below, so there is no watcher leak either.
+	stopWatcher := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopWatcher()
 	if err := d.negotiate(ctx, conn); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -104,6 +104,14 @@ func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			return err
 		}
+		// RFC 1929 §2: version 0x01 + status 0x00 is success; anything else
+		// is typed proxyAuthError. HONEST CAVEAT: a MALFORMED reply (a wrong
+		// version byte, garbage status — a hostile or broken proxy) is not
+		// strictly a credential verdict, yet it lands typed anyway because
+		// this 2-byte reply cannot distinguish rejection from corruption.
+		// The conservative typing is kept deliberately: both classes mark
+		// health and allow fallback identically, so only the label differs —
+		// and only this boundary code may produce the type either way.
 		if buf[0] != 0x01 || buf[1] != 0x00 {
 			return &proxyAuthError{msg: "socks5: proxy authentication failed"}
 		}

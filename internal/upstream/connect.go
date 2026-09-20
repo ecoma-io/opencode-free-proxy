@@ -78,20 +78,20 @@ func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net
 	// cancellation from the request, but a canceled CLIENT ctx must still
 	// tear the tunnel down; Deadline values survive WithoutCancel).
 	_ = conn.SetDeadline(deadlineFrom(ctx, config.ConnectTimeout))
-	handshakeDone := make(chan struct{})
-	defer close(handshakeDone)
+	// context.AfterFunc, not a select-watcher goroutine: a watcher that
+	// selects between ctx.Done() and a handshake-done channel flips a coin
+	// when BOTH become ready at once — it may Close() the just-returned live
+	// tunnel. AfterFunc arms ONLY on ctx cancellation, and stop() disarms it
+	// deterministically on the success path, so a completed handshake can
+	// never race its own teardown. There is no leak either way: stop() runs
+	// on every return below.
 	// Capture the conn AT SPAWN: conn is reassigned to the TLS wrapper below,
 	// and a closure reading the variable would race that write (go memory
 	// model). Closing the captured TCP conn is correct on every path — every
 	// later wrapper wraps exactly this conn.
 	dialConn := conn
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = dialConn.Close()
-		case <-handshakeDone:
-		}
-	}()
+	stopWatcher := context.AfterFunc(ctx, func() { _ = dialConn.Close() })
+	defer stopWatcher()
 
 	if d.proxy.Scheme == "https" {
 		// TLS to the proxy first (an https proxy endpoint); the CONNECT then
@@ -195,16 +195,20 @@ func (d *connectDialer) originTLSConfig(addr string) *tls.Config {
 	return cfg
 }
 
-// deadlineFrom returns now+def when the context carries no deadline, else
-// the earlier of the two; def <= 0 means "deadline already passed / none"
-// and clears (zero Time).
+// deadlineFrom arms a conn deadline for a dial bounded by def: now+def when
+// the context carries no deadline, the context's own deadline when it is
+// earlier (the caller's bound wins), or def when the context deadline is
+// later than def. def <= 0 never clears anything — with a deadline-less
+// context it would arm now+def, an already-expired deadline; no caller does
+// that today (the only caller passes config.ConnectTimeout). Clearing after
+// the handshake is the caller's own explicit SetDeadline(time.Time{}).
 func deadlineFrom(ctx context.Context, def time.Duration) time.Time {
 	dl, ok := ctx.Deadline()
-	if !ok || (def > 0 && time.Until(dl) > def) {
+	if !ok {
 		return time.Now().Add(def)
 	}
-	if !ok {
-		return time.Time{} // def <= 0 and no ctx deadline: clear
+	if def <= 0 || time.Until(dl) <= def {
+		return dl
 	}
-	return dl
+	return time.Now().Add(def)
 }
