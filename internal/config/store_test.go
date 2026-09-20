@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -376,4 +378,222 @@ routes: [{id: r, egress: [a]}]
 	if g := s.Get().Generation; g != g0 {
 		t.Fatalf("generation changed on rejected reload: %d -> %d", g0, g)
 	}
+}
+
+// reloadDocA / reloadDocB are two distinct VALID configs: one egress vs two,
+// so a snapshot's content names which document it was parsed from.
+const (
+	reloadDocA = `
+egress: [{id: a}]
+routes: [{id: r, egress: [a]}]
+`
+	reloadDocB = `
+egress: [{id: a}, {id: b}]
+routes: [{id: r, egress: [a, b]}]
+`
+)
+
+// TestLoadBytesMatchesLoadFile: LoadBytes is the pipeline behind LoadFile —
+// same bytes in, same snapshot out (it is what lets the store stamp a hash
+// over the bytes it actually parsed).
+func TestLoadBytesMatchesLoadFile(t *testing.T) {
+	dir := t.TempDir()
+	p := writeConfig(t, dir, "cfg.yaml", `
+egress:
+  - id: a
+    proxy: {type: http, url: "http://a.example:1"}
+    weight: 2
+  - id: b
+routes:
+  - id: stream
+    priority: 5
+    match: {streaming: true}
+    egress: [a, b]
+  - id: default
+    egress: [a, b]
+fallback: {max_attempts: 2}
+health: {failure_threshold: 4, cooldown: 12s}
+`)
+	fromFile, err := LoadFile(p)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromBytes, err := LoadBytes(raw)
+	if err != nil {
+		t.Fatalf("LoadBytes: %v", err)
+	}
+	if fromFile.Generation != 0 || fromBytes.Generation != 0 {
+		t.Fatal("a bare load must not stamp a generation (the store owns stamping)")
+	}
+	if len(fromFile.File.Egress) != len(fromBytes.File.Egress) || len(fromFile.Routes()) != len(fromBytes.Routes()) {
+		t.Fatalf("LoadFile and LoadBytes disagree: %+v vs %+v", fromFile.File, fromBytes.File)
+	}
+	for i := range fromFile.File.Egress {
+		a, b := fromFile.File.Egress[i], fromBytes.File.Egress[i]
+		if a.ID != b.ID || a.TransportSignature() != b.TransportSignature() || a.EffectiveWeight() != b.EffectiveWeight() {
+			t.Fatalf("egress %d differs: %+v vs %+v", i, a, b)
+		}
+	}
+	if fromFile.HealthThreshold() != fromBytes.HealthThreshold() ||
+		fromFile.HealthCooldown() != fromBytes.HealthCooldown() ||
+		fromFile.Fallback.MaxAttempts != fromBytes.Fallback.MaxAttempts {
+		t.Fatal("policies differ between LoadFile and LoadBytes")
+	}
+
+	// LoadBytes runs the full pipeline on its own account too: interpolation
+	// and validation both gate a snapshot behind the caller's bytes.
+	t.Setenv("OFP_TEST_RELOAD_URL", "http://env.example:9")
+	withEnv, err := LoadBytes([]byte(`
+egress: [{id: a, proxy: {type: http, url: "${OFP_TEST_RELOAD_URL}"}}]
+routes: [{id: r, egress: [a]}]
+`))
+	if err != nil {
+		t.Fatalf("interpolation through LoadBytes: %v", err)
+	}
+	if e, _ := withEnv.Egress("a"); e.Proxy.URL != "http://env.example:9" {
+		t.Fatalf("env not interpolated through LoadBytes: %q", e.Proxy.URL)
+	}
+	if _, err := LoadBytes([]byte("egress: [{id: a, proxy: {type: http, url: \"http://${OFP_TEST_UNSET_VAR}:1\"}}]\n" +
+		"routes: [{id: r, egress: [a]}]\n")); err == nil || !strings.Contains(err.Error(), "OFP_TEST_UNSET_VAR") {
+		t.Fatalf("unset var must be a load error naming it, got %v", err)
+	}
+	if _, err := LoadBytes([]byte("egress: [{id: a}, {id: a}]\nroutes: [{id: r, egress: [a]}]\n")); err == nil {
+		t.Fatal("invalid document must not resolve")
+	}
+}
+
+// TestStampedLoadCoherentUnderMidLoadRewrite is the TOCTOU proof: the stamp
+// and the snapshot come from ONE read. The file is rewritten BETWEEN the read
+// and the load — the exact window the old read-then-re-read poller straddled,
+// where a snapshot could end up stamped with another generation's hash and
+// make every later "unchanged" decision lie.
+func TestStampedLoadCoherentUnderMidLoadRewrite(t *testing.T) {
+	dir := t.TempDir()
+	p := writeConfig(t, dir, "cfg.yaml", reloadDocA)
+
+	raw1, sum1, err := readStamped(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := sha256Hex(raw1); sum1 != want {
+		t.Fatalf("stamp %q is not the hash of the returned bytes (%q)", sum1, want)
+	}
+
+	// Mutate the file after the read, before the load.
+	writeConfig(t, dir, "cfg.yaml", reloadDocB)
+	rt, err := LoadBytes(raw1)
+	if err != nil {
+		t.Fatalf("load of the already-read bytes: %v", err)
+	}
+	if len(rt.File.Egress) != 1 {
+		t.Fatalf("snapshot is a chimera: %d egresses, want the 1 from the read bytes", len(rt.File.Egress))
+	}
+
+	// A second stamped read of the rewritten file is a DIFFERENT stamp, and
+	// loading its bytes yields the new generation's content.
+	raw2, sum2, err := readStamped(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum2 == sum1 {
+		t.Fatal("rewritten content kept the same stamp")
+	}
+	rt2, err := LoadBytes(raw2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rt2.File.Egress) != 2 {
+		t.Fatalf("second stamped load incoherent: %d egresses, want 2", len(rt2.File.Egress))
+	}
+}
+
+// TestStoreInvalidThenValidReloadReverts: valid → invalid keeps the last good
+// snapshot (and its generation); a later valid file is adopted — generation
+// increments and the content swaps — while the held old snapshot stays put.
+func TestStoreInvalidThenValidReloadReverts(t *testing.T) {
+	dir := t.TempDir()
+	p := writeConfig(t, dir, "cfg.yaml", reloadDocA)
+	var mu sync.Mutex
+	var logs []string
+	s, err := NewStore(p, pollInterval, func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		logs = append(logs, strings.TrimSpace(format))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	rt1 := s.Get()
+	if rt1.Generation != 1 {
+		t.Fatalf("first load generation = %d, want 1", rt1.Generation)
+	}
+
+	// Phase 1: valid → invalid. Rejected, last good kept, no generation burned.
+	writeConfig(t, dir, "cfg.yaml", `
+egress: [{id: a}, {id: a}]
+routes: [{id: r, egress: [a]}]
+`)
+	deadline := time.Now().Add(2 * time.Second)
+	rejected := false
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		for _, l := range logs {
+			if strings.Contains(l, "rejected") {
+				rejected = true
+			}
+		}
+		mu.Unlock()
+		if rejected {
+			break
+		}
+		time.Sleep(2 * pollInterval)
+	}
+	if !rejected {
+		t.Fatal("invalid reload was never attempted (no rejection logged)")
+	}
+	if got := s.Get(); got != rt1 || got.Generation != 1 || len(got.File.Egress) != 1 {
+		t.Fatalf("invalid reload disturbed the last good snapshot: %+v", got)
+	}
+
+	// Phase 2: invalid → valid-again. The revert adopts the new good config.
+	writeConfig(t, dir, "cfg.yaml", reloadDocB)
+	deadline = time.Now().Add(2 * time.Second)
+	for s.Get().Generation == 1 && time.Now().Before(deadline) {
+		time.Sleep(2 * pollInterval)
+	}
+	rt2 := s.Get()
+	if rt2 == rt1 {
+		t.Fatal("revert never swapped the snapshot")
+	}
+	if rt2.Generation != 2 {
+		t.Fatalf("revert generation = %d, want 2", rt2.Generation)
+	}
+	if len(rt2.File.Egress) != 2 {
+		t.Fatalf("revert adopted %d egresses, want the valid file's 2", len(rt2.File.Egress))
+	}
+	// The snapshot held across the whole episode is untouched.
+	if rt1.Generation != 1 || len(rt1.File.Egress) != 1 {
+		t.Fatalf("held snapshot mutated across invalid→valid: %+v", rt1)
+	}
+	mu.Lock()
+	swapped := false
+	for _, l := range logs {
+		if strings.Contains(l, "swapped") {
+			swapped = true
+		}
+	}
+	mu.Unlock()
+	if !swapped {
+		t.Fatal("revert never logged a swap")
+	}
+}
+
+func sha256Hex(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

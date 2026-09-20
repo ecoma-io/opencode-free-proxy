@@ -104,11 +104,17 @@ func (e *Egress) TransportSignature() string {
 }
 
 // HealthKey is the health registry's state identity: logical egress id +
-// physical transport signature. The concatenation is collision-free by
-// construction, not by accident: Validate rejects control characters in ids
-// (the NUL separator cannot appear there) and url.Parse rejects them in URLs
-// (so it cannot appear in a signature either), which makes the LAST NUL of a
-// key always the separator; signatures are never empty ("direct" or type:url).
+// physical transport signature, joined as id + NUL + signature. The registry
+// consumes the key opaquely (a map key — nothing ever splits it back apart),
+// so what matters is injectivity, and that holds by construction on the
+// FIRST NUL: Validate rejects control characters in egress ids
+// (hasControlByte), so the id half cannot contain the separator and the first
+// NUL always terminates the id — whatever follows it, NULs included, belongs
+// to the signature half. In practice the signature half cannot carry a NUL
+// either (Validate gates the type to the three enum constants, and url.Parse
+// rejects ASCII control bytes outright — net/url stringContainsCTLByte), so a
+// live key holds exactly one NUL. Signatures are never empty ("direct" or
+// type:url).
 func (e *Egress) HealthKey() string {
 	return e.ID + "\x00" + e.TransportSignature()
 }
@@ -197,11 +203,14 @@ func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	s, ok := raw.(string)
 	if !ok {
-		return fmt.Errorf("duration must be a string like \"30s\", got %v", raw)
+		return fmt.Errorf("duration must be a string like \"30s\", got %s", boundedEcho(fmt.Sprintf("%v", raw)))
 	}
 	parsed, err := time.ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("invalid duration %q: %w", s, err)
+		// time.ParseDuration's error text echoes the raw input back inside
+		// quotes, unbounded — stripQuoted keeps the reason class while the
+		// value reaches the log only through the bounded echo.
+		return fmt.Errorf("invalid duration %q: %s", boundedEcho(s), stripQuoted(err.Error()))
 	}
 	*d = Duration(parsed)
 	return nil
@@ -210,6 +219,19 @@ func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
 // Runtime is the immutable post-validation snapshot a request holds for its
 // whole lifetime. Hot reload swaps the pointer atomically; an in-flight
 // request never observes a mutation.
+//
+// Immutability contract: nothing outside Resolve may write a snapshot.
+// Routes/MatchRoute deep-copy what they return and HealthThreshold/
+// HealthCooldown return values. Two surfaces still expose snapshot memory and
+// stay for cause, each documented at its site: the exported FIELDS (File,
+// Fallback, Health) — read directly by the router and health packages, so
+// they cannot become methods or unexport without touching out-of-package
+// callers — and Egress(id), whose pointer identity internal/routing pins as
+// the proof that a RoutePlan resolves against a single snapshot. Both are
+// READ-ONLY by contract; no in-repo code writes through them. What Resolve
+// guarantees regardless is that a snapshot never aliases its loader's input:
+// every pointer/slice field is deep-copied there, so input mutation and
+// snapshot state can never meet.
 type Runtime struct {
 	File     File
 	byID     map[string]*Egress
@@ -227,21 +249,47 @@ type Runtime struct {
 	Generation uint64
 }
 
-// Egress resolves an egress id from this snapshot.
+// Egress resolves an egress id from this snapshot. The returned pointer
+// ALIASES the snapshot's own egress: it is READ-ONLY by contract, because the
+// scheduler pins exactly these pointers into a request's RoutePlan (one
+// request = one snapshot) and the executor dials from that pinned list for
+// the request's whole lifetime.
+//
+// Accessor audit (snapshot hardening): every in-repo caller only reads
+// through it (routing's resolveEgresses/weightOf, the router's routeHeads/
+// routeHealthKeys/generationKeepSets/clientForEgress, health.ActiveKeys, the
+// upstream budget/fallback tests). The strict fix — a private per-call copy —
+// was built and then rejected here: internal/routing's
+// TestPlanEgressesResolvedFromSnapshot asserts pointer identity with
+// rt.Egress as its proof that a plan resolves against a single snapshot, and
+// that package is outside this hardening's scope. Until a coordinated change
+// lands there, this is the ONE accessor that hands out snapshot memory —
+// deliberately, documented, and unused for writes anywhere in the repo.
 func (rt *Runtime) Egress(id string) (*Egress, bool) {
 	e, ok := rt.byID[id]
 	return e, ok
 }
 
-// Routes returns the snapshot's routes in deterministic match order.
-func (rt *Runtime) Routes() []Route { return rt.routes }
+// Routes returns the snapshot's routes in deterministic match order as a deep
+// copy — mutating the result, including nested Match.Models and Egress
+// backing arrays, never reaches the live snapshot. It runs once per
+// generation (keep-set derivation, tests), never per request; MatchRoute is
+// the per-request accessor.
+func (rt *Runtime) Routes() []Route {
+	out := make([]Route, len(rt.routes))
+	for i := range rt.routes {
+		out[i] = cloneRoute(&rt.routes[i])
+	}
+	return out
+}
 
-// MatchRoute returns the first route whose conditions hold for the profile.
+// MatchRoute returns the first route whose conditions hold for the profile,
+// as a deep copy (the returned Match.Models and Egress slices are private).
 // Order is priority desc then file order — never random.
 func (rt *Runtime) MatchRoute(streaming bool, bodyBytes int64, model string) (Route, bool) {
-	for _, r := range rt.routes {
-		if matchHolds(r.Match, streaming, bodyBytes, model) {
-			return r, true
+	for i := range rt.routes {
+		if matchHolds(rt.routes[i].Match, streaming, bodyBytes, model) {
+			return cloneRoute(&rt.routes[i]), true
 		}
 	}
 	return Route{}, false
@@ -276,9 +324,48 @@ func globMatch(pattern, model string) bool {
 	return err == nil && ok
 }
 
+// boundedEcho bounds an input-derived value echoed into a load error. Those
+// errors are logged verbatim — at startup and on a rejected reload — so a
+// hostile config line must not be able to bloat a log or smuggle unbounded
+// bytes into an error surface. The convention mirrors yaml.v3's scalar echo
+// (decode.go, decoder.terror): a value over 10 bytes renders as its first 7
+// plus "...". The one deliberate exception is Interpolate's unset-variable
+// name, documented at its site.
+func boundedEcho(s string) string {
+	if len(s) <= 10 {
+		return s
+	}
+	return s[:7] + "..."
+}
+
+// stripQuoted removes every "…" span from a text. Parse errors
+// (time.ParseDuration among them) echo the offending input back inside
+// quotes, which would defeat boundedEcho on the wrapping site — the useful
+// reason survives, the unbounded original does not. The example test reuses
+// it for the same shape of problem: stripping quoted YAML scalars from a line
+// so a placeholder check can look at the comment text alone.
+func stripQuoted(s string) string {
+	var b strings.Builder
+	for {
+		i := strings.IndexByte(s, '"')
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		b.WriteString(s[:i])
+		s = s[i+1:]
+		j := strings.IndexByte(s, '"')
+		if j < 0 {
+			return b.String()
+		}
+		s = s[j+1:]
+	}
+}
+
 // Validate applies the full structural + semantic check set in a fixed
 // order, returning the first failure with an actionable path ("egress
-// proxy-b: …", "route streaming: …").
+// proxy-b: …", "route streaming: …"). Every echoed input value goes through
+// boundedEcho — see its comment for why.
 func (f *File) Validate() error {
 	seen := map[string]bool{}
 	if len(f.Egress) == 0 {
@@ -297,35 +384,38 @@ func (f *File) Validate() error {
 			// log lines and the X-OFP-Egress response header verbatim.
 			return fmt.Errorf("egress[%d]: id must not contain control characters", i)
 		}
+		eid := boundedEcho(e.ID)
 		if seen[e.ID] {
-			return fmt.Errorf("egress %q: duplicate id", e.ID)
+			return fmt.Errorf("egress %q: duplicate id", eid)
 		}
 		seen[e.ID] = true
 		if e.Weight != nil && *e.Weight < 0 {
-			return fmt.Errorf("egress %q: weight must be >= 0 (0 = configured but never scheduled)", e.ID)
+			return fmt.Errorf("egress %q: weight must be >= 0 (0 = configured but never scheduled)", eid)
 		}
 		if e.MaxConcurrency < 0 {
-			return fmt.Errorf("egress %q: max_concurrency must be >= 0 (0 = unlimited)", e.ID)
+			return fmt.Errorf("egress %q: max_concurrency must be >= 0 (0 = unlimited)", eid)
 		}
 		if e.MaxBodyBytes < 0 {
-			return fmt.Errorf("egress %q: max_body_bytes must be >= 0 (0 = unlimited)", e.ID)
+			return fmt.Errorf("egress %q: max_body_bytes must be >= 0 (0 = unlimited)", eid)
 		}
 		for _, pat := range e.Models {
 			if _, err := path.Match(pat, ""); err != nil {
-				return fmt.Errorf("egress %q: invalid model pattern %q: %w", e.ID, pat, err)
+				// path.ErrBadPattern is a constant sentence — it never echoes
+				// the pattern back, so only the bounded echo carries input.
+				return fmt.Errorf("egress %q: invalid model pattern %q: %w", eid, boundedEcho(pat), err)
 			}
 		}
 		if e.Proxy == nil {
 			continue
 		}
-		if err := validateProxy(e.ID, e.Proxy); err != nil {
+		if err := validateProxy(eid, e.Proxy); err != nil {
 			return err
 		}
 	}
 
 	ids := make([]string, 0, len(seen))
 	for id := range seen {
-		ids = append(ids, id)
+		ids = append(ids, boundedEcho(id))
 	}
 	sort.Strings(ids)
 	routeSeen := map[string]bool{}
@@ -337,42 +427,43 @@ func (f *File) Validate() error {
 		if hasControlByte(r.ID) {
 			return fmt.Errorf("route[%d]: id must not contain control characters", i)
 		}
+		rid := boundedEcho(r.ID)
 		if routeSeen[r.ID] {
-			return fmt.Errorf("route %q: duplicate id", r.ID)
+			return fmt.Errorf("route %q: duplicate id", rid)
 		}
 		routeSeen[r.ID] = true
 		switch r.Strategy {
 		case "", StrategyRoundRobin, StrategyWeightedRR:
 		default:
-			return fmt.Errorf("route %q: unknown strategy %q (want %q or %q)", r.ID, r.Strategy, StrategyRoundRobin, StrategyWeightedRR)
+			return fmt.Errorf("route %q: unknown strategy %q (want %q or %q)", rid, boundedEcho(string(r.Strategy)), StrategyRoundRobin, StrategyWeightedRR)
 		}
 		if len(r.Egress) == 0 {
-			return fmt.Errorf("route %q: egress list is empty", r.ID)
+			return fmt.Errorf("route %q: egress list is empty", rid)
 		}
 		if r.Match.MinBodyBytes < 0 {
-			return fmt.Errorf("route %q: match.min_body_bytes must be >= 0", r.ID)
+			return fmt.Errorf("route %q: match.min_body_bytes must be >= 0", rid)
 		}
 		if r.Match.MaxBodyBytes < 0 {
-			return fmt.Errorf("route %q: match.max_body_bytes must be >= 0", r.ID)
+			return fmt.Errorf("route %q: match.max_body_bytes must be >= 0", rid)
 		}
 		if r.Match.MinBodyBytes > 0 && r.Match.MaxBodyBytes > 0 && r.Match.MinBodyBytes > r.Match.MaxBodyBytes {
-			return fmt.Errorf("route %q: match.min_body_bytes (%d) > match.max_body_bytes (%d)", r.ID, r.Match.MinBodyBytes, r.Match.MaxBodyBytes)
+			return fmt.Errorf("route %q: match.min_body_bytes (%d) > match.max_body_bytes (%d)", rid, r.Match.MinBodyBytes, r.Match.MaxBodyBytes)
 		}
 		for _, pat := range r.Match.Models {
 			if _, err := path.Match(pat, ""); err != nil {
-				return fmt.Errorf("route %q: invalid match model pattern %q: %w", r.ID, pat, err)
+				return fmt.Errorf("route %q: invalid match model pattern %q: %w", rid, boundedEcho(pat), err)
 			}
 		}
 		refSeen := map[string]bool{}
 		for _, ref := range r.Egress {
 			if !seen[ref] {
-				return fmt.Errorf("route %q: unknown egress %q (configured: %s)", r.ID, ref, strings.Join(ids, ", "))
+				return fmt.Errorf("route %q: unknown egress %q (configured: %s)", rid, boundedEcho(ref), strings.Join(ids, ", "))
 			}
 			// A repeated ref would let ONE request dial the same egress twice —
 			// two health strikes on one identity and two draws against the
 			// max_attempts contract ("DISTINCT egresses one request may try").
 			if refSeen[ref] {
-				return fmt.Errorf("route %q: egress %q is listed more than once (each egress is tried at most once per request)", r.ID, ref)
+				return fmt.Errorf("route %q: egress %q is listed more than once (each egress is tried at most once per request)", rid, boundedEcho(ref))
 			}
 			refSeen[ref] = true
 		}
@@ -385,7 +476,7 @@ func (f *File) Validate() error {
 				}
 			}
 			if !usable {
-				return fmt.Errorf("route %q: weighted_round_robin needs at least one egress with weight > 0", r.ID)
+				return fmt.Errorf("route %q: weighted_round_robin needs at least one egress with weight > 0", rid)
 			}
 		}
 	}
@@ -421,7 +512,10 @@ func (rt *Runtime) HealthCooldown() time.Duration {
 
 // validateProxy checks the proxy type/scheme pair. socks5h is rejected BY
 // NAME — silently normalizing it into socks5 would flip DNS resolution to
-// the proxy side without the operator noticing.
+// the proxy side without the operator noticing. id arrives already bounded
+// (Validate only calls this with boundedEcho(e.ID)); the type and url echoes
+// below are bounded here — the url only after RedactProxyURL, so the bound
+// can never reintroduce what redaction removed.
 func validateProxy(id string, p *Proxy) error {
 	switch p.Type {
 	case ProxyHTTP, ProxyHTTPS, ProxySOCKS5:
@@ -429,7 +523,7 @@ func validateProxy(id string, p *Proxy) error {
 		if p.Type == "socks5h" {
 			return fmt.Errorf("egress %q: proxy type \"socks5h\" is not supported (remote-DNS semantics are deliberately out of scope; use \"socks5\", which resolves hostnames locally)", id)
 		}
-		return fmt.Errorf("egress %q: unknown proxy type %q (want http, https, or socks5)", id, p.Type)
+		return fmt.Errorf("egress %q: unknown proxy type %q (want http, https, or socks5)", id, boundedEcho(string(p.Type)))
 	}
 	if p.URL == "" {
 		return fmt.Errorf("egress %q: proxy url is required", id)
@@ -451,10 +545,10 @@ func validateProxy(id string, p *Proxy) error {
 	case p.Type == ProxySOCKS5 && u.Scheme == "socks5h":
 		return fmt.Errorf("egress %q: proxy url scheme \"socks5h://\" is not supported (use \"socks5://\" — hostnames resolve locally)", id)
 	default:
-		return fmt.Errorf("egress %q: proxy url scheme %q does not match type %q", id, RedactProxyURL(p.URL), p.Type)
+		return fmt.Errorf("egress %q: proxy url scheme %q does not match type %q", id, boundedEcho(RedactProxyURL(p.URL)), p.Type)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("egress %q: proxy url %q has no host", id, RedactProxyURL(p.URL))
+		return fmt.Errorf("egress %q: proxy url %q has no host", id, boundedEcho(RedactProxyURL(p.URL)))
 	}
 	return nil
 }
@@ -507,9 +601,19 @@ func cloneIntPtr(v *int) *int {
 	return new(*v)
 }
 
+func cloneDurationPtr(d *Duration) *Duration {
+	if d == nil {
+		return nil
+	}
+	c := *d
+	return &c
+}
+
 // Resolve validates the file and builds the immutable Runtime snapshot with
-// defaults applied. The slice contents are copied — the snapshot shares no
-// backing array with the loader, so callers can never observe a mutation.
+// defaults applied. EVERY pointer- and slice-typed field is deep-copied —
+// elements, pointees, and backing arrays — so the snapshot shares no memory
+// with the loader's parse result: a caller mutating anything reachable from
+// its input after Resolve can never observe (or cause) a snapshot change.
 func (f *File) Resolve() (*Runtime, error) {
 	if err := f.Validate(); err != nil {
 		return nil, err
@@ -523,11 +627,28 @@ func (f *File) Resolve() (*Runtime, error) {
 	for i := range f.Routes {
 		cp.Routes[i] = cloneRoute(&f.Routes[i])
 	}
+	// Fallback/Health are value structs carrying pointers (*bool/*int/
+	// *Duration): the struct copy above shares the POINTERS with the input, so
+	// they are re-cloned here — otherwise *f.Fallback.Enabled = false after
+	// Resolve would flip the snapshot's fallback switch.
+	cp.Fallback = FallbackPolicy{Enabled: cloneBoolPtr(f.Fallback.Enabled)}
+	cp.Health = HealthPolicy{
+		Enabled:          cloneBoolPtr(f.Health.Enabled),
+		FailureThreshold: cloneIntPtr(f.Health.FailureThreshold),
+		Cooldown:         cloneDurationPtr(f.Health.Cooldown),
+	}
 	rt := &Runtime{File: cp, byID: make(map[string]*Egress, len(cp.Egress))}
 	for i := range cp.Egress {
 		rt.byID[cp.Egress[i].ID] = &rt.File.Egress[i]
 	}
-	rt.routes = append([]Route(nil), cp.Routes...)
+	// The match path reads rt.routes per request, so it gets its own deep copy
+	// rather than a struct-copy of cp.Routes (which would share the nested
+	// Match.Models/Egress backing arrays with the exported File field for no
+	// benefit — every consumer path clones on the way out anyway).
+	rt.routes = make([]Route, len(cp.Routes))
+	for i := range cp.Routes {
+		rt.routes[i] = cloneRoute(&cp.Routes[i])
+	}
 	sort.SliceStable(rt.routes, func(i, j int) bool {
 		return rt.routes[i].Priority > rt.routes[j].Priority
 	})
@@ -546,6 +667,10 @@ func (f *File) Resolve() (*Runtime, error) {
 		c := *f.Health.Cooldown
 		rt.Health.Cooldown = &c
 	}
+	// rt.Fallback/rt.Health above are built fresh (new pointers, never the
+	// input's): the request path reads them via value-returning accessors, and
+	// the deep copy of cp.Fallback/cp.Health keeps the exported File half
+	// independent of the input too.
 	return rt, nil
 }
 
@@ -592,6 +717,11 @@ func Interpolate(raw []byte) ([]byte, error) {
 			}
 			v, ok := lookupEnv(name)
 			if !ok {
+				// The name is deliberately echoed verbatim, not through
+				// boundedEcho: this error exists to NAME the variable the
+				// operator must export (AGENTS.md: "an unset ${VAR} is a load
+				// error naming the variable") — the example's own 21-character
+				// names would be mangled beyond use.
 				return nil, fmt.Errorf("environment variable %s is not set (referenced in config)", name)
 			}
 			out.WriteString(v)

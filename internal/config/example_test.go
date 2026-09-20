@@ -238,3 +238,24 @@ func TestExampleConfigCarriesNoLiteralCredentials(t *testing.T) {
 		}
 	}
 }
+
+// TestExampleCommentsCarryNoPlaceholder: the env interpolator scans the RAW
+// file bytes — comments included (AGENTS.md) — so a ${…} reference inside a
+// comment would silently demand an environment variable no operator knows to
+// export, and the example would fail to load for everyone. The example keeps
+// placeholder syntax out of comments entirely; this pins it. Quoted scalars
+// are stripped first (stripQuoted drops every "…" span, mirroring what the
+// parser reads as values): a placeholder INSIDE a quoted url value is the
+// intended mechanism, not a violation.
+func TestExampleCommentsCarryNoPlaceholder(t *testing.T) {
+	raw, err := os.ReadFile(filepath.FromSlash(examplePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(string(raw), "\n") {
+		if strings.Contains(stripQuoted(line), "${") {
+			t.Fatalf("example line %d carries a placeholder outside a quoted scalar: %q",
+				i+1, strings.TrimSpace(line))
+		}
+	}
+}

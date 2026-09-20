@@ -21,6 +21,13 @@ import (
 // read → SHA-256 content compare → only parse+validate + swap on change.
 // Filesystem events are never the only mechanism; repeated writes between
 // ticks coalesce into one parse of the final content.
+//
+// One read per cycle, and the hash travels with the bytes: every load path
+// reads the file exactly once, hashes those bytes, and parses THOSE bytes
+// (LoadBytes). Parsing can therefore never disagree with the stamp — a write
+// landing between two reads of the old read-then-re-read flow could stamp a
+// snapshot with another generation's hash and make every later "unchanged"
+// decision lie.
 type Store struct {
 	path     string
 	interval time.Duration
@@ -47,12 +54,19 @@ type Store struct {
 // disables polling (single load). A load failure is fatal here — at startup
 // there is no valid previous snapshot to fall back on.
 func NewStore(path string, interval time.Duration, logf func(string, ...any)) (*Store, error) {
-	rt, err := LoadFile(path)
+	if logf == nil {
+		logf = log.Printf
+	}
+	// One read for both the snapshot and the poller's compare seed: the hash
+	// is stamped from the same bytes that were parsed (readStamped + LoadBytes,
+	// never LoadFile's own read).
+	raw, sum, err := readStamped(path)
 	if err != nil {
 		return nil, err
 	}
-	if logf == nil {
-		logf = log.Printf
+	rt, err := LoadBytes(raw)
+	if err != nil {
+		return nil, err
 	}
 	s := &Store{
 		path:     path,
@@ -60,14 +74,11 @@ func NewStore(path string, interval time.Duration, logf func(string, ...any)) (*
 		logf:     logf,
 		stopCh:   make(chan struct{}),
 		done:     make(chan struct{}),
+		initHash: sum,
 	}
 	rt.Generation = s.gen.Add(1)
 	s.cur.Store(rt)
 	if interval > 0 {
-		if raw, err := os.ReadFile(path); err == nil {
-			sum := sha256.Sum256(raw)
-			s.initHash = hex.EncodeToString(sum[:])
-		}
 		go s.poll()
 	}
 	return s, nil
@@ -97,12 +108,24 @@ func (s *Store) Stop() {
 	})
 }
 
-// LoadFile reads, interpolates, parses, and resolves the config at path.
+// LoadFile reads, interpolates, parses, and resolves the config at path. It
+// reads the file exactly once and hands those bytes to LoadBytes — the same
+// path the poller uses, so a snapshot and its content stamp can never come
+// from different file generations.
 func LoadFile(path string) (*Runtime, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	return LoadBytes(raw)
+}
+
+// LoadBytes interpolates, parses, validates, and resolves an ALREADY-READ
+// config document. It is the whole load pipeline after the read, and the
+// single entry point every snapshot is built through: because the caller
+// supplies the bytes, any content hash computed over them provably describes
+// the snapshot that comes back (the store's TOCTOU fix — see Store).
+func LoadBytes(raw []byte) (*Runtime, error) {
 	interpolated, err := Interpolate(raw)
 	if err != nil {
 		return nil, err
@@ -113,6 +136,20 @@ func LoadFile(path string) (*Runtime, error) {
 	}
 	return f.Resolve()
 }
+
+// readStamped reads the config file once and returns its bytes plus the
+// SHA-256 of THOSE bytes. NewStore and the poller both stamp from it, so the
+// hash that gates "unchanged" always describes the bytes a snapshot would be
+// parsed from.
+func readStamped(path string) (raw []byte, sum string, err error) {
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	digest := sha256.Sum256(raw)
+	return raw, hex.EncodeToString(digest[:]), nil
+}
+
 func (s *Store) poll() {
 	defer close(s.done)
 	lastHash := s.initHash
@@ -130,26 +167,25 @@ func (s *Store) poll() {
 
 // tick is one poll cycle. A content change is detected by SHA-256 before any
 // parse work; parse/validation failure keeps the previous snapshot and logs
-// the error (a valid config is never replaced by an invalid one).
+// the error (a valid config is never replaced by an invalid one). The read is
+// the cycle's ONLY one: the hash and the bytes handed to LoadBytes come from
+// it together, so a swap can never pair one generation's content with
+// another's stamp. A write landing after the read is simply picked up by the
+// next tick.
 func (s *Store) tick(lastHash *string) {
-	raw, err := os.ReadFile(s.path)
+	raw, hash, err := readStamped(s.path)
 	if err != nil {
 		s.logf("config reload: read failed, keeping previous config: %v", err)
 		return
 	}
-	sum := sha256.Sum256(raw)
-	hash := hex.EncodeToString(sum[:])
 	if hash == *lastHash {
 		return
 	}
-	rt, err := LoadFile(s.path)
+	rt, err := LoadBytes(raw)
 	if err != nil {
 		s.logf("config reload: rejected, keeping previous config: %v", err)
 		return
 	}
-	// Re-check the hash after the successful parse: if the file changed
-	// between our read and LoadFile's re-read, the hash we compared is stale
-	// and a second tick will converge on the newer content.
 	*lastHash = hash
 	rt.Generation = s.gen.Add(1)
 	s.cur.Store(rt)
