@@ -48,10 +48,10 @@ type AttemptPolicy struct {
 // egress id, the attempts consumed, the last failure class, and the
 // client-facing UpstreamError. On success uerr is nil and class is
 // ClassSuccess. When no egress could serve, resp is nil and uerr carries the
-// LAST REAL verdict of the final dialed egress (base.js never synthesizes
-// one — a 429 that outlives the plan stays a 429); only a request that never
-// dialed (every plan entry skipped, or an empty head set) gets the synthetic
-// 502 envelope.
+// LAST REAL verdict of the final dialed egress — a deliberate divergence
+// from base.js:183, which synthesizes an "All N URLs failed" error in that
+// spot (see the loop tail below); only a request that never dialed (every
+// plan entry skipped, or an empty head set) gets the synthetic 502 envelope.
 //
 // Invariants (issue #3):
 //   - 429 falls back to the next egress but NEVER marks health.
@@ -63,8 +63,14 @@ type AttemptPolicy struct {
 //     (the cap counts in-flight requests/streams, so a winning egress holds
 //     its slot until the body is consumed — both relay paths close it).
 //
-// slotReleaseBody closes the underlying body and frees the slot exactly
-// once (sync.Once — the streaming relay closes the body twice).
+// slotReleaseBody closes the underlying body and frees the slot exactly once
+// (sync.Once — the streaming relay closes the body twice). ORDER MATTERS:
+// the body is closed BEFORE the slot frees. A replacement request must never
+// be admitted past the concurrency cap while this attempt's connection is
+// still open — releasing first would let Acquire succeed before Close runs,
+// briefly overshooting the cap by one live connection per handoff. Freeing
+// after the close keeps the cap a true upper bound on held connections
+// (pinned by TestSlotReleaseBodyClosesBodyBeforeFree).
 type slotReleaseBody struct {
 	io.ReadCloser
 	once sync.Once
@@ -72,8 +78,9 @@ type slotReleaseBody struct {
 }
 
 func (b *slotReleaseBody) Close() error {
+	err := b.ReadCloser.Close()
 	b.once.Do(b.free)
-	return b.ReadCloser.Close()
+	return err
 }
 func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy) (*http.Response, string, int, Class, *UpstreamError) {
 	budget := policy.MaxAttempts
@@ -150,10 +157,24 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 	// Terminal verdict: the LAST REAL one when anything was dialed — a plan
 	// that ran out before the budget must not rewrite a 429/503/504 into a
 	// synthetic 502 (it would invert the client's backoff semantics and make
-	// the visible status depend on plan length vs budget). base.js never
-	// synthesizes either: an exhausted matrix returns the real response
-	// (base.js:163) and the last url's real error escapes (base.js:179). The
-	// synthetic envelope is only for a request that never dialed — every
+	// the visible status depend on plan length vs budget).
+	//
+	// Deliberate divergence from base.js, stated as such per porting
+	// discipline #4: when the URL loop completes without returning,
+	// base.js:183 executes `throw lastError || new Error(\`All
+	// ${fallbackCount} URLs failed with status ${lastStatus}\`)`. That DOES
+	// synthesize a failure whenever every URL was passed over via
+	// shouldRetry (base.js:83-85, the 429-exhausted case): lastError is
+	// still null after status-only skips, so the client sees the synthesized
+	// "All N URLs failed with status 429" instead of its own 429 envelope.
+	// This executor keeps the last real verdict instead — the synthesized
+	// string is lossy (it discards the upstream's own message body), not
+	// load-bearing, and the status the client backoffs on stays the
+	// upstream's. Everything else is parity: an exhausted retry matrix
+	// returns the real response (base.js:163) and the last URL's real error
+	// escapes (base.js:179).
+	//
+	// The synthetic envelope is only for a request that never dialed — every
 	// plan entry skipped (slot-full / unknown egress / transport build) or an
 	// empty plan; attempts==0 marks that case in the log.
 	if lastErr != nil {
