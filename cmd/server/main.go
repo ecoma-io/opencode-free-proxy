@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -85,7 +87,8 @@ func main() {
 	})
 
 	addr := ":" + cfg.Port
-	srv := &http.Server{Addr: addr, Handler: mux}
+	conns := newConnTracker()
+	srv := &http.Server{Addr: addr, Handler: mux, ConnState: conns.connState}
 	go func() {
 		log.Printf("opencode-free-proxy %s listening on %s (upstream %s)", version, addr, cfg.UpstreamBase)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -93,10 +96,19 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown: on SIGINT/SIGTERM stop accepting NEW work first (the
-	// drain gate answers 503), stop the config poller and UA sync, then let
-	// the HTTP server finish in-flight requests/streams — bounded by
-	// OFP_SHUTDOWN_GRACE, after which remaining connections are closed.
+	// Graceful shutdown, two phases:
+	//
+	//   Phase 1 (drain): on SIGINT/SIGTERM stop accepting NEW work first (the
+	//   drain gate answers 503), stop the config poller and UA sync, then let
+	//   the HTTP server finish in-flight requests/streams. Shutdown closes
+	//   the listener and the idle connections and waits for the ACTIVE ones.
+	//
+	//   Phase 2 (force): OFP_SHUTDOWN_GRACE bounds phase 1. Shutdown itself
+	//   never closes an active connection — a stuck stream (upstream that
+	//   trickles below the stall deadline) would outlive the grace — so when
+	//   the grace lapses, every still-tracked connection is force-closed
+	//   here, unblocking the handlers and bounding the process exit to the
+	//   grace in all cases.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	<-ctx.Done()
 	stop()
@@ -108,9 +120,52 @@ func main() {
 	graceCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGrace)
 	defer cancel()
 	if err := srv.Shutdown(graceCtx); err != nil {
-		log.Printf("shutdown: forced close after grace: %v", err)
+		closed := conns.forceCloseAll()
+		log.Printf("shutdown: grace %v elapsed, force-closed %d connection(s): %v", cfg.ShutdownGrace, closed, err)
 	}
 	log.Printf("shutdown complete")
+}
+
+// connTracker records the server's live client connections through
+// http.Server.ConnState so the shutdown path can force-close the survivors of
+// the drain grace. A connection is tracked from StateNew/StateActive and
+// dropped on StateIdle (Shutdown closes idle conns itself), StateHijacked
+// (no longer the server's to manage — none today, the SSE relays use flush,
+// not hijack) and StateClosed. forceCloseAll closes whatever remains; Close
+// is safe to call concurrently with the transport's own reads/writes.
+type connTracker struct {
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+}
+
+func newConnTracker() *connTracker {
+	return &connTracker{conns: map[net.Conn]struct{}{}}
+}
+
+// connState is the http.Server.ConnState hook.
+func (t *connTracker) connState(c net.Conn, cs http.ConnState) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch cs {
+	case http.StateNew, http.StateActive:
+		t.conns[c] = struct{}{}
+	case http.StateIdle, http.StateHijacked, http.StateClosed:
+		delete(t.conns, c)
+	}
+}
+
+// forceCloseAll closes every still-tracked connection and returns the count.
+func (t *connTracker) forceCloseAll() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	closed := 0
+	for c := range t.conns {
+		if err := c.Close(); err == nil {
+			closed++
+		}
+	}
+	t.conns = map[net.Conn]struct{}{}
+	return closed
 }
 
 // runHealthcheck backs the Docker HEALTHCHECK: GET the server's own /healthz
