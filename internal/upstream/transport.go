@@ -29,6 +29,17 @@ import (
 //
 // Hostnames resolve LOCALLY for socks5 (config-level contract). The proxy
 // URL itself is never logged; errors carry the redacted form.
+//
+// Redirects: both http.Clients below (and Client.HTTP from NewClient) leave
+// CheckRedirect unset, so http.Client follows up to 10 redirects — faithful
+// parity with the JS source, which passes no `redirect:` option in the
+// executor path (base.js:144-149 → utils/proxyFetch.js:203-257 forwards the
+// options to native fetch, default `redirect: "follow"`; the lone
+// redirect:"manual" lives in translator/concerns/image.js:97-98, a different
+// boundary). Accepted consequence: a 307/308 re-POSTs the body — including
+// `Authorization: Bearer public` and the x-opencode-* headers — to the
+// redirect target, exactly as the JS router would (pinned by
+// TestRedirectFollowedLikeJSFetch).
 func NewClientFor(p *config.Proxy) (*Client, error) {
 	c := &Client{Sleep: time.Sleep, Now: time.Now}
 	if p == nil {
