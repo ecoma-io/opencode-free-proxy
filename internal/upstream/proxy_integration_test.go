@@ -262,6 +262,30 @@ func TestProxyAuthFailureDoesNotUseGeneric502Retry(t *testing.T) {
 	}
 }
 
+// TestProxyAuthFailureFallsBackImmediately: the executor half of the §5
+// contract — the typed refusal is FallbackAllowed, so the very next attempt
+// serves from b; no further dials against a, no budget consumed.
+func TestProxyAuthFailureFallsBackImmediately(t *testing.T) {
+	f := newProxyAuthFixture(t)
+
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.origin.URL+"/zen/v1/chat/completions",
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), f.plan, policy(true, 3))
+	if resp != nil {
+		defer func() { _ = resp.Body.Close() }()
+	}
+	if uerr != nil || resp == nil || id != "b" || attempts != 2 || class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d class=%s uerr=%v, want immediate fallback to b", id, attempts, class, uerr)
+	}
+	if got := f.connects.Load(); got != 1 {
+		t.Fatalf("CONNECTs on a = %d, want 1 (the refusal ends a's turn)", got)
+	}
+	if !f.health.Healthy(healthKey("b"), testHealthPolicy) {
+		t.Fatal("b's success must keep it healthy")
+	}
+}
+
 // proxyAuthFixture: egress a dials through a CONNECT-407 fake proxy, egress b
 // is a healthy https origin reached directly.
 type proxyAuthFixture struct {

@@ -267,6 +267,32 @@ func TestExecuteAllUnhealthyReturns502(t *testing.T) {
 	}
 }
 
+// Test429ChainFallsBackToThirdEgress: the adversarial 429 row — two chained
+// rate limits still fall through to the third egress, and NEITHER 429'd
+// egress is poisoned (the next request may be routed back to either).
+func Test429ChainFallsBackToThirdEgress(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 429, "b": 429, "c": 200})
+	defer f.Close()
+
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), f.plan("r", "a", "b", "c"), policy(true, 3))
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr = %v", uerr)
+	}
+	_ = resp.Body.Close()
+	if id != "c" || attempts != 3 || class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d class=%s, want c/3/success", id, attempts, class)
+	}
+	if f.rec.count("a") != 1 || f.rec.count("b") != 1 || f.rec.count("c") != 1 {
+		t.Fatalf("calls a=%d b=%d c=%d, want 1 each (429s never retry)", f.rec.count("a"), f.rec.count("b"), f.rec.count("c"))
+	}
+	if !f.health.Healthy(healthKey("a"), testHealthPolicy) || !f.health.Healthy(healthKey("b"), testHealthPolicy) {
+		t.Fatal("429s must not mark either egress unhealthy")
+	}
+}
+
 // TestExecuteBudgetCapsAttempts: MaxAttempts bounds DISTINCT egresses tried
 // (default 3); the rest of the plan is never dialed.
 func TestExecuteBudgetCapsAttempts(t *testing.T) {
