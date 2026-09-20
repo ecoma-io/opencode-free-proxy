@@ -326,13 +326,18 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	latency := time.Since(start)
 	if uerr != nil {
 		cancelUpstream()
-		s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%s endpoint=%s fallback=%t",
+		// model=%q, not %s: the model id is client-controlled and survives
+		// cloak.BaseModelID verbatim — an embedded newline (or any control
+		// byte) would forge extra log lines (CWE-117). %q escapes them for the
+		// LOG LINE only; the JSON body echo is untouched (JSON escaping
+		// already protects it) and the upstream model id is unaffected.
+		s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
 			reqID, rt.Generation, plan.RouteID, egID, attempts, class, uerr.Status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 		writeError(w, uerr.Status, fmt.Sprintf("[%d]: %s", uerr.Status, uerr.Message))
 		return
 	}
 	w.Header().Set("X-OFP-Egress", egID)
-	s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%s endpoint=%s fallback=%t",
+	s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
 		reqID, rt.Generation, plan.RouteID, egID, attempts, class, resp.StatusCode, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 	// Forced SSE→JSON needs the upstream reply to actually be SSE
 	// (sseToJsonHandler.js:185-188): when it is not, chatCore falls through to
