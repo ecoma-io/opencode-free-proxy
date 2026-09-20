@@ -18,24 +18,17 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"opencode-free-proxy/internal/caps"
 	"opencode-free-proxy/internal/cloak"
-	"opencode-free-proxy/internal/config"
-	"opencode-free-proxy/internal/identity"
 	"opencode-free-proxy/internal/jsonx"
 	"opencode-free-proxy/internal/relay"
+	"opencode-free-proxy/internal/routing"
 	"opencode-free-proxy/internal/translate"
 	"opencode-free-proxy/internal/upstream"
 	"opencode-free-proxy/internal/usage"
 )
-
-// Server carries the process-wide dependencies.
-type Server struct {
-	Cfg      *config.Config
-	Upstream *upstream.Client
-	UA       *identity.UserAgentCache
-}
 
 // aliasRe strips the "oc/" provider alias prefix (PROVIDER_ID_TO_ALIAS
 // resolution happens before chatCore in 9router; the id arriving here is
@@ -99,6 +92,13 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	// Drain gate: a shutting-down server rejects NEW requests with 503 before
+	// reading the body (in-flight requests/streams finish under the shutdown
+	// grace; nothing upstream is dialed after this point).
+	if s.Draining.Load() {
+		writeError(w, http.StatusServiceUnavailable, "Server is shutting down")
 		return
 	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
@@ -225,6 +225,37 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		}
 	}
 
+	// ---- routing: match the CURRENT snapshot, filter to the eligible head
+	// set and let the scheduler order it. Health config is applied per
+	// request so a reload of threshold/cooldown takes effect immediately;
+	// routing (start selection), fallback (attempt loop) and health
+	// (temporary eligibility) stay three separate decisions.
+	rt := s.runtime()
+	if s.Health != nil {
+		s.Health.Configure(
+			rt.Health.Enabled == nil || *rt.Health.Enabled,
+			rt.Health.FailureThreshold,
+			time.Duration(rt.Health.Cooldown),
+		)
+	}
+	profile := routing.Profile{
+		Model:     cleanModel,
+		Streaming: clientRequestedStreaming,
+		BodyBytes: int64(len(raw)),
+		Endpoint:  string(sourceFormat),
+	}
+	route, ok := rt.MatchRoute(profile.Streaming, profile.BodyBytes, profile.Model)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "No route matched this request")
+		return
+	}
+	heads := s.routeHeads(rt, route, profile)
+	if len(heads) == 0 {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("No eligible egress for route %q", route.ID))
+		return
+	}
+	plan := s.Scheduler.Plan(rt, route, heads)
+
 	// ---- executor boundary (session resolve + transform + headers).
 	downstream := captureDownstream(r)
 	session := upstream.PrepareRequest(upstreamModel, body, downstream)
@@ -242,12 +273,31 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	buildHeaders := func() map[string]string {
 		return upstream.BuildHeaders(downstream, session, s.UA.Get())
 	}
-	resp, uerr := s.Upstream.Do(reqCtx, url, buildHeaders, bodyJSON)
+	policy := upstream.AttemptPolicy{
+		FallbackEnabled: rt.Fallback.Enabled == nil || *rt.Fallback.Enabled,
+		MaxAttempts:     rt.Fallback.MaxAttempts,
+		MaxConcurrency:  make(map[string]int, len(heads)),
+	}
+	for _, id := range heads {
+		if e, ok := rt.Egress(id); ok {
+			policy.MaxConcurrency[id] = e.MaxConcurrency
+		}
+	}
+
+	reqID := newRequestID()
+	start := time.Now()
+	resp, egID, attempts, class, uerr := s.Exec.Execute(reqCtx, url, buildHeaders, bodyJSON, plan, policy)
+	latency := time.Since(start)
 	if uerr != nil {
 		cancelUpstream()
+		s.logf("%s route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%s endpoint=%s fallback=%t",
+			reqID, plan.RouteID, egID, attempts, class, uerr.Status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 		writeError(w, uerr.Status, fmt.Sprintf("[%d]: %s", uerr.Status, uerr.Message))
 		return
 	}
+	w.Header().Set("X-OFP-Egress", egID)
+	s.logf("%s route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%s endpoint=%s fallback=%t",
+		reqID, plan.RouteID, egID, attempts, class, resp.StatusCode, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 
 	// Forced SSE→JSON needs the upstream reply to actually be SSE
 	// (sseToJsonHandler.js:185-188): when it is not, chatCore falls through to

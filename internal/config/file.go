@@ -87,6 +87,16 @@ func (e *Egress) weight() int {
 	return *e.Weight
 }
 
+// IsEnabled reports whether the egress participates in scheduling (nil = yes).
+func (e *Egress) IsEnabled() bool { return e.enabled() }
+
+// AcceptsStreaming reports whether the egress accepts streaming requests.
+func (e *Egress) AcceptsStreaming() bool { return e.streaming() }
+
+// EffectiveWeight returns the scheduling weight: omitted = 1, explicit 0 =
+// configured but never scheduled as a route head (not eligibility).
+func (e *Egress) EffectiveWeight() int { return e.weight() }
+
 // Match is the typed route condition set. Every set field must hold (AND);
 // an empty Match matches everything (the default-route shape).
 type Match struct {
@@ -317,7 +327,7 @@ func (f *File) Validate() error {
 	}
 
 	if f.Fallback.MaxAttempts < 0 {
-		return fmt.Errorf("fallback: max_attempts must be >= 0 (0 = only the scheduled egress)")
+		return fmt.Errorf("fallback: max_attempts must be >= 0 (0 = default 3)")
 	}
 	if f.Health.FailureThreshold < 0 {
 		return fmt.Errorf("health: failure_threshold must be >= 0 (0 = never cool down)")

@@ -75,11 +75,13 @@ func TestParseUpstreamModels(t *testing.T) {
 // models + the known-free id). The test's upstream base is a closed port, so
 // the fetch fails and the fallback kicks in.
 func TestHandleModelsFallsBackToStaticRegistry(t *testing.T) {
-	s := &Server{
-		Cfg:      &config.Config{Port: "0", UpstreamBase: "http://127.0.0.1:1"},
-		Upstream: upstream.NewClient(),
-		UA:       identity.NewUserAgentCache(),
-	}
+	s := NewServer(
+		&config.Config{Port: "0", UpstreamBase: "http://127.0.0.1:1"},
+		config.NewDefault(),
+		identity.NewUserAgentCache(),
+		upstream.NewClient(),
+		nil, nil,
+	)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	s.HandleModels(rec, req)

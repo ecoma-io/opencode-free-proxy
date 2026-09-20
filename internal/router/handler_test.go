@@ -114,12 +114,14 @@ func newScriptedUpstream(t *testing.T, rec *upstreamRecorder, status int, conten
 // pinned fallback).
 func newRouter(upstreamURL, apiKey string) (*Server, *http.ServeMux) {
 	c := upstream.NewClient()
-	c.Sleep = func(time.Duration) {}
-	s := &Server{
-		Cfg:      &config.Config{Port: "0", APIKey: apiKey, UpstreamBase: upstreamURL},
-		Upstream: c,
-		UA:       identity.NewUserAgentCache(),
-	}
+	s := NewServer(
+		&config.Config{Port: "0", APIKey: apiKey, UpstreamBase: upstreamURL},
+		config.NewDefault(),
+		identity.NewUserAgentCache(),
+		c,
+		nil,
+		func(time.Duration) {}, // no-op sleep: retry matrices run instantly
+	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.HandleChatCompletions)
 	mux.HandleFunc("POST /v1/responses", s.HandleResponses)

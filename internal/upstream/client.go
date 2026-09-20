@@ -63,6 +63,16 @@ func (e *UpstreamError) Error() string {
 // same line is an in-place no-op on the already-transformed body, so the
 // already-serialized bodyJSON is re-sent unchanged.
 func (c *Client) Do(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte) (*http.Response, *UpstreamError) {
+	resp, uerr, _ := c.DoClassified(ctx, url, buildHeaders, bodyJSON)
+	return resp, uerr
+}
+
+// DoClassified is Do plus the failure taxonomy (failure.go) the executor
+// needs for fallback/health decisions. The retry matrix is identical — the
+// classification only sharpens the terminal branches: transport errors get
+// their real class instead of a 502 guess, and 429 keeps its own class so
+// the executor can fall back without poisoning health.
+func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte) (*http.Response, *UpstreamError, Class) {
 	// base.js:104 `const retryAttemptsByUrl = {}` — ONE counter per URL shared
 	// by every retryable status and network errors alike. tryRetry checks
 	// `retryAttemptsByUrl[urlIndex] >= attempts` where `attempts` is the CAP OF
@@ -77,8 +87,11 @@ func (c *Client) Do(ctx context.Context, url string, buildHeaders func() map[str
 			// Network/fetch exceptions map to the 502 retry rule
 			// (base.js:173 tryRetry(urlIndex, BAD_GATEWAY, `network …`)). The
 			// [502]: prefix is applied at write time like every other error.
+			// The class is the REAL class (timeout vs connection vs ctx) —
+			// the 502 status is only the client-facing envelope.
+			class := classifyNetErr(ctx, netErr)
 			if !c.tryRetry(ctx, &used, config.RetryRules[502]) {
-				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}
+				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 			}
 			continue
 		}
@@ -95,9 +108,9 @@ func (c *Client) Do(ctx context.Context, url string, buildHeaders func() map[str
 		if resp.StatusCode >= 400 {
 			raw, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			return nil, parseUpstreamError(resp.StatusCode, raw)
+			return nil, parseUpstreamError(resp.StatusCode, raw), classifyStatus(resp.StatusCode)
 		}
-		return resp, nil
+		return resp, nil, ClassSuccess
 	}
 }
 
