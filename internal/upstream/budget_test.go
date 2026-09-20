@@ -37,7 +37,8 @@ func newHandlerFixture(t *testing.T, handlers map[string]http.HandlerFunc) *hand
 		health:  health.New(),
 		slots:   NewLimiter(),
 	}
-	f.health.Configure(true, 1, time.Minute)
+	// No registry Configure: the health policy rides the AttemptPolicy
+	// (policy() pins testHealthPolicy, threshold 1) since issue #6.
 
 	ids := make([]string, 0, len(handlers))
 	for id, h := range handlers {
@@ -179,7 +180,7 @@ func TestExecute429Then200KeepsEgressUsable(t *testing.T) {
 		t.Fatalf("req1: id=%q attempts=%d class=%s uerr=%v, want b/2/success", id, attempts, class, uerr)
 	}
 	_ = resp.Body.Close()
-	if !f.health.Healthy("a") {
+	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
 		t.Fatal("a's 429 must NOT mark it unhealthy (rate limit ≠ egress failure)")
 	}
 
@@ -220,7 +221,7 @@ func TestExecute429Then500PoisonsOnlyThe500(t *testing.T) {
 		t.Fatalf("req1 uerr=%v, want success via fallback", uerr)
 	}
 	_ = resp.Body.Close()
-	if !f.health.Healthy("a") {
+	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
 		t.Fatal("req1: single 429 must not mark a unhealthy")
 	}
 
@@ -233,7 +234,7 @@ func TestExecute429Then500PoisonsOnlyThe500(t *testing.T) {
 		t.Fatalf("req2 uerr=%v, want success via fallback", uerr2)
 	}
 	_ = resp2.Body.Close()
-	if f.health.Healthy("a") {
+	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
 		t.Fatal("req2: the 500 must mark a unhealthy (consecutive-failure threshold 1)")
 	}
 }
@@ -256,7 +257,7 @@ func TestExecute500Then200RecoversEgress(t *testing.T) {
 		t.Fatalf("id=%q uerr=%v, want fallback to b", id, uerr)
 	}
 	_ = resp.Body.Close()
-	if f.health.Healthy("a") {
+	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
 		t.Fatal("a's 500 marks it unhealthy")
 	}
 

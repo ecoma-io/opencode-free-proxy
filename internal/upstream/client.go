@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,14 +22,20 @@ import (
 // Client performs the retrying upstream call (executors/base.js execute, the
 // single-URL shape this proxy uses).
 type Client struct {
-	HTTP  *http.Client
-	Sleep func(time.Duration)
-	Now   func() time.Time
+	// HTTP is the main transport: direct for unproxied and socks5 egresses,
+	// Go's absolute-form proxy path for HTTP origins behind an HTTP(S)
+	// proxy. tunneled (http/https proxy egresses only) carries HTTPS origins
+	// through the hand-rolled CONNECT boundary — attempt picks by scheme.
+	HTTP     *http.Client
+	tunneled *http.Client
+	Sleep    func(time.Duration)
+	Now      func() time.Time
 
-	// Proxy is the egress transport descriptor, carried so the failure
-	// taxonomy can tell a proxy's 407 from the origin's. Direct clients
-	// leave it nil.
-	Proxy *config.Proxy
+	// TLSConfig holds the ORIGIN TLS settings for the tunneled CONNECT
+	// transport (and, cloned in, the proxy hop when the proxy endpoint is
+	// itself https). Tests inject a root pool for self-signed fixtures;
+	// production leaves it nil (system roots). Set before first use.
+	TLSConfig *tls.Config
 }
 
 // NewClient wires an http.Client whose response-header wait is the connect
@@ -78,6 +85,13 @@ func (c *Client) Do(ctx context.Context, url string, buildHeaders func() map[str
 // classification only sharpens the terminal branches: transport errors get
 // their real class instead of a 502 guess, and 429 keeps its own class so
 // the executor can fall back without poisoning health.
+//
+// Classification PRECEDES the retry decision (issue #6): a typed proxy-auth
+// failure returns after ONE attempt without touching the shared budget — the
+// proxy will refuse the same credentials identically on every retry, so the
+// generic matrix would only add deterministic no-hope dials. The executor
+// still sees FallbackAllowed() and moves to the next egress. Every other
+// transport class keeps the base.js retry semantics.
 func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte) (*http.Response, *UpstreamError, Class) {
 	// base.js:104 `const retryAttemptsByUrl = {}` — ONE counter per URL shared
 	// by every retryable status and network errors alike. tryRetry checks
@@ -95,10 +109,17 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 			// [502]: prefix is applied at write time like every other error.
 			// The class is the REAL class (proxy-auth vs timeout vs
 			// connection vs ctx) — the 502 status is only the client-facing
-			// envelope. classifyNetErrFor knows whether a proxy was
-			// configured, so a CONNECT 407 (which only a proxy can produce)
-			// is proxy-auth while a direct dial error is not.
-			class := classifyNetErrFor(ctx, netErr, c.Proxy != nil)
+			// envelope. classifyNetErrFor reads typed transport-boundary
+			// errors only: a proxy CONNECT refusal carries a proxyAuthError
+			// marker from connect.go/socks5.go, so no error-text probing is
+			// involved.
+			class := classifyNetErrFor(ctx, netErr)
+			if class == ClassProxyAuthError {
+				// Deliberate divergence from the JS matrix (documented in
+				// issue #6): proxy-auth is terminal for THIS egress — one
+				// dial, no budget consumption, immediate executor fallback.
+				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
+			}
 			if !c.tryRetry(ctx, &used, config.RetryRules[502]) {
 				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 			}
@@ -117,7 +138,7 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 		if resp.StatusCode >= 400 {
 			raw, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			return nil, parseUpstreamError(resp.StatusCode, raw), classifyStatusFor(resp.StatusCode, c.Proxy, url)
+			return nil, parseUpstreamError(resp.StatusCode, raw), classifyStatusFor(resp.StatusCode)
 		}
 		return resp, nil, ClassSuccess
 	}
@@ -131,7 +152,9 @@ func drainAndClose(resp *http.Response) {
 }
 
 // attempt performs one POST without touching the response body; netErr
-// distinguishes transport failures.
+// distinguishes transport failures. The transport is picked by TARGET scheme:
+// https through an HTTP(S) proxy rides the tunneled CONNECT boundary, http
+// rides the absolute-form proxy transport (or the single direct/socks5 one).
 func (c *Client) attempt(ctx context.Context, url string, headers map[string]string, bodyJSON []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyJSON))
 	if err != nil {
@@ -140,7 +163,11 @@ func (c *Client) attempt(ctx context.Context, url string, headers map[string]str
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	return c.HTTP.Do(req)
+	client := c.HTTP
+	if req.URL.Scheme == "https" && c.tunneled != nil {
+		client = c.tunneled
+	}
+	return client.Do(req)
 }
 
 // tryRetry consumes one draw from the shared per-URL budget against this

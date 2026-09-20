@@ -19,7 +19,7 @@ import (
 // relay owns commitment from the moment Execute returns a non-nil response.
 type Executor struct {
 	clientFor func(*config.Egress) (*Client, bool)
-	health    *health.Registry // nil = health disabled
+	health    *health.Registry // nil = no registry wired (health off)
 	slots     *Limiter         // nil = unlimited
 }
 
@@ -33,11 +33,14 @@ func NewExecutor(clientFor func(*config.Egress) (*Client, bool), h *health.Regis
 }
 
 // AttemptPolicy carries the per-request (per-snapshot) bounds the executor
-// honors. MaxConcurrency maps egress id → cap (0 = unlimited).
+// honors. MaxConcurrency maps egress id → cap (0 = unlimited). HealthPolicy
+// is the request's OWN snapshot policy — observations are judged under it,
+// never under a global knob (issue #6).
 type AttemptPolicy struct {
 	FallbackEnabled bool
 	MaxAttempts     int // distinct egresses including the first; < 1 = 1
 	MaxConcurrency  map[string]int
+	HealthPolicy    health.Policy
 }
 
 // Execute walks the plan honoring the policy. Returns the live response
@@ -120,7 +123,10 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 				return nil, id, attempts, class, uerr
 			}
 			if class.MarksHealth() && x.health != nil {
-				x.health.Observe(id, false)
+				// State identity is id+transport (eg.HealthKey) so a policy-
+				// only reload keeps history while a transport swap starts
+				// clean; the POLICY is this request's snapshot.
+				x.health.Observe(eg.HealthKey(), false, policy.HealthPolicy)
 			}
 			if !class.FallbackAllowed() || attempts >= budget {
 				return nil, id, attempts, class, uerr
@@ -128,7 +134,7 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 			continue
 		}
 		if x.health != nil {
-			x.health.Observe(id, true)
+			x.health.Observe(eg.HealthKey(), true, policy.HealthPolicy)
 		}
 		if x.slots != nil {
 			resp.Body = &slotReleaseBody{ReadCloser: resp.Body, free: func() { x.slots.Release(id) }}

@@ -87,6 +87,29 @@ func (e *Egress) weight() int {
 	return *e.Weight
 }
 
+// TransportSignature names the PHYSICAL transport an egress dials through:
+// proxy type + URL, or "direct" for the host's own network. The per-egress
+// client cache is keyed by it (a reload that keeps a URL reuses the same
+// immutable client) and the health registry derives its state identity from
+// it (issue #6): a policy-only reload keeps the signature — history
+// continues — while swapping the proxy URL changes it, so a fresh physical
+// transport never inherits the old transport's failure streak or cooldown.
+// The signature can carry proxy credentials: it is a map key ONLY and must
+// never be logged (log lines name the egress id, never this string).
+func (e *Egress) TransportSignature() string {
+	if e.Proxy == nil {
+		return "direct"
+	}
+	return string(e.Proxy.Type) + ":" + e.Proxy.URL
+}
+
+// HealthKey is the health registry's state identity: logical egress id +
+// physical transport signature. The NUL separator cannot appear in a YAML id
+// or URL, so the concatenation is collision-free.
+func (e *Egress) HealthKey() string {
+	return e.ID + "\x00" + e.TransportSignature()
+}
+
 // IsEnabled reports whether the egress participates in scheduling (nil = yes).
 func (e *Egress) IsEnabled() bool { return e.enabled() }
 

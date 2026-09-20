@@ -4,21 +4,23 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"opencode-free-proxy/internal/config"
+	"opencode-free-proxy/internal/health"
+	"opencode-free-proxy/internal/routing"
 )
-
-// insecureTLS disables cert verification for the loopback origin fixture
-// (httptest TLS certs are self-signed for "example.com").
-func insecureTLS() *tls.Config { return &tls.Config{InsecureSkipVerify: true} }
 
 // noSleepClient stubs the retry sleep so hardening loops run instantly; every
 // failure row below exercises the 502 retry budget (1 initial + 3 retries).
@@ -30,56 +32,39 @@ func noSleepClient(c *Client, err error) *Client {
 	return c
 }
 
-// TestConnect407FromProxyIsProxyAuth: an HTTP CONNECT proxy answers 407 —
-// only a proxy can produce this error. stdlib strips the numeric code and
-// wraps the REASON PHRASE (transport.go strings.Cut → errors.New(text)), so a
-// string-contains "407" probe would MISS this; the phrase gate catches it and
-// the class is proxy-auth, not a generic connection error.
-func TestConnect407FromProxyIsProxyAuth(t *testing.T) {
-	var connects int
+// originRootPool builds a root pool trusting the httptest fixture origin, so
+// the tunneled/direct origin TLS verifies against it (the cert carries the
+// 127.0.0.1 SAN the server listens on).
+func originRootPool(t *testing.T, origin *httptest.Server) *x509.CertPool {
+	t.Helper()
+	pool := x509.NewCertPool()
+	pool.AddCert(origin.Certificate())
+	return pool
+}
+
+// connect407Proxy is a fake HTTP CONNECT proxy that counts CONNECTs and
+// always answers 407.
+func connect407Proxy(t *testing.T) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var connects atomic.Int64
 	pxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
 			t.Errorf("expected CONNECT, got %s", r.Method)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		connects++
+		connects.Add(1)
 		w.Header().Set("Proxy-Authenticate", `Basic realm="egress-proxy"`)
-		w.WriteHeader(http.StatusProxyAuthRequired) // 407
+		w.WriteHeader(http.StatusProxyAuthRequired)
 	}))
-	defer pxy.Close()
-
-	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL}))
-	resp, uerr, class := c.DoClassified(context.Background(), "https://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	if resp != nil {
-		_ = resp.Body.Close()
-	}
-	if class != ClassProxyAuthError {
-		t.Fatalf("class = %s, want ClassProxyAuthError", class)
-	}
-	if uerr == nil || uerr.Status != http.StatusBadGateway {
-		t.Fatalf("uerr = %+v, want the 502 envelope", uerr)
-	}
-	if !strings.Contains(uerr.Message, "Proxy Authentication Required") {
-		// Pins the stdlib shape: the number is gone, the phrase is the marker.
-		t.Fatalf("error text = %q, want the reason phrase (stdlib strips the 407 code)", uerr.Message)
-	}
-	if connects == 0 {
-		t.Fatal("proxy never saw the request")
-	}
+	t.Cleanup(pxy.Close)
+	return pxy, &connects
 }
 
-// TestOrigin407BehindProxyIsClientError: with an https target the proxy
-// CONNECT-tunnels; a 407 AFTER the tunnel can only come from the ORIGIN — it
-// must NOT be classified as proxy-auth (the tunnel means our proxy
-// credentials were accepted).
-func TestOrigin407BehindProxyIsClientError(t *testing.T) {
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusProxyAuthRequired)
-		_, _ = io.WriteString(w, `{"error":{"message":"origin auth"}}`)
-	}))
-	defer origin.Close()
-
+// tunnelingProxy is a fake CONNECT proxy that establishes real tunnels to
+// r.Host — the wire the origin-407-behind-proxy case travels.
+func tunnelingProxy(t *testing.T) *httptest.Server {
+	t.Helper()
 	pxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
 			w.WriteHeader(http.StatusBadRequest)
@@ -99,10 +84,85 @@ func TestOrigin407BehindProxyIsClientError(t *testing.T) {
 		go func() { _, _ = io.Copy(up, client) }()
 		go func() { _, _ = io.Copy(client, up) }()
 	}))
-	defer pxy.Close()
+	t.Cleanup(pxy.Close)
+	return pxy
+}
+
+// TestHTTPConnect407IsProxyAuth: an HTTP CONNECT proxy answers the CONNECT
+// with 407 — the ONE case where a 407 is provably proxy-owned. Our
+// hand-rolled CONNECT boundary (connect.go) reads the proxy's status line
+// itself and raises the typed *proxyAuthError, so the class is proxy-auth by
+// wire evidence, not text inference. The client-facing envelope stays 502
+// (network errors map to the 502 rule in the JS error matrix); the CLASS is
+// what drives retry/fallback.
+func TestHTTPConnect407IsProxyAuth(t *testing.T) {
+	pxy, connects := connect407Proxy(t)
 
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL}))
-	c.HTTP.Transport.(*http.Transport).TLSClientConfig = insecureTLS()
+	resp, uerr, class := c.DoClassified(context.Background(), "https://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if class != ClassProxyAuthError {
+		t.Fatalf("class = %s, want ClassProxyAuthError", class)
+	}
+	if uerr == nil || uerr.Status != http.StatusBadGateway {
+		t.Fatalf("uerr = %+v, want the 502 envelope for a transport-level refusal", uerr)
+	}
+	if !strings.Contains(uerr.Message, "CONNECT refused with 407") {
+		t.Fatalf("error text = %q, want the typed boundary message", uerr.Message)
+	}
+	if got := connects.Load(); got != 1 {
+		t.Fatalf("CONNECTs = %d, want exactly 1 (proxy-auth never rides the 502 retry matrix)", got)
+	}
+}
+
+// TestHTTPSProxyConnect407IsProxyAuth: the same refusal through an HTTPS
+// proxy endpoint (TLS to the proxy BEFORE the CONNECT). The typed marker must
+// survive the extra hop — this exercises connectDialer's https branch.
+func TestHTTPSProxyConnect407IsProxyAuth(t *testing.T) {
+	var connects atomic.Int64
+	pxy := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		connects.Add(1)
+		w.WriteHeader(http.StatusProxyAuthRequired)
+	}))
+	defer pxy.Close()
+
+	u, err := url.Parse(pxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := newConnectDialer(u, func() *tls.Config { return nil })
+	d.proxyTLS = &tls.Config{InsecureSkipVerify: true} // fixture: self-signed proxy cert
+	_, derr := d.DialTLSContext(context.Background(), "tcp", "origin.invalid:443")
+	var pae *proxyAuthError
+	if !errors.As(derr, &pae) {
+		t.Fatalf("err = %v (%T), want *proxyAuthError", derr, derr)
+	}
+	if got := connects.Load(); got != 1 {
+		t.Fatalf("CONNECTs = %d, want 1", got)
+	}
+}
+
+// TestHTTPSOrigin407IsClientError: with an https target the proxy
+// CONNECT-tunnels; a 407 AFTER the tunnel can only come from the ORIGIN — the
+// proxy already accepted our credentials at CONNECT time. It must NOT
+// classify as proxy-auth; it surfaces to the client as the 407 it is.
+func TestHTTPSOrigin407IsClientError(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusProxyAuthRequired)
+		_, _ = io.WriteString(w, `{"error":{"message":"origin auth"}}`)
+	}))
+	defer origin.Close()
+
+	pxy := tunnelingProxy(t)
+
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL}))
+	c.TLSConfig = &tls.Config{RootCAs: originRootPool(t, origin)}
 	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
 	if resp != nil {
 		_ = resp.Body.Close()
@@ -115,10 +175,38 @@ func TestOrigin407BehindProxyIsClientError(t *testing.T) {
 	}
 }
 
-// TestForwardProxy407WithCredsIsProxyAuth: an http TARGET through an http
-// proxy with credentials — we sent Proxy-Authorization and the proxy gated
-// us (the origin never saw the request). Definitive proxy-auth.
-func TestForwardProxy407WithCredsIsProxyAuth(t *testing.T) {
+// TestDirectOrigin407IsClientError: no proxy in the path at all — a 407 is
+// the origin's own verdict about the request. Plain client_error.
+func TestDirectOrigin407IsClientError(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusProxyAuthRequired)
+	}))
+	defer origin.Close()
+
+	c := NewClient()
+	c.Sleep = func(time.Duration) {}
+	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if class != ClassClientError {
+		t.Fatalf("class = %s, want ClassClientError", class)
+	}
+	if uerr == nil || uerr.Status != http.StatusProxyAuthRequired {
+		t.Fatalf("uerr = %+v, want status 407", uerr)
+	}
+}
+
+// TestHTTPOrigin407ThroughForwardProxyIsNotBlindlyProxyAuth: a plain-http
+// target through a forward proxy is the AMBIGUOUS case — the proxy relays
+// requests and replies byte-for-byte, so a 407 may be the proxy gating the
+// request OR the origin's own answer, and no header is reliably proxy-authored
+// (issue #6 rejects content sniffing). Even though we SENT Proxy-Authorization
+// (asserted below), the conservative class is client_error: no fallback (the
+// next egress would repeat the rejection), no health mark (a credential
+// problem is not an outage). Only the transport boundary — a CONNECT refusal,
+// an RFC 1929 rejection — may claim proxy_auth_error.
+func TestHTTPOrigin407ThroughForwardProxyIsNotBlindlyProxyAuth(t *testing.T) {
 	pxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !r.URL.IsAbs() {
 			t.Errorf("forward proxy expected an absolute-URI request, got %s", r.URL)
@@ -135,35 +223,96 @@ func TestForwardProxy407WithCredsIsProxyAuth(t *testing.T) {
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassProxyAuthError {
-		t.Fatalf("class = %s, want ClassProxyAuthError", class)
+	if class != ClassClientError {
+		t.Fatalf("class = %s, want ClassClientError (ambiguous 407 must not be promoted by credentials-sent)",
+			class)
 	}
 	if uerr == nil || uerr.Status != http.StatusProxyAuthRequired {
 		t.Fatalf("uerr = %+v, want status 407", uerr)
 	}
 }
 
-// TestForwardProxy407NoCredsIsClientError: same shape without credentials —
-// ambiguous (proxy wants what we never sent, or the origin answered). The
-// conservative choice: a client error, no fallback onto the next proxy with
-// the same missing credentials and no health poison of a healthy egress.
-func TestForwardProxy407NoCredsIsClientError(t *testing.T) {
-	pxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusProxyAuthRequired)
-	}))
-	defer pxy.Close()
+// TestProxyAuthFailureDoesNotUseGeneric502Retry: egress a sits behind a
+// CONNECT-407 proxy, egress b is a healthy https origin. The proxy-auth
+// refusal must cost a EXACTLY ONE dial — the generic 502 matrix (1 initial +
+// 3 retries = 4 POSTs) must NOT run, because the proxy refuses the same
+// credentials identically every time (issue #6 §5: A=1 call, never A=4).
+func TestProxyAuthFailureDoesNotUseGeneric502Retry(t *testing.T) {
+	f := newProxyAuthFixture(t)
 
-	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.origin.URL+"/zen/v1/chat/completions",
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), f.plan, policy(true, 3))
 	if resp != nil {
-		_ = resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 	}
-	if class != ClassClientError {
-		t.Fatalf("class = %s, want ClassClientError", class)
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr=%v resp=%v, want fallback to b serving", uerr, resp)
 	}
-	if uerr == nil || uerr.Status != http.StatusProxyAuthRequired {
-		t.Fatalf("uerr = %+v, want status 407", uerr)
+	if id != "b" || attempts != 2 || class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d class=%s, want b/2/success", id, attempts, class)
 	}
+	if got := f.connects.Load(); got != 1 {
+		t.Fatalf("CONNECTs on a = %d, want 1 (never the 502 matrix's 4)", got)
+	}
+	// The refusal is a true egress failure class: it must have marked health.
+	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
+		t.Fatal("a's proxy-auth refusal must mark it unhealthy (threshold 1)")
+	}
+}
+
+// proxyAuthFixture: egress a dials through a CONNECT-407 fake proxy, egress b
+// is a healthy https origin reached directly.
+type proxyAuthFixture struct {
+	exec     *Executor
+	health   *health.Registry
+	origin   *httptest.Server
+	connects *atomic.Int64
+	plan     routing.RoutePlan
+}
+
+func newProxyAuthFixture(t *testing.T) *proxyAuthFixture {
+	t.Helper()
+	pxy, connects := connect407Proxy(t)
+	origin := httpsOKOrigin(t)
+	pool := originRootPool(t, origin)
+
+	a, err := NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Sleep = func(time.Duration) {}
+	// b is DIRECT, so its origin trust rides the transport's TLSClientConfig
+	// (Client.TLSConfig only feeds the tunneled CONNECT boundary).
+	b := NewClient()
+	b.Sleep = func(time.Duration) {}
+	b.HTTP.Transport.(*http.Transport).TLSClientConfig = &tls.Config{RootCAs: pool}
+	clients := map[string]*Client{"a": a, "b": b}
+
+	rt := fixtureRuntime(map[string]int{"a": 200, "b": 200})
+	healthReg := health.New()
+	exec := NewExecutor(func(e *config.Egress) (*Client, bool) {
+		c, ok := clients[e.ID]
+		return c, ok
+	}, healthReg, NewLimiter())
+
+	egA, _ := rt.Egress("a")
+	egB, _ := rt.Egress("b")
+	plan := routing.RoutePlan{RouteID: "r", Strategy: config.StrategyRoundRobin, Attempts: []string{"a", "b"}}
+	plan.Egresses = []*config.Egress{egA, egB}
+
+	return &proxyAuthFixture{exec: exec, health: healthReg, origin: origin, connects: connects, plan: plan}
+}
+
+// httpsOKOrigin is a 200-speaking https fixture origin.
+func httpsOKOrigin(t *testing.T) *httptest.Server {
+	t.Helper()
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(origin.Close)
+	return origin
 }
 
 // ---- SOCKS5 (RFC 1928 + RFC 1929) ----
@@ -302,8 +451,8 @@ type errSocks string
 func (e errSocks) Error() string { return string(e) }
 
 // TestSocks5AuthFailureIsProxyAuth: the proxy demanded a username/password
-// (RFC 1929) and rejected our credentials — a typed proxyAuthError, so the
-// class is proxy-auth regardless of any "407" text.
+// (RFC 1929) and rejected our credentials — a typed proxyAuthError from the
+// boundary code, so the class is proxy-auth regardless of any error text.
 func TestSocks5AuthFailureIsProxyAuth(t *testing.T) {
 	f := newSocks5Fake(t, 0x02, 0x01, 0x00) // auth required, reject creds
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://user:bad@" + strings.TrimPrefix(f.url, "socks5://")}))

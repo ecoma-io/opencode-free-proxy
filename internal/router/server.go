@@ -18,7 +18,10 @@ import (
 // Server carries the process-wide dependencies. Upstream is the DIRECT
 // client, retained for the UA warm/sync path only (GitHub is reached
 // directly, never through an egress proxy); per-egress clients are built
-// lazily by clientForEgress and cached by proxy signature.
+// lazily by clientForEgress and cached by transport signature. Health owns
+// process-wide STATE only — the POLICY travels with each request's snapshot
+// (health.PolicyFromSnapshot at relay time), so no global tuning is ever
+// applied or stored here.
 type Server struct {
 	Cfg       *config.Config
 	Store     *config.Store
@@ -33,13 +36,10 @@ type Server struct {
 	sleep    func(time.Duration)
 	clientMu sync.Mutex
 	clients  map[string]*upstream.Client
-	// healthMu serializes health-threshold application: Load → Configure →
-	// Store must be atomic so a request holding a STALE snapshot can never
-	// overwrite a newer generation's tuning (see applyHealth).
-	healthMu sync.Mutex
-	// healthGen is the last generation whose health thresholds were applied
-	// (applyHealth, once per generation — never per request).
-	healthGen atomic.Uint64
+	// prunedGen is the last generation whose transport cache was pruned
+	// (onGeneration, once per generation, monotonic — a request holding a
+	// STALE snapshot never prunes against its older keep-set).
+	prunedGen atomic.Uint64
 	logf      func(format string, args ...any)
 }
 
@@ -66,11 +66,6 @@ func NewServer(cfg *config.Config, store *config.Store, ua *identity.UserAgentCa
 		logf:      logf,
 	}
 	s.Exec = upstream.NewExecutor(s.clientForEgress, s.Health, s.Slots)
-	// Seed health thresholds from the CURRENT snapshot; relay() re-applies
-	// only when the generation advances past healthGen. healthGen starts at
-	// the never-applied sentinel so the seed always runs.
-	s.healthGen.Store(^uint64(0))
-	s.applyHealth(s.runtime())
 	return s
 }
 
@@ -90,16 +85,17 @@ func (s *Server) runtime() *config.Runtime {
 func (s *Server) Drain() { s.Draining.Store(true) }
 
 // clientForEgress resolves a snapshot-resolved egress to its transport,
-// cached by proxy signature ("type:url" — never logged). Because the cache
-// key is the transport itself, a config reload that keeps a proxy URL reuses
-// the SAME immutable client — generations sharing a transport share a
-// transport — and a reload that swaps URLs simply adds a new entry: the old
-// client stays alive for in-flight requests that still reference it. No
-// runtime lookup happens here; the egress comes from the request's snapshot
-// (routing.Plan), so this method cannot see a reload under an active
-// request. Returns false only when the transport cannot be built.
+// cached by transport signature (Egress.TransportSignature — type:url, never
+// logged). Because the cache key is the transport itself, a config reload
+// that keeps a proxy URL reuses the SAME immutable client — generations
+// sharing a transport share a transport — and a reload that swaps URLs
+// simply adds a new entry: the old client stays alive for in-flight requests
+// that still reference it. No runtime lookup happens here; the egress comes
+// from the request's snapshot (routing.Plan), so this method cannot see a
+// reload under an active request. Returns false only when the transport
+// cannot be built.
 func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
-	sig := proxySignature(e)
+	sig := e.TransportSignature()
 	s.clientMu.Lock()
 	defer s.clientMu.Unlock()
 	if c, ok := s.clients[sig]; ok {
@@ -115,43 +111,40 @@ func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
 	return c, true
 }
 
-// applyHealth applies the snapshot's health thresholds when its generation
-// is not already applied. The registry stays global mutable state keyed by
-// egress id (deliberate — see internal/health); this bounds how often config
-// tuning touches it: once per generation, never per request. The fast path
-// is lock-free (the common case: this or a NEWER generation already applied
-// — a request holding an old snapshot must never regress the tuning); the
-// slow path takes healthMu so Load → Configure → Store is atomic and a
-// stale-generation racer can never interleave Configure with a newer one.
-func (s *Server) applyHealth(rt *config.Runtime) {
-	if cur := s.healthGen.Load(); cur == rt.Generation || (cur != ^uint64(0) && cur > rt.Generation) {
+// onGeneration runs once-per-generation transport-cache maintenance: when
+// the request's snapshot is from a generation NEWER than the last one
+// serviced, prune cached transports absent from that snapshot (a reload that
+// swapped out a proxy URL). The guard is a monotonic CAS: a request holding
+// a STALE snapshot never prunes against its older keep-set (it would drop a
+// newer generation's transports), and concurrent racers converge instead of
+// racing a mutex. In-flight requests hold their *Client by reference (the
+// map is only a lookup), so pruning cannot invalidate them — the old client
+// lives until the request's last reference and GC drops it. Generation 0 is
+// the built-in default runtime: nothing to prune.
+func (s *Server) onGeneration(rt *config.Runtime) {
+	if rt.Generation == 0 {
 		return
 	}
-	s.healthMu.Lock()
-	defer s.healthMu.Unlock()
-	if cur := s.healthGen.Load(); cur == rt.Generation || (cur != ^uint64(0) && cur > rt.Generation) {
-		return // reconfirm under the lock: a concurrent apply won the race
+	for {
+		cur := s.prunedGen.Load()
+		if cur >= rt.Generation {
+			return
+		}
+		if s.prunedGen.CompareAndSwap(cur, rt.Generation) {
+			s.pruneClients(rt)
+			return
+		}
 	}
-	enabled := rt.Health.Enabled == nil || *rt.Health.Enabled
-	s.Health.Configure(enabled, rt.HealthThreshold(), rt.HealthCooldown())
-	s.healthGen.Store(rt.Generation)
-	// A swap happened: prune cached transports whose signature no longer
-	// exists in this snapshot. In-flight requests hold their *Client by
-	// reference (the map is only a lookup), so pruning cannot invalidate
-	// them — the old client lives until the request's last reference and GC
-	// drops it.
-	s.pruneClients(rt)
 }
 
 // pruneClients drops cached per-egress transports absent from the snapshot's
-// routes (a reload that swapped out a proxy URL). Called only from
-// applyHealth, once per generation, already holding healthMu.
+// routes. Called only from onGeneration, once per generation.
 func (s *Server) pruneClients(rt *config.Runtime) {
 	keep := make(map[string]struct{}, 8)
 	for _, r := range rt.Routes() {
 		for _, id := range r.Egress {
 			if e, ok := rt.Egress(id); ok {
-				keep[proxySignature(e)] = struct{}{}
+				keep[e.TransportSignature()] = struct{}{}
 			}
 		}
 	}
@@ -164,18 +157,13 @@ func (s *Server) pruneClients(rt *config.Runtime) {
 	}
 }
 
-func proxySignature(e *config.Egress) string {
-	if e.Proxy == nil {
-		return "direct:"
-	}
-	return string(e.Proxy.Type) + ":" + e.Proxy.URL
-}
-
 // routeHeads filters the route's egress list to the CURRENTLY eligible head
 // set: enabled, streaming-compatible, model allow-list, body-size bound,
 // health-eligible, and under its concurrency cap (a soft Peek — the executor
-// re-checks with Acquire at dial time). Order follows route.Egress.
-func (s *Server) routeHeads(rt *config.Runtime, route config.Route, p routing.Profile) []string {
+// re-checks with Acquire at dial time). Order follows route.Egress. Health
+// is judged under the REQUEST's snapshot policy (hp) against the egress's
+// id+transport identity — never against a global knob.
+func (s *Server) routeHeads(rt *config.Runtime, route config.Route, p routing.Profile, hp health.Policy) []string {
 	heads := make([]string, 0, len(route.Egress))
 	for _, id := range route.Egress {
 		e, ok := rt.Egress(id)
@@ -191,7 +179,7 @@ func (s *Server) routeHeads(rt *config.Runtime, route config.Route, p routing.Pr
 		if e.MaxBodyBytes > 0 && p.BodyBytes > e.MaxBodyBytes {
 			continue
 		}
-		if s.Health != nil && !s.Health.Healthy(id) {
+		if s.Health != nil && !s.Health.Healthy(e.HealthKey(), hp) {
 			continue
 		}
 		if s.Slots != nil && !s.Slots.Peek(id, e.MaxConcurrency) {

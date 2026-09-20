@@ -3,27 +3,64 @@
 // chooses where to start, fallback chooses what to try after a retryable
 // failure, health decides whether an egress may be tried AT ALL for a while.
 //
-// The registry is keyed by egress id and survives config swaps: state for an
-// egress that leaves the config is inert until its id returns, at which
-// point its history resumes.
+// Policy and state are deliberately split (issue #6):
+//
+//   - STATE (the per-identity failure counter + cooldown deadline) is
+//     process-wide runtime state. It survives config swaps and is shared by
+//     every generation.
+//   - POLICY (enabled / threshold / cooldown duration) is immutable per
+//     request: the caller passes the Policy captured from ITS config
+//     snapshot on every call. A hot reload therefore affects only new
+//     requests — a request pinned to generation 1 keeps adjudicating its
+//     observations under generation 1's thresholds even after generation 2
+//     is live.
+//
+// Reloading the policy never arms or clears a cooldown by itself — only an
+// Observe crossing the observing request's threshold arms one. A threshold
+// DECREASE (10 → 3, streak 3) thus leaves the egress healthy until its next
+// failing observation, and an INCREASE (3 → 10, streak 2) keeps the streak
+// for later observers to judge. See the tests for the full semantics table.
 package health
 
 import (
 	"sync"
 	"time"
+
+	"opencode-free-proxy/internal/config"
 )
 
-// Registry tracks per-egress failure state. Zero value is not usable; use
-// New. Configure applies the current snapshot's policy — it is called on
-// every request (a mutex-protected field write), so a hot reload of
-// threshold/cooldown takes effect on the next request.
+// Policy is the immutable health policy of one config generation. It is a
+// value type: a request captures it once (from its snapshot) and passes the
+// same copy to every Healthy/Observe call it makes.
+type Policy struct {
+	Enabled   bool
+	Threshold int // consecutive failures before cooldown; <= 0 = never cools
+	Cooldown  time.Duration
+}
+
+// PolicyFromSnapshot resolves the generation's effective policy (defaults
+// applied, explicit 0 preserved). One call per request, at snapshot pin time.
+func PolicyFromSnapshot(rt *config.Runtime) Policy {
+	return Policy{
+		Enabled:   rt.Health.Enabled == nil || *rt.Health.Enabled,
+		Threshold: rt.HealthThreshold(),
+		Cooldown:  rt.HealthCooldown(),
+	}
+}
+
+// Registry tracks per-identity failure state. Zero value is not usable; use
+// New. The registry itself carries NO policy: every method receives the
+// caller's snapshot-pinned Policy.
+//
+// State identity: keys are egress id + transport signature
+// (config.Egress.HealthKey). A policy-only reload keeps the same key —
+// history continues across generations; swapping an egress's proxy URL
+// changes the key, so a fresh physical transport never inherits the old
+// transport's failure streak or cooldown.
 type Registry struct {
-	mu        sync.Mutex
-	enabled   bool
-	threshold int // consecutive failures before cooldown; <= 0 = never cools
-	cooldown  time.Duration
-	now       func() time.Time
-	states    map[string]*state
+	mu     sync.Mutex
+	now    func() time.Time
+	states map[string]*state
 }
 
 type state struct {
@@ -35,30 +72,24 @@ func New() *Registry {
 	return &Registry{now: time.Now, states: map[string]*state{}}
 }
 
-// Configure applies the policy (nil-safe: a disabled registry makes Healthy
-// always true and Observe a no-op).
-func (r *Registry) Configure(enabled bool, threshold int, cooldown time.Duration) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.enabled = enabled
-	r.threshold = threshold
-	r.cooldown = cooldown
-}
-
-// Observe records one outcome. A success resets the failure streak. A
-// failure counts toward the threshold; crossing it arms the cooldown.
-// Failures during an active cooldown never extend it (the cooldown bounds
-// the absence — repeated failures can't push an egress out indefinitely).
-func (r *Registry) Observe(id string, ok bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.enabled || r.threshold <= 0 {
+// Observe records one outcome for the identity, judged under the OBSERVING
+// request's policy. A disabled policy or a never-cool threshold (<= 0)
+// records nothing — an operator who turned health off (or off for cooldown
+// purposes) gets no history accrual either. A success resets the failure
+// streak; a failure counts toward the threshold, and CROSSING it arms the
+// cooldown for the observing policy's duration. Failures during an active
+// cooldown never extend it (the cooldown bounds the absence — repeated
+// failures can't push an egress out indefinitely).
+func (r *Registry) Observe(key string, ok bool, p Policy) {
+	if !p.Enabled || p.Threshold <= 0 {
 		return
 	}
-	st := r.states[id]
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.states[key]
 	if st == nil {
 		st = &state{}
-		r.states[id] = st
+		r.states[key] = st
 	}
 	if ok {
 		st.failures = 0
@@ -69,21 +100,24 @@ func (r *Registry) Observe(id string, ok bool) {
 		return // already cooling; don't extend
 	}
 	st.failures++
-	if st.failures >= r.threshold {
-		st.until = r.now().Add(r.cooldown)
+	if st.failures >= p.Threshold {
+		st.until = r.now().Add(p.Cooldown)
 		st.failures = 0
 	}
 }
 
-// Healthy reports whether the egress may be scheduled. Unknown egresses and
-// the disabled registry are always healthy.
-func (r *Registry) Healthy(id string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.enabled {
+// Healthy reports whether the identity may be scheduled, judged under the
+// ASKING request's policy. Unknown identities are always healthy; a disabled
+// policy answers healthy for everything (the state stays put — re-enabling
+// health resumes from the preserved history rather than inventing a clean
+// slate).
+func (r *Registry) Healthy(key string, p Policy) bool {
+	if !p.Enabled {
 		return true
 	}
-	st := r.states[id]
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.states[key]
 	if st == nil {
 		return true
 	}

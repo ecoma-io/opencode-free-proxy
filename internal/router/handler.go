@@ -22,6 +22,7 @@ import (
 
 	"opencode-free-proxy/internal/caps"
 	"opencode-free-proxy/internal/cloak"
+	"opencode-free-proxy/internal/health"
 	"opencode-free-proxy/internal/jsonx"
 	"opencode-free-proxy/internal/relay"
 	"opencode-free-proxy/internal/routing"
@@ -225,16 +226,17 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		}
 	}
 
-	// ---- routing: match the CURRENT snapshot, filter to the eligible head
-	// set and let the scheduler order it. Health tuning is applied once per
-	// generation (generation CAS, seeded at NewServer) so a reload of
-	// threshold/cooldown takes effect on the first request of the new config;
-	// routing (start selection), fallback (attempt loop) and health
-	// (temporary eligibility) stay three separate decisions.
+	// ---- routing: pin ONE immutable snapshot for the whole request, resolve
+	// its health policy next to it, filter to the eligible head set and let
+	// the scheduler order it. Every downstream decision — route, egress
+	// transports, fallback budget, concurrency caps, health eligibility AND
+	// the policy health is judged under — comes from this rt; nothing after
+	// this point re-reads the store, so a hot reload affects only requests
+	// that have not started yet. Routing (start selection), fallback (attempt
+	// loop) and health (temporary eligibility) stay three separate decisions.
 	rt := s.runtime()
-	if s.Health != nil {
-		s.applyHealth(rt)
-	}
+	hp := health.PolicyFromSnapshot(rt)
+	s.onGeneration(rt)
 	profile := routing.Profile{
 		Model:     cleanModel,
 		Streaming: clientRequestedStreaming,
@@ -246,7 +248,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		writeError(w, http.StatusBadRequest, "No route matched this request")
 		return
 	}
-	heads := s.routeHeads(rt, route, profile)
+	heads := s.routeHeads(rt, route, profile, hp)
 	if len(heads) == 0 {
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("No eligible egress for route %q", route.ID))
 		return
@@ -274,6 +276,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		FallbackEnabled: rt.Fallback.Enabled == nil || *rt.Fallback.Enabled,
 		MaxAttempts:     rt.Fallback.MaxAttempts,
 		MaxConcurrency:  make(map[string]int, len(heads)),
+		HealthPolicy:    hp,
 	}
 	for _, id := range heads {
 		if e, ok := rt.Egress(id); ok {
