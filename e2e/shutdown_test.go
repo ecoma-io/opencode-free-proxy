@@ -60,8 +60,9 @@ func slowChunkUpstream(t *testing.T, ticks int, tick time.Duration, done chan st
 func TestGracefulDrainFinishesInFlightStream(t *testing.T) {
 	done := make(chan struct{})
 	up := slowChunkUpstream(t, 10, 150*time.Millisecond, done)
-	sp := spawnProxy(t, cfgDir(t), map[string]string{
-		"OFP_UPSTREAM_BASE":  up.URL,
+	dir := cfgDir(t)
+	writeCFG(t, dir, upstreamBase(up.URL)+"egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n")
+	sp := spawnProxy(t, dir, map[string]string{
 		"OFP_SHUTDOWN_GRACE": "5000",
 	})
 
@@ -182,9 +183,9 @@ func TestGraceForcesCloseStalledStream(t *testing.T) {
 	}))
 	t.Cleanup(func() { up.Close() })  // runs LAST (LIFO)
 	t.Cleanup(func() { close(stop) }) // runs FIRST: unblock the handler
-
-	sp := spawnProxy(t, cfgDir(t), map[string]string{
-		"OFP_UPSTREAM_BASE":  up.URL,
+	dir := cfgDir(t)
+	writeCFG(t, dir, upstreamBase(up.URL)+"egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n")
+	sp := spawnProxy(t, dir, map[string]string{
 		"OFP_SHUTDOWN_GRACE": "300",
 	})
 

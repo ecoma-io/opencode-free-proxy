@@ -6,11 +6,11 @@ package router
 //
 // NOTE on wiring: the JS route fetches a caller-supplied `url` and returns
 // {data: []} when the fetch fails; the Go proxy serves /v1/models directly and
-// derives the URL from the configured upstream base (s.Cfg.UpstreamBase +
-// "/zen/v1/models"), so the happy path is redirectable like the JS route. The
-// FILTER logic is unit-tested through parseUpstreamModels; the handler test
-// below exercises the fallback (unreachable base), and e2e/models via the
-// e2e tag exercises the happy path against a fake upstream.
+// derives the URL from the pinned runtime's upstream.base (OFP_CONFIG
+// upstream.base + "/zen/v1/models"), so the happy path is redirectable like
+// the JS route. The FILTER logic is unit-tested through parseUpstreamModels;
+// the handler test below exercises the fallback (unreachable base), and
+// e2e/models via the e2e tag exercises the happy path against a fake upstream.
 
 import (
 	"encoding/json"
@@ -73,15 +73,25 @@ func TestParseUpstreamModels(t *testing.T) {
 // TestHandleModelsFallsBackToStaticRegistry: when the upstream model list is
 // unreachable the static registry models are served (registry/opencode.js
 // models + the known-free id). The test's upstream base is a closed port, so
-// the fetch fails and the fallback kicks in.
+// modelsServer wires a Server whose runtime pins an unreachable upstream base
+// (upstream.base from the config doc — same snapshot path as main.go), with a
+// cold UA cache. The base is a closed port so the /v1/models fetch fails.
+func modelsServer(t *testing.T) *Server {
+	t.Helper()
+	doc := "upstream:\n  base: \"http://127.0.0.1:1\"\n" +
+		"egress:\n  - {id: direct}\n" +
+		"routes:\n  - {id: default, egress: [direct]}\n"
+	p := writeCfg(t, t.TempDir(), doc)
+	store, err := config.NewStore(p, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Stop)
+	return NewServer(store, identity.NewUserAgentCache(), upstream.NewClient(), nil, nil)
+}
+
 func TestHandleModelsFallsBackToStaticRegistry(t *testing.T) {
-	s := NewServer(
-		&config.Config{Port: "0", UpstreamBase: "http://127.0.0.1:1"},
-		config.NewDefault(),
-		identity.NewUserAgentCache(),
-		upstream.NewClient(),
-		nil, nil,
-	)
+	s := modelsServer(t)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	s.HandleModels(rec, req)
@@ -118,13 +128,7 @@ func TestHandleModelsFallsBackToStaticRegistry(t *testing.T) {
 // chat/responses — a shutting-down process must not start an upstream fetch
 // it may not finish.
 func TestHandleModelsDrainGateAnswers503(t *testing.T) {
-	s := NewServer(
-		&config.Config{Port: "0", UpstreamBase: "http://127.0.0.1:1"},
-		config.NewDefault(),
-		identity.NewUserAgentCache(),
-		upstream.NewClient(),
-		nil, nil,
-	)
+	s := modelsServer(t)
 	s.Drain()
 	rec := httptest.NewRecorder()
 	s.HandleModels(rec, httptest.NewRequest("GET", "/v1/models", nil))

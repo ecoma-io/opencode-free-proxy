@@ -4,10 +4,13 @@
 #
 # Usage:
 #   docker compose up -d --build                  # anonymous free tier
-#   OFP_API_KEY=secret HOST_PORT=9090 docker compose up -d --build
+#   HOST_PORT=9090 docker compose up -d --build   # different host port
 #
-# Point a client at http://localhost:8090/v1 (Bearer only when OFP_API_KEY
-# was set).
+# The proxy's service settings (upstream base, inbound auth, UA sync cadence)
+# live in the OFP_CONFIG document mounted below — the removed OFP_API_KEY /
+# OFP_UPSTREAM_BASE / OFP_UA_SYNC_INTERVAL env vars no longer exist. See
+# compose.config.yaml and example.config.yaml for how to enable auth or a
+# non-default upstream.
 
 services:
   proxy:
@@ -21,8 +24,11 @@ services:
     ports:
       - "${HOST_PORT:-30258}:8090"
     environment:
-      # Inbound auth is optional: set OFP_API_KEY in the shell to require a
-      # Bearer key from clients; leave unset to keep auth off.
-      OFP_API_KEY: ${OFP_API_KEY:-}
-      # UA triple sync cadence in ms (default 1h). Rarely needed in testing.
-      OFP_UA_SYNC_INTERVAL: ${OFP_UA_SYNC_INTERVAL:-}
+      # The config document is the single source of truth for upstream.base,
+      # auth.keys, and user_agent.sync_interval. The file is re-read every
+      # poll interval and hot-reloaded on change.
+      OFP_CONFIG: /etc/ofp/config.yaml
+    volumes:
+      # Bind, don't copy: editing the file on the host (adding an auth
+      # section, pointing upstream.base elsewhere) hot-reloads in place.
+      - ./compose.config.yaml:/etc/ofp/config.yaml:ro

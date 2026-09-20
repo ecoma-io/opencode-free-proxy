@@ -64,7 +64,7 @@ egress:
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), "http://upstream.invalid", nil)
+`, pxyURL(proxyA), pxyURL(proxyB)), nil)
 
 	// Request 1: pins generation 1's keys (keyA included) and blocks inside
 	// a's dial. a must be HEALTHY here — a cooling a would be filtered from
@@ -104,7 +104,7 @@ routes:
 
 	// Swap to generation 2: route [b] only. a's identity is now INACTIVE —
 	// the next reclaim would collect it, were it not pinned.
-	writeCfg(t, dir, fmt.Sprintf(`
+	writeCfg(t, dir, testUpstreamBasePrefix+fmt.Sprintf(`
 health:
   enabled: true
   failure_threshold: 1
@@ -222,7 +222,7 @@ routes:
   - {id: r, egress: [c]}
 `, pxyURL(proxyC))
 
-	s, mux, store := snapshotRouter(t, dir, oddDoc, "http://upstream.invalid", nil)
+	s, mux, store := snapshotRouter(t, dir, oddDoc, nil)
 
 	// Arm a: odd-generation requests must find it cooling (heads empty → 502)
 	// unless an even-generation reclaim legitimately wiped the state.
@@ -247,7 +247,7 @@ routes:
 				return
 			default:
 			}
-			writeCfgAtomic(t, dir, doc)
+			writeCfgAtomic(t, dir, testUpstreamBasePrefix+doc)
 			if doc == evenDoc {
 				doc = oddDoc
 			} else {

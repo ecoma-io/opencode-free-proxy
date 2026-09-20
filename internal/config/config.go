@@ -17,10 +17,14 @@ const (
 	// public` reject requests that do not look like the official OpenCode
 	// agentic client. stream must be true; tools must include the fingerprint
 	// quartet; User-Agent must look like opencode >= 1.17.
-	ChatCompletionsURL = UpstreamBase + "/zen/v1/chat/completions"
-	ResponsesURL       = UpstreamBase + "/zen/v1/responses"
-	ModelsURL          = UpstreamBase + "/zen/v1/models"
-	PublicBearer       = "public"
+	// Zen* paths are the request suffixes on the CONFIGURED upstream base
+	// (the OFP_CONFIG upstream.base, default https://opencode.ai); request
+	// URLs are never absolute outside this const set (upstream.BuildURL,
+	// models.go, cloak).
+	ZenChatPath      = "/zen/v1/chat/completions"
+	ZenResponsesPath = "/zen/v1/responses"
+	ZenModelsPath    = "/zen/v1/models"
+	PublicBearer     = "public"
 
 	// Free-model selection (mirrors src/app/api/providers/suggested-models/filters.js).
 	// "big-pickle" is free without the -free suffix; deepseek-v4-flash-free
@@ -66,11 +70,12 @@ const (
 	RootPackageJSONPath = "package.json"
 	LockfilePath        = "bun.lock"
 
-	// UASyncInterval is the background sync cadence for the UA triple. The
-	// request hot path NEVER triggers a fetch (documented divergence from
-	// opencodeClientVersion.js lazy warm — the ticker keeps the cache at
-	// most one interval stale instead). Override with OFP_UA_SYNC_INTERVAL
-	// (milliseconds).
+	// UASyncInterval is the default background sync cadence for the UA
+	// triple. The request hot path NEVER triggers a fetch (documented
+	// divergence from opencodeClientVersion.js lazy warm — the ticker keeps
+	// the cache at most one interval stale instead). OFP_CONFIG section
+	// user_agent.sync_interval (integer seconds, 0 = disabled) overrides it
+	// per generation.
 	UASyncInterval = time.Hour
 )
 
@@ -157,14 +162,14 @@ var DefaultErrorMessages = map[int]string{
 	504: "Gateway timeout",
 }
 
-// FromEnv builds the runtime config from environment variables.
+// FromEnv builds the process-bootstrap config from environment variables.
+// Every SERVICE setting (upstream base, inbound auth keys, UA sync cadence)
+// lives in the OFP_CONFIG YAML document instead — see file.go; these four
+// variables are deliberately not part of it.
 type Config struct {
-	Port           string
-	APIKey         string // optional inbound API key; empty = no auth
-	UpstreamBase   string
-	UASyncInterval time.Duration
-	// ConfigPath is OFP_CONFIG: the routing config file. Empty = the
-	// default single-egress runtime.
+	Port string
+	// ConfigPath is OFP_CONFIG: the routing + service config file. Empty =
+	// the built-in default runtime.
 	ConfigPath string
 	// ShutdownGrace is OFP_SHUTDOWN_GRACE: how long draining waits for
 	// active requests/streams before forced close.
@@ -182,15 +187,12 @@ const DefaultConfigPoll = time.Second
 
 func FromEnv() *Config {
 	return &Config{
-		Port:           envOr("PORT", DefaultPort),
-		APIKey:         os.Getenv("OFP_API_KEY"),
-		UpstreamBase:   envOr("OFP_UPSTREAM_BASE", UpstreamBase),
-		UASyncInterval: envMs("OFP_UA_SYNC_INTERVAL", UASyncInterval),
-		ConfigPath:     os.Getenv("OFP_CONFIG"),
+		Port:       envOr("PORT", DefaultPort),
+		ConfigPath: os.Getenv("OFP_CONFIG"),
 		// OFP_SHUTDOWN_GRACE is milliseconds like every other ms sibling
-		// (OFP_CONFIG_POLL_MS, OFP_UA_SYNC_INTERVAL). A "30s" duration string
-		// would be silently dropped by envDur's ParseDuration; envMs matches
-		// the documented contract.
+		// (OFP_CONFIG_POLL_MS). A "30s" duration string would be silently
+		// dropped by envMs' ParseDuration; envMs matches the documented
+		// contract.
 		ShutdownGrace: envMs("OFP_SHUTDOWN_GRACE", DefaultShutdownGrace),
 		ConfigPoll:    envMs("OFP_CONFIG_POLL_MS", DefaultConfigPoll),
 	}

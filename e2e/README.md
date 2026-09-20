@@ -1,8 +1,8 @@
 # E2E tests
 
 Black-box tests: the real server binary is compiled, launched as a subprocess
-(`PORT` / `OFP_API_KEY` / `OFP_UPSTREAM_BASE`) against a fake OpenCode Zen
-upstream, and exercised over HTTP like any external client.
+with an `OFP_CONFIG` document (upstream base + auth keys, against a fake
+OpenCode Zen upstream), and exercised over HTTP like any external client.
 
 They are behind the `e2e` build tag — the default `go test ./...` unit suite
 (fully offline, `httptest`-only) never builds them.
@@ -42,7 +42,7 @@ Covered, end to end through the wire:
 Each test spawns its OWN server subprocess with bespoke env
 (`OFP_CONFIG`, `OFP_CONFIG_POLL_MS`, `OFP_SHUTDOWN_GRACE`) and real HTTP
 forward proxies per egress — per-egress behavior is observable on the wire
-even though `OFP_UPSTREAM_BASE` is a single value:
+even though `upstream.base` is a single value:
 
 - hot reload mid-request: an in-flight request keeps its generation-1 plan,
   falls back to the OLD route's egress, never dials the new route, and logs
@@ -123,7 +123,7 @@ unless `E2E_LIVE=1`; spends free-tier quota.
 E2E_LIVE=1 go test -tags e2e ./e2e/ -run TestLive
 # optional:
 #   E2E_BASE_URL=http://127.0.0.1:9000   target proxy
-#   E2E_API_KEY=...                      value of the proxy's OFP_API_KEY
+#   E2E_API_KEY=...                      value of a key in the proxy's auth.keys
 ```
 
 Covers the live model list (free filter holds), one tiny chat completion, and

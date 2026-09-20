@@ -188,37 +188,48 @@ type HealthPolicy struct {
 	Cooldown         *Duration `yaml:"cooldown,omitempty"`
 }
 
-// File is the OFP_CONFIG YAML document.
-type File struct {
-	Egress   []Egress       `yaml:"egress"`
-	Routes   []Route        `yaml:"routes"`
-	Fallback FallbackPolicy `yaml:"fallback,omitempty"`
-	Health   HealthPolicy   `yaml:"health,omitempty"`
+// Upstream names the single upstream the proxy fronts. Base is the request
+// root: every endpoint (/zen/v1/chat/completions, /zen/v1/responses,
+// /zen/v1/models) derives from it — never a hard-coded absolute URL outside
+// internal/config (AGENTS.md "constants live only in internal/config").
+type UpstreamConfig struct {
+	Base string `yaml:"base,omitempty"`
 }
 
-// Duration accepts Go duration strings ("30s", "1m30s"). yaml.v3 would
-// otherwise decode into time.Duration as a bare nanosecond count — a silent
-// unit bug; strings only, with an explicit error.
-type Duration time.Duration
+// APIKey is ONE named inbound bearer credential. Name is the
+// operator-chosen identity surfaced in logs as api_key_name; Key is a
+// secret — it must never reach a log line, a load-error string, debug
+// output, or a response (validated and logged by name only).
+type APIKey struct {
+	Name string `yaml:"name"`
+	Key  string `yaml:"key"`
+}
 
-func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
-	var raw any
-	if err := unmarshal(&raw); err != nil {
-		return err
-	}
-	s, ok := raw.(string)
-	if !ok {
-		return fmt.Errorf("duration must be a string like \"30s\", got %s", boundedEcho(fmt.Sprintf("%v", raw)))
-	}
-	parsed, err := time.ParseDuration(s)
-	if err != nil {
-		// time.ParseDuration's error text echoes the raw input back inside
-		// quotes, unbounded — stripQuoted keeps the reason class while the
-		// value reaches the log only through the bounded echo.
-		return fmt.Errorf("invalid duration %q: %s", boundedEcho(s), stripQuoted(err.Error()))
-	}
-	*d = Duration(parsed)
-	return nil
+// AuthConfig gates inbound requests. An empty/omitted keys list disables
+// authentication — byte-identical to the removed empty-OFP_API_KEY default
+// (auth off in the no-config runtime).
+type AuthConfig struct {
+	Keys []APIKey `yaml:"keys,omitempty"`
+}
+
+// UserAgentConfig tunes the UA-identity sync loop (the free-tier gate reads
+// the User-Agent triple). SyncInterval is an integer SECONDS value; nil =
+// the 3600 s default, 0 = disabled, negative = load error. Conversion to
+// time.Duration happens only in Resolve — mirroring how every other runtime
+// duration is config-layer-owned.
+type UserAgentConfig struct {
+	SyncInterval *int `yaml:"sync_interval,omitempty"`
+}
+
+// File is the OFP_CONFIG YAML document.
+type File struct {
+	Egress    []Egress        `yaml:"egress"`
+	Routes    []Route         `yaml:"routes"`
+	Fallback  FallbackPolicy  `yaml:"fallback,omitempty"`
+	Health    HealthPolicy    `yaml:"health,omitempty"`
+	Upstream  UpstreamConfig  `yaml:"upstream,omitempty"`
+	Auth      AuthConfig      `yaml:"auth,omitempty"`
+	UserAgent UserAgentConfig `yaml:"user_agent,omitempty"`
 }
 
 // Runtime is the immutable post-validation snapshot a request holds for its
@@ -252,6 +263,39 @@ type Runtime struct {
 	// Hot reload stamps only the NEW snapshot; an in-flight request keeps
 	// the generation it started with.
 	Generation uint64
+	// Service settings resolved from the File's upstream/auth/user_agent
+	// sections (or DefaultRuntime's built-ins; see UpstreamBase const and
+	// UASyncInterval const). Unexported and read only through accessors:
+	// an accessor is the one surface that can guarantee no caller ever
+	// reaches an inbound key VALUE (LookupAPIKey returns the name only).
+	upstreamBase   string
+	authByKey      map[string]string // inbound key value -> key name; nil = auth disabled
+	uaSyncInterval time.Duration
+}
+
+// Duration accepts Go duration strings ("30s", "1m30s"). yaml.v3 would
+// otherwise decode into time.Duration as a bare nanosecond count — a silent
+// unit bug; strings only, with an explicit error.
+type Duration time.Duration
+
+func (d *Duration) UnmarshalYAML(unmarshal func(any) error) error {
+	var raw any
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return fmt.Errorf("duration must be a string like \"30s\", got %s", boundedEcho(fmt.Sprintf("%v", raw)))
+	}
+	parsed, err := time.ParseDuration(s)
+	if err != nil {
+		// time.ParseDuration's error text echoes the raw input back inside
+		// quotes, unbounded — stripQuoted keeps the reason class while the
+		// value reaches the log only through the bounded echo.
+		return fmt.Errorf("invalid duration %q: %s", boundedEcho(s), stripQuoted(err.Error()))
+	}
+	*d = Duration(parsed)
+	return nil
 }
 
 // Egress resolves an egress id from this snapshot as a PRIVATE COPY: the
@@ -494,8 +538,90 @@ func (f *File) Validate() error {
 	if f.Health.Cooldown != nil && *f.Health.Cooldown < 0 {
 		return fmt.Errorf("health: cooldown must be >= 0")
 	}
+	if f.Upstream.Base != "" {
+		u, err := url.Parse(f.Upstream.Base)
+		if err != nil {
+			// *url.Error embeds the raw input; surface only the underlying
+			// reason (same shape as validateProxy).
+			reason := err
+			if inner := errors.Unwrap(err); inner != nil {
+				reason = inner
+			}
+			return fmt.Errorf("upstream: malformed base url: %v", reason)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("upstream: base url scheme %q must be http or https", boundedEcho(u.Scheme))
+		}
+		if u.Host == "" {
+			return fmt.Errorf("upstream: base url has no host")
+		}
+		// A credentialed base would leak userinfo into error paths and send
+		// credentials upstream; query/fragment would corrupt the raw string
+		// join in cloak.URL — both rejected at load, never normalized.
+		if u.User != nil {
+			return fmt.Errorf("upstream: base url must not carry userinfo (credentials belong in auth.keys)")
+		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("upstream: base url must not carry a query or fragment")
+		}
+	}
+	if len(f.Auth.Keys) > 0 {
+		names := map[string]struct{}{}
+		// key value -> owning key name. The VALUE is a secret and is never
+		// echoed; the duplicate-value error names the two entries by their
+		// operator-chosen names.
+		byValue := map[string]string{}
+		for i := range f.Auth.Keys {
+			k := &f.Auth.Keys[i]
+			if strings.TrimSpace(k.Name) == "" {
+				return fmt.Errorf("auth.keys[%d]: name is required", i)
+			}
+			// The name reaches log lines verbatim as api_key_name — same
+			// control-byte discipline as egress ids.
+			if hasControlByte(k.Name) {
+				return fmt.Errorf("auth.keys[%d]: name must not contain control characters", i)
+			}
+			if k.Key == "" {
+				return fmt.Errorf("auth.keys[%d] (%s): key value must not be empty", i, boundedEcho(k.Name))
+			}
+			if _, dup := names[k.Name]; dup {
+				return fmt.Errorf("auth.keys[%d]: duplicate key name %q", i, boundedEcho(k.Name))
+			}
+			names[k.Name] = struct{}{}
+			if owner, dup := byValue[k.Key]; dup {
+				return fmt.Errorf("auth.keys[%d] (%s): duplicate key value (also used by auth key %q)", i, boundedEcho(k.Name), boundedEcho(owner))
+			}
+			byValue[k.Key] = k.Name
+		}
+	}
+	if f.UserAgent.SyncInterval != nil && *f.UserAgent.SyncInterval < 0 {
+		return fmt.Errorf("user_agent: sync_interval must be >= 0 (0 = disabled)")
+	}
 	return nil
 }
+
+// UpstreamBase returns the effective upstream base URL — the OFP_CONFIG
+// upstream.base, or the built-in default. Trailing slashes are normalized at
+// Resolve; every request URL is derived from this value.
+func (rt *Runtime) UpstreamBase() string { return rt.upstreamBase }
+
+// AuthEnabled reports whether any inbound bearer key is configured. When
+// false every request is admitted (the no-config default).
+func (rt *Runtime) AuthEnabled() bool { return len(rt.authByKey) > 0 }
+
+// LookupAPIKey resolves a presented bearer credential to its configured key
+// NAME. The name is safe for logs (api_key_name) and is the only identity a
+// caller can hold; the VALUE is never returned, so no caller can leak it by
+// accident.
+func (rt *Runtime) LookupAPIKey(key string) (string, bool) {
+	name, ok := rt.authByKey[key]
+	return name, ok
+}
+
+// UASyncInterval returns the UA-identity sync cadence; 0 = disabled. The
+// value travels with the request's snapshot: a hot reload may enable,
+// disable, or rescale UA sync on the next generation (see useragent.go).
+func (rt *Runtime) UASyncInterval() time.Duration { return rt.uaSyncInterval }
 
 // HealthThreshold returns the effective failure threshold (default applied
 // when the field is unset; explicit 0 survives as "never cool down").
@@ -645,6 +771,11 @@ func (f *File) Resolve() (*Runtime, error) {
 		FailureThreshold: cloneIntPtr(f.Health.FailureThreshold),
 		Cooldown:         cloneDurationPtr(f.Health.Cooldown),
 	}
+	// Auth.Keys is a slice in the struct copy above — its backing array is
+	// shared with the input, so it is re-cloned here (same reason as
+	// cp.Fallback/cp.Health).
+	cp.Auth = AuthConfig{Keys: make([]APIKey, len(f.Auth.Keys))}
+	copy(cp.Auth.Keys, f.Auth.Keys)
 	rt := &Runtime{File: cp, byID: make(map[string]*Egress, len(cp.Egress))}
 	for i := range cp.Egress {
 		rt.byID[cp.Egress[i].ID] = &rt.File.Egress[i]
@@ -679,6 +810,20 @@ func (f *File) Resolve() (*Runtime, error) {
 	// input's): the request path reads them via value-returning accessors, and
 	// the deep copy of cp.Fallback/cp.Health keeps the exported File half
 	// independent of the input too.
+	rt.upstreamBase = UpstreamBase
+	if f.Upstream.Base != "" {
+		rt.upstreamBase = strings.TrimRight(f.Upstream.Base, "/")
+	}
+	if len(cp.Auth.Keys) > 0 {
+		rt.authByKey = make(map[string]string, len(cp.Auth.Keys))
+		for i := range cp.Auth.Keys {
+			rt.authByKey[cp.Auth.Keys[i].Key] = cp.Auth.Keys[i].Name
+		}
+	}
+	rt.uaSyncInterval = UASyncInterval
+	if f.UserAgent.SyncInterval != nil {
+		rt.uaSyncInterval = time.Duration(*f.UserAgent.SyncInterval) * time.Second
+	}
 	return rt, nil
 }
 
@@ -688,7 +833,9 @@ func (f *File) Resolve() (*Runtime, error) {
 // is DISABLED here: the old proxy had no failure-threshold outage, and a
 // config-less deployment must not acquire one after 3 connection errors.
 // File-driven configs opt into health by default (Resolve), which is the
-// multi-egress feature's intent.
+// multi-egress feature's intent. Service settings take their built-ins:
+// the default upstream base, AUTH DISABLED (byte-identical to the removed
+// empty-OFP_API_KEY default), and the 1 h UA sync cadence.
 func DefaultRuntime() *Runtime {
 	return &Runtime{
 		File: File{
@@ -704,6 +851,10 @@ func DefaultRuntime() *Runtime {
 		Fallback: FallbackPolicy{Enabled: new(true), MaxAttempts: 1},
 		Health:   HealthPolicy{Enabled: new(false)},
 		Direct:   true,
+		// Service built-ins (see UpstreamBase/UASyncInterval consts):
+		upstreamBase:   UpstreamBase,
+		authByKey:      nil, // auth disabled
+		uaSyncInterval: UASyncInterval,
 	}
 }
 

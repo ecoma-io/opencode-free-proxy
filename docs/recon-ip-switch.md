@@ -16,7 +16,7 @@ Real proxy binary in the loop, egress chosen per request:
 
 ```
 Claude Code (driver) ──HTTP──► opencode-free-proxy :8090
-                                  │  OFP_UPSTREAM_BASE=http://127.0.0.1:8091
+                                  │  upstream.base=http://127.0.0.1:8091
                                   ▼
                     egress-switching forwarder :8091  (mode file per request)
                       ├─ mode=direct  → https://opencode.ai   (machine IP)

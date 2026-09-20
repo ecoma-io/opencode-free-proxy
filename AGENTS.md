@@ -89,22 +89,22 @@ The semantics agents most often get wrong:
 
 ## Layout
 
-| Package              | Role                                                                                                                                                              |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                           |
-| `internal/config`    | every runtime constant + env vars (`PORT`, `OFP_API_KEY`, `OFP_UPSTREAM_BASE`, `OFP_CONFIG`); multi-egress YAML model, interpolation, redaction, hot-reload store |
-| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                  |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                       |
-| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration                                               |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                              |
-| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging      |
-| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                      |
-| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                            |
-| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                           |
-| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                          |
-| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                              |
+| Package              | Role                                                                                                                                                                                                        |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                     |
+| `internal/config`    | every runtime constant + the `PORT`/`OFP_CONFIG` env vars; multi-egress YAML model (routes, egresses, `upstream.base`, `auth.keys`, `user_agent.sync_interval`), interpolation, redaction, hot-reload store |
+| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                            |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                 |
+| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration                                                                                         |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                          |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                        |
+| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging                                                |
+| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                |
+| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                      |
+| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                          |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                     |
+| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                    |
+| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                        |
 
 ## Porting discipline (the rules that keep parity)
 
@@ -142,12 +142,9 @@ The semantics agents most often get wrong:
 ## Environment
 
 | `PORT` | `8090` | Listen port (`0` valid in tests) |
-| `OFP_API_KEY` | _(empty = auth off)_ | Bearer key required from clients |
-| `OFP_UPSTREAM_BASE` | `https://opencode.ai` | Zen upstream base, all routes |
-| `OFP_CONFIG` | _(empty = built-in)_ | Multi-egress routing config file (YAML); hot-reloaded, invalid keeps last good |
+| `OFP_CONFIG` | _(empty = built-in)_ | Multi-egress routing config file (YAML); hot-reloaded, invalid keeps last good; also carries `upstream.base`, `auth.keys`, `user_agent.sync_interval` |
 | `OFP_CONFIG_POLL_MS` | `1000` | Hot-reload poll interval for `OFP_CONFIG` (ms) |
 | `OFP_SHUTDOWN_GRACE` | `30000` | Drain window: in-flight streams finish before forced close (ms) |
-| `OFP_UA_SYNC_INTERVAL` | `3600000` | UA identity sync cadence in ms (background ticker; hot path never fetches) |
 
 ## Security
 

@@ -15,7 +15,7 @@ func TestTestConnectionProbeAnswersFixedBody(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(up.URL, "")
+	_, mux := newRouter(t, up.URL, "")
 
 	res := postJSON(t, mux, "/v1/chat/completions",
 		`{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":true}`,
@@ -72,7 +72,7 @@ func TestTestConnectionProbePresenceOnly(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(up.URL, "")
+	_, mux := newRouter(t, up.URL, "")
 
 	t.Run("any value triggers", func(t *testing.T) {
 		res := postJSON(t, mux, "/v1/chat/completions",
@@ -106,7 +106,7 @@ func TestTestConnectionProbeAbsentTakesNormalPath(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(up.URL, "")
+	_, mux := newRouter(t, up.URL, "")
 
 	res := postJSON(t, mux, "/v1/chat/completions",
 		`{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":false}`, nil)
@@ -125,7 +125,7 @@ func TestTestConnectionProbeStillNeedsModel(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(up.URL, "")
+	_, mux := newRouter(t, up.URL, "")
 
 	// The probe sits AFTER the missing-model 400 (chat.js:86-97).
 	res := postJSON(t, mux, "/v1/chat/completions", `{"messages":[]}`,
@@ -146,7 +146,7 @@ func TestTestConnectionProbeSharedHandlerScope(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", responsesStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(up.URL, "")
+	_, mux := newRouter(t, up.URL, "")
 
 	// Verified scope: the probe's only call site is src/sse/handlers/chat.js:94,
 	// and handleChat serves /v1/chat/completions, /v1/messages, /v1/responses
@@ -170,7 +170,7 @@ func TestTestConnectionProbeEchoesMarkerStrippedModel(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(up.URL, "")
+	_, mux := newRouter(t, up.URL, "")
 
 	// chat.js:96 passes modelStr — the marker-stripped value, alias intact.
 	res := postJSON(t, mux, "/v1/chat/completions",

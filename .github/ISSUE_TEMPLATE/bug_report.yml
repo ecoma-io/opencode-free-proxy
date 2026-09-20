@@ -13,8 +13,8 @@ body:
         [`AGENTS.md`](../../blob/main/AGENTS.md).
 
         **Do not report a security vulnerability here.** A configured
-        `OFP_API_KEY` (or any live credential) reaching a log line or an
-        error goes through a
+        `auth.keys` credential (or any live credential) reaching a log line
+        or an error goes through a
         [private security advisory](../../security/advisories/new)
         instead — see [SECURITY.md](../../blob/main/SECURITY.md).
 

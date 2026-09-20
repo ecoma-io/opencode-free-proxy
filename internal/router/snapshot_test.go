@@ -21,6 +21,12 @@ import (
 	"opencode-free-proxy/internal/upstream"
 )
 
+// testUpstreamBasePrefix is prepended to every snapshot doc: the pinned
+// upstream.base is part of the runtime, and a swap doc that omits `upstream`
+// would revert the base to the REAL default (https://opencode.ai) — proxied
+// requests would start CONNECT+TLS against a live host from unit tests.
+const testUpstreamBasePrefix = "upstream:\n  base: \"http://upstream.invalid\"\n"
+
 // writeCfg writes a config document into a temp dir (store_test's pattern,
 // reused here because the store is what the router snapshots).
 func writeCfg(t *testing.T, dir, doc string) string {
@@ -46,18 +52,20 @@ func waitGeneration(t *testing.T, s *config.Store, want uint64) {
 }
 
 // snapshotRouter wires a Server on a live polling store, exactly like
-// cmd/server/main.go: egresses reach the mesh through their configured HTTP
-// proxies; UpstreamBase is a dummy host that is NEVER dialed directly.
-func snapshotRouter(t *testing.T, dir, cfgDoc, upstreamBase string, logf func(string, ...any)) (*Server, *http.ServeMux, *config.Store) {
+// cmd/server/main.go: the runtime (including upstream.base) comes from the
+// config document that the store polls; the dummy upstream base pinned in
+// every doc (testUpstreamBasePrefix) is NEVER dialed directly — every egress
+// reaches the mesh through its configured proxies.
+func snapshotRouter(t *testing.T, dir, cfgDoc string, logf func(string, ...any)) (*Server, *http.ServeMux, *config.Store) {
 	t.Helper()
-	p := writeCfg(t, dir, cfgDoc)
+	doc := testUpstreamBasePrefix + cfgDoc
+	p := writeCfg(t, dir, doc)
 	store, err := config.NewStore(p, 20*time.Millisecond, logf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(store.Stop)
 	s := NewServer(
-		&config.Config{Port: "0", UpstreamBase: upstreamBase},
 		store,
 		identity.NewUserAgentCache(),
 		upstream.NewClient(), // direct client: unused — every egress is proxied
@@ -125,14 +133,13 @@ func TestReloadDoesNotAffectActiveRequest(t *testing.T) {
 	proxyC := countProxy(&cCalls, &cMu)
 	defer proxyC.Close()
 
-	upstreamBase := "http://upstream.invalid" // never dialed: egresses use proxies
 	s, mux, store := snapshotRouter(t, dir, fmt.Sprintf(`
 egress:
   - {id: a, proxy: {type: http, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), upstreamBase, logf)
+`, pxyURL(proxyA), pxyURL(proxyB)), logf)
 	_ = s
 
 	done := make(chan *httptest.ResponseRecorder, 1)
@@ -153,7 +160,7 @@ routes:
 	}
 
 	// Swap the config to generation 2 (route [c] only) while a is blocked.
-	writeCfg(t, dir, fmt.Sprintf(`
+	writeCfg(t, dir, testUpstreamBasePrefix+fmt.Sprintf(`
 egress:
   - {id: c, proxy: {type: http, url: %q}}
 routes:
@@ -221,14 +228,14 @@ egress:
   - {id: a, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a]}
-`, pxyURL(proxyA)), "http://upstream.invalid", logf)
+`, pxyURL(proxyA)), logf)
 
 	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
 	if rec.Code != http.StatusOK || rec.Header().Get("X-OFP-Egress") != "a" {
 		t.Fatalf("pre-reload: status=%d egress=%q", rec.Code, rec.Header().Get("X-OFP-Egress"))
 	}
 
-	writeCfg(t, dir, fmt.Sprintf(`
+	writeCfg(t, dir, testUpstreamBasePrefix+fmt.Sprintf(`
 egress:
   - {id: c, proxy: {type: http, url: %q}}
 routes:
@@ -280,7 +287,7 @@ egress:
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), "http://upstream.invalid", nil)
+`, pxyURL(proxyA), pxyURL(proxyB)), nil)
 
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -298,7 +305,7 @@ routes:
 	}
 
 	// Reload to a LOOSE policy (100 failures to arm) while a is blocked.
-	writeCfg(t, dir, fmt.Sprintf(`
+	writeCfg(t, dir, testUpstreamBasePrefix+fmt.Sprintf(`
 health:
   enabled: true
   failure_threshold: 100
@@ -370,7 +377,7 @@ egress:
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), "http://upstream.invalid", nil)
+`, pxyURL(proxyA), pxyURL(proxyB)), nil)
 
 	// Under the disabled policy a's failures must never mark it: keep making
 	// requests (rotation order is the scheduler's business) until a has been
@@ -398,7 +405,7 @@ routes:
 	}
 
 	// Reload: health ON with threshold 1.
-	writeCfg(t, dir, fmt.Sprintf(`
+	writeCfg(t, dir, testUpstreamBasePrefix+fmt.Sprintf(`
 health:
   enabled: true
   failure_threshold: 1
@@ -457,7 +464,7 @@ egress:
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), "http://upstream.invalid", nil)
+`, pxyURL(proxyA), pxyURL(proxyB)), nil)
 
 	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
 	if rec.Code != http.StatusOK {

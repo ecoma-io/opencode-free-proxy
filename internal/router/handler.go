@@ -84,9 +84,20 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // (translator/formats.js detectFormatByEndpoint: /v1/responses is always
 // responses, /v1/chat/completions is openai — even with an input[] body).
 func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat relay.Format) {
-	if s.Cfg.APIKey != "" {
-		auth := r.Header.Get("Authorization")
-		if auth != "Bearer "+s.Cfg.APIKey {
+	// Inbound auth against the CURRENT snapshot's named keys — the first
+	// gate, before the method check and the body read (the 401 path never
+	// touches a lock, a health state, or an upstream). authName feeds the
+	// completion log lines (api_key_name); it is captured here, at ARRIVAL:
+	// a reload that deletes the key between this check and the relay's own
+	// snapshot can only widen admission to the NEXT generation for a request
+	// that was already authenticated — never the reverse, and never a 401
+	// for a valid key.
+	authName := ""
+	if rt := s.runtime(); rt.AuthEnabled() {
+		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		var ok bool
+		authName, ok = rt.LookupAPIKey(auth)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "Invalid API key provided")
 			return
 		}
@@ -300,7 +311,11 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		return
 	}
 
-	url := upstream.BuildURL(s.Cfg.UpstreamBase, upstreamModel)
+	// One snapshot read for the base — never two reads that could straddle a
+	// reload swap. (s.Cfg.UpstreamBase was the OFP_UPSTREAM_BASE env; the
+	// base now lives in the OFP_CONFIG upstream.base of the SAME generation
+	// that pinned routing above.)
+	url := upstream.BuildURL(rt.UpstreamBase(), upstreamModel)
 	reqCtx, cancelUpstream := context.WithCancel(r.Context())
 	// base.js re-invokes transformRequest+buildHeaders inside the retry loop, so
 	// a forged x-opencode-request id is fresh on every attempt; the closure is
@@ -324,6 +339,18 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	start := time.Now()
 	resp, egID, attempts, class, uerr := s.Exec.Execute(reqCtx, url, buildHeaders, bodyJSON, plan, policy)
 	latency := time.Since(start)
+	// Completion log line: same facts per status. api_key_name is appended
+	// ONLY when auth is enabled — the configured NAME, never the credential,
+	// and only for requests that passed the gate.
+	logLine := func(status int) {
+		format := "%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t"
+		args := []any{reqID, rt.Generation, plan.RouteID, egID, attempts, class, status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1}
+		if authName != "" {
+			format += " api_key_name=%q"
+			args = append(args, authName)
+		}
+		s.logf(format, args...)
+	}
 	if uerr != nil {
 		cancelUpstream()
 		// model=%q, not %s: the model id is client-controlled and survives
@@ -331,14 +358,12 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		// byte) would forge extra log lines (CWE-117). %q escapes them for the
 		// LOG LINE only; the JSON body echo is untouched (JSON escaping
 		// already protects it) and the upstream model id is unaffected.
-		s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
-			reqID, rt.Generation, plan.RouteID, egID, attempts, class, uerr.Status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
+		logLine(uerr.Status)
 		writeError(w, uerr.Status, fmt.Sprintf("[%d]: %s", uerr.Status, uerr.Message))
 		return
 	}
 	w.Header().Set("X-OFP-Egress", egID)
-	s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
-		reqID, rt.Generation, plan.RouteID, egID, attempts, class, resp.StatusCode, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
+	logLine(resp.StatusCode)
 	// Forced SSE→JSON needs the upstream reply to actually be SSE
 	// (sseToJsonHandler.js:185-188): when it is not, chatCore falls through to
 	// the streaming path — a non-streaming client behind a non-SSE upstream

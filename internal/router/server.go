@@ -23,7 +23,6 @@ import (
 // (health.PolicyFromSnapshot at relay time), so no global tuning is ever
 // applied or stored here.
 type Server struct {
-	Cfg       *config.Config
 	Store     *config.Store
 	Scheduler *routing.Scheduler
 	Exec      *upstream.Executor
@@ -46,7 +45,7 @@ type Server struct {
 // NewServer wires the multi-egress machinery. store may be a live poller
 // (OFP_CONFIG set) or the default direct runtime; logf nil → log.Printf;
 // sleep nil → time.Sleep (tests pass a no-op to keep retry matrices fast).
-func NewServer(cfg *config.Config, store *config.Store, ua *identity.UserAgentCache, direct *upstream.Client, logf func(string, ...any), sleep func(time.Duration)) *Server {
+func NewServer(store *config.Store, ua *identity.UserAgentCache, direct *upstream.Client, logf func(string, ...any), sleep func(time.Duration)) *Server {
 	if logf == nil {
 		logf = log.Printf
 	}
@@ -54,7 +53,6 @@ func NewServer(cfg *config.Config, store *config.Store, ua *identity.UserAgentCa
 		sleep = time.Sleep
 	}
 	s := &Server{
-		Cfg:       cfg,
 		Store:     store,
 		Scheduler: routing.NewScheduler(),
 		Health:    health.New(),

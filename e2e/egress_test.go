@@ -1,8 +1,7 @@
 //go:build e2e
 
 // Issue #6 hardening E2E: the health-policy and proxy-auth semantics proven
-// end to end through the real server binary. Per-egress behavior stays
-// observable on the wire even though OFP_UPSTREAM_BASE is a single value —
+// observable on the wire even though upstream.base is a single value —
 // each egress reaches a DIFFERENT local listener (the reload_test.go trick),
 // so per-egress call counts are exact. Every wait here is an observable
 // condition (an upstream counter, the reload log line, a closed gate); none
@@ -168,9 +167,10 @@ func TestReloadHealthPolicyPinnedPerGeneration(t *testing.T) {
 routes:
   - {id: r, egress: [a, b]}
 `, proxyA.URL, proxyB.URL)
-	writeCFG(t, dir, egressYAML+"health:\n  enabled: false\n")
+	// upstream.invalid: never dialed (both egresses are proxies) — but the
+	// section must be present or the base reverts to the real opencode.ai.
+	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+"health:\n  enabled: false\n")
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_UPSTREAM_BASE":  "http://upstream.invalid/zen",
 		"OFP_CONFIG":         "cfg.yaml",
 		"OFP_CONFIG_POLL_MS": "50",
 	})
@@ -181,7 +181,7 @@ routes:
 		"request never parked inside proxy a\nlog:\n"+sp.out.String())
 
 	// Swap to generation 2 while the generation-1 request sits in a.
-	writeCFG(t, dir, egressYAML+healthYAML)
+	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+healthYAML)
 	waitSwap(t, sp, "config reload: swapped to new config (generation 2")
 
 	close(gate)
@@ -274,16 +274,15 @@ func TestConnect407ThroughRealForwardProxyFallsBack(t *testing.T) {
 	}))
 	defer refusing.Close()
 
-	// b is a direct egress, so the fake zen's own counter is b's counter.
-
-	writeCFG(t, dir, fmt.Sprintf(`egress:
+	writeCFG(t, dir, fmt.Sprintf(`upstream:
+  base: %q
+egress:
   - {id: a, proxy: {type: http, url: %q}}
   - {id: b}
 routes:
   - {id: r, egress: [a, b]}
-`, refusing.URL))
+`, tlsZen.URL, refusing.URL))
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_UPSTREAM_BASE":  tlsZen.URL,
 		"OFP_CONFIG":         "cfg.yaml",
 		"OFP_CONFIG_POLL_MS": "50",
 		"SSL_CERT_FILE":      certPath,
@@ -323,14 +322,13 @@ func TestHTTPOrigin407IsClientErrorNoFallback(t *testing.T) {
 	proxyB := chatProxy(&bCalls)
 	defer proxyB.Close()
 
-	writeCFG(t, dir, fmt.Sprintf(`egress:
+	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+fmt.Sprintf(`egress:
   - {id: a, proxy: {type: http, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
 `+healthYAML, proxyA.URL, proxyB.URL))
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_UPSTREAM_BASE":  "http://upstream.invalid/zen",
 		"OFP_CONFIG":         "cfg.yaml",
 		"OFP_CONFIG_POLL_MS": "50",
 	})
@@ -397,13 +395,11 @@ routes:
   - {id: r, egress: [a, b]}
 `, aURL, proxyB.URL)
 	}
-	writeCFG(t, dir, egressYAML("http://127.0.0.1:"+dead)+healthYAML)
+	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML("http://127.0.0.1:"+dead)+healthYAML)
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_UPSTREAM_BASE":  "http://upstream.invalid/zen",
 		"OFP_CONFIG":         "cfg.yaml",
 		"OFP_CONFIG_POLL_MS": "50",
 	})
-
 	// req1: the dead port refuses; the dial failure rides the 502 retry
 	// matrix INSIDE the attempt (that is what a real dead proxy looks like),
 	// then generation 1's threshold-1 policy cools a and the executor falls
@@ -420,7 +416,7 @@ routes:
 	assertRequestLine(t, sp, 1, "egress=b", "attempts=1", "fallback=false")
 
 	// Generation 2: same egress id, NEW proxy URL.
-	writeCFG(t, dir, egressYAML(proxyA2.URL)+healthYAML)
+	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML(proxyA2.URL)+healthYAML)
 	waitSwap(t, sp, "config reload: swapped to new config (generation 2")
 
 	// req3: the replacement transport starts clean — a serves.
@@ -458,15 +454,11 @@ func TestPolicyOnlyReloadKeepsHealthState(t *testing.T) {
 routes:
   - {id: r, egress: [a, b]}
 `, proxyA.URL, proxyB.URL)
-	writeCFG(t, dir, egressYAML+healthYAML)
+	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+healthYAML)
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_UPSTREAM_BASE":  "http://upstream.invalid/zen",
 		"OFP_CONFIG":         "cfg.yaml",
 		"OFP_CONFIG_POLL_MS": "50",
 	})
-
-	// req1 arms a's cooldown (a 500, threshold 1); req2 confirms a is out of
-	// the head set.
 	if eg := drainChat(t, sp.post(t, streamBody, nil)); eg != "b" {
 		t.Fatalf("req1 X-OFP-Egress = %q, want b", eg)
 	}
@@ -476,7 +468,7 @@ routes:
 	}
 	assertRequestLine(t, sp, 1, "egress=b", "attempts=1", "fallback=false")
 
-	writeCFG(t, dir, egressYAML+"health:\n  failure_threshold: 5\n  cooldown: 60s\n")
+	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+"health:\n  failure_threshold: 5\n  cooldown: 60s\n")
 	waitSwap(t, sp, "config reload: swapped to new config (generation 2")
 
 	// Two post-reload requests: still b only — a still cooling. Had the

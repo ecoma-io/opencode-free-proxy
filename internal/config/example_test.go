@@ -25,6 +25,7 @@ const (
 	exampleHTTPPass  = "e2e-secret"
 	exampleTLSPass   = "e2e-secret-tls"
 	exampleSocksPass = "e2e-secret-socks"
+	exampleAPIKey    = "e2e-secret-api"
 )
 
 // setExampleEnv pins every variable the example references. Unset variables
@@ -38,6 +39,7 @@ func setExampleEnv(t *testing.T) {
 	t.Setenv("OFP_EXAMPLE_HTTPS_PASS", exampleTLSPass)
 	t.Setenv("OFP_EXAMPLE_SOCKS_USER", exampleUser)
 	t.Setenv("OFP_EXAMPLE_SOCKS_PASS", exampleSocksPass)
+	t.Setenv("OFP_EXAMPLE_API_KEY", exampleAPIKey)
 }
 
 func loadExample(t *testing.T) *Runtime {
@@ -166,6 +168,24 @@ func TestExampleConfigLoads(t *testing.T) {
 	if rt.HealthCooldown() != 45*time.Second {
 		t.Fatalf("health cooldown = %v, want 45s", rt.HealthCooldown())
 	}
+
+	// Service settings: the three new OFP_CONFIG sections resolved into the
+	// snapshot (upstream base, named inbound keys, UA sync cadence).
+	if rt.UpstreamBase() != UpstreamBase {
+		t.Fatalf("upstream base = %q, want the default %q", rt.UpstreamBase(), UpstreamBase)
+	}
+	if !rt.AuthEnabled() {
+		t.Fatal("example config has auth.keys — auth must be enabled")
+	}
+	if name, ok := rt.LookupAPIKey(exampleAPIKey); !ok || name != "primary" {
+		t.Fatalf("LookupAPIKey(key) = %q,%v, want primary,true", name, ok)
+	}
+	if _, ok := rt.LookupAPIKey("wrong-key"); ok {
+		t.Fatal("LookupAPIKey must reject an unknown key")
+	}
+	if rt.UASyncInterval() != 3600*time.Second {
+		t.Fatalf("UA sync interval = %v, want 3600s", rt.UASyncInterval())
+	}
 }
 
 // TestExampleConfigRouteSelection pins the documented matching order: the
@@ -208,7 +228,7 @@ func TestExampleConfigCarriesNoLiteralCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	doc := string(raw)
-	for _, fake := range []string{exampleUser, exampleHTTPPass, exampleTLSPass, exampleSocksPass} {
+	for _, fake := range []string{exampleUser, exampleHTTPPass, exampleTLSPass, exampleSocksPass, exampleAPIKey} {
 		if strings.Contains(doc, fake) {
 			t.Fatalf("example file embeds a literal credential value %q", fake)
 		}
@@ -217,6 +237,7 @@ func TestExampleConfigCarriesNoLiteralCredentials(t *testing.T) {
 		"OFP_EXAMPLE_HTTP_USER", "OFP_EXAMPLE_HTTP_PASS",
 		"OFP_EXAMPLE_HTTPS_USER", "OFP_EXAMPLE_HTTPS_PASS",
 		"OFP_EXAMPLE_SOCKS_USER", "OFP_EXAMPLE_SOCKS_PASS",
+		"OFP_EXAMPLE_API_KEY",
 	} {
 		if !strings.Contains(doc, name) {
 			t.Fatalf("example file no longer references %s", name)
@@ -236,6 +257,13 @@ func TestExampleConfigCarriesNoLiteralCredentials(t *testing.T) {
 		if strings.Contains(redacted, "@") {
 			t.Fatalf("egress %q redacted url keeps userinfo: %q", id, redacted)
 		}
+	}
+	// Inbound auth: the same contract as proxy credentials — the file names
+	// the environment variable, the runtime resolves the value, and the
+	// accessor hands back the NAME only (an accidental log of the lookup
+	// result can never carry the secret).
+	if name, ok := rt.LookupAPIKey(exampleAPIKey); !ok || name != "primary" {
+		t.Fatalf("auth key not resolved from env: %q,%v", name, ok)
 	}
 }
 

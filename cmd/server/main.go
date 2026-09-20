@@ -62,7 +62,7 @@ func main() {
 		store = config.NewDefault()
 	}
 
-	server := router.NewServer(cfg, store, uaCache, direct, log.Printf, time.Sleep)
+	server := router.NewServer(store, uaCache, direct, log.Printf, time.Sleep)
 
 	// Sync the compound UA triple (opencode version, ai-sdk provider-utils,
 	// bun) from GitHub: one forced warm at startup, then a background ticker
@@ -74,7 +74,14 @@ func main() {
 		ua := uaCache.Warm(direct.HTTP, true)
 		log.Printf("opencode UA cache warm: %s", ua)
 	}()
-	uaStop := uaCache.StartSync(direct.HTTP, cfg.UASyncInterval)
+	// The UA sync cadence is read LIVE from the current store snapshot on
+	// every cycle (user_agent.sync_interval may be changed by a reload); the
+	// loop follows the store, never a captured value — StartSync is called
+	// exactly once here, re-arm happens inside the loop, not via a second
+	// call (see identity.UserAgentCache.StartSync).
+	uaStop := uaCache.StartSync(direct.HTTP, func() time.Duration {
+		return store.Get().UASyncInterval()
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", server.HandleChatCompletions)
@@ -90,7 +97,7 @@ func main() {
 	conns := newConnTracker()
 	srv := &http.Server{Addr: addr, Handler: mux, ConnState: conns.connState}
 	go func() {
-		log.Printf("opencode-free-proxy %s listening on %s (upstream %s)", version, addr, cfg.UpstreamBase)
+		log.Printf("opencode-free-proxy %s listening on %s (upstream %s)", version, addr, store.Get().UpstreamBase())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server exited: %v", err)
 		}

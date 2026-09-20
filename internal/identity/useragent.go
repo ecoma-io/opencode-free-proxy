@@ -132,27 +132,39 @@ func (c *UserAgentCache) Get() string {
 // cache that is never started (tests, the healthcheck subcommand) has zero
 // sync goroutines. interval <= 0 starts nothing and returns a no-op stop
 // (time.NewTicker would panic) — a misconfigured cadence degrades to the
-// compiled-in fallback triple instead of crashing. The returned stop is
-// idempotent and safe to call any number of times, before any sync has run
-// or after the loop already exited; a second StartSync on the same cache
-// runs a second loop (the single-flight Warm dedupe keeps them from
-// stampeding GitHub), so callers should start once and keep the stop.
-// Startup itself warms once before/alongside this loop.
-func (c *UserAgentCache) StartSync(client *http.Client, interval time.Duration) (stop func()) {
-	if interval <= 0 {
-		return func() {}
-	}
+// interval is re-read on EVERY cycle — a reload may have changed the
+// configured OFP_CONFIG user_agent.sync_interval — so the loop follows the
+// live store snapshot instead of a captured cadence. Re-arm is a read, never
+// a second goroutine: a second StartSync would still run a second loop, which
+// is why main.go calls StartSync exactly once. A non-positive read at any
+// cycle idles on a 1 s re-check that never fetches (the compile-in fallback
+// stays), and a later positive read resumes the fetch cadence in place — no
+// supervisor, no stop/start race. Startup itself warms once before this loop.
+func (c *UserAgentCache) StartSync(client *http.Client, interval func() time.Duration) (stop func()) {
 	done := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
 		for {
+			want := interval()
+			if want <= 0 {
+				// Disabled sync: idle on a 1 s re-check (one wakeup/second,
+				// no network, no fetch) so a reload that re-enables sync is
+				// picked up by the NEXT cycle — the loop follows the
+				// snapshot, never a supervisor.
+				select {
+				case <-done:
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
+			timer := time.NewTimer(want)
 			select {
 			case <-done:
+				timer.Stop()
 				return
-			case <-ticker.C:
-				ua := c.Warm(client, true)
-				_ = ua // Warm logs nothing; failure is fail-open by design
+			case <-timer.C:
+				ua := c.Warm(client, true) // force: the sync loop bypasses the TTL gate
+				_ = ua                     // Warm logs nothing; failure is fail-open by design
 			}
 		}
 	}()

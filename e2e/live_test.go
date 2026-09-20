@@ -9,7 +9,7 @@
 // Configuration of the target proxy:
 //
 //	E2E_BASE_URL  proxy base (default http://127.0.0.1:8090)
-//	E2E_API_KEY   value of the proxy's OFP_API_KEY (omit when auth is off)
+//	E2E_API_KEY   a key configured in the proxy's auth.keys (omit when auth is off)
 package e2e
 
 import (

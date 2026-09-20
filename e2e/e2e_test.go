@@ -1,8 +1,9 @@
 //go:build e2e
 
 // Package e2e holds black-box end-to-end tests: the real server binary is
-// compiled, launched as a subprocess with PORT / OFP_API_KEY /
-// OFP_UPSTREAM_BASE pointing at a fake OpenCode Zen upstream, and then spoken
+// compiled, launched as a subprocess with its service settings (upstream
+// base, inbound auth keys) in an OFP_CONFIG document pointing at a fake
+// OpenCode Zen upstream, and then spoken
 // to over HTTP exactly like an external client. Nothing is imported from
 // internal/ except small JSON helpers — every assertion goes through the wire.
 //
@@ -36,7 +37,8 @@ import (
 	"opencode-free-proxy/internal/jsonx"
 )
 
-// testAPIKey is the inbound key the proxy subprocess requires (OFP_API_KEY).
+// testAPIKey is the inbound key the proxy subprocess requires, defined in
+// the OFP_CONFIG doc's auth.keys (its name is "e2e").
 const testAPIKey = "e2e-secret"
 
 // officialUARe is the compound User-Agent shape the official opencode CLI
@@ -320,11 +322,27 @@ func runSuite(m *testing.M) (int, error) {
 	}
 	proxyBase = "http://127.0.0.1:" + port
 
+	// The subprocess takes its service settings (upstream.base, auth.keys)
+	// from an OFP_CONFIG document — the removed env vars no longer exist.
+	cfgDoc := fmt.Sprintf(`upstream:
+  base: %q
+auth:
+  keys:
+    - {name: e2e, key: %s}
+egress:
+  - {id: direct}
+routes:
+  - {id: default, egress: [direct]}
+`, fake.URL, testAPIKey)
+	cfgPath := filepath.Join(tmp, "cfg.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgDoc), 0o600); err != nil {
+		return 1, err
+	}
+
 	proxyCmd = exec.Command(bin)
-	proxyCmd.Env = append(filteredEnv("PORT", "OFP_API_KEY", "OFP_UPSTREAM_BASE"),
+	proxyCmd.Env = append(filteredEnv("PORT", "OFP_API_KEY", "OFP_UPSTREAM_BASE", "OFP_UA_SYNC_INTERVAL"),
 		"PORT="+port,
-		"OFP_API_KEY="+testAPIKey,
-		"OFP_UPSTREAM_BASE="+fake.URL)
+		"OFP_CONFIG="+cfgPath)
 	proxyCmd.Stdout = &proxyOut
 	proxyCmd.Stderr = &proxyOut
 	if err := proxyCmd.Start(); err != nil {
@@ -445,6 +463,32 @@ func errorEnvelope(t *testing.T, body map[string]any) map[string]any {
 		t.Fatalf("no error object in %v", body)
 	}
 	return e
+}
+
+// TestConfigDrivenServiceSettings: the shared suite proxy is spawned from an
+// OFP_CONFIG document (upstream.base + auth.keys) — no service env vars
+// remain. This test asserts the config actually drove the runtime: the
+// upstream call reached the configured base, and the completion log line
+// carries the configured api_key_name, never the credential.
+func TestConfigDrivenServiceSettings(t *testing.T) {
+	resp := postChat(t, chatBody(testedModel), nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	up := fake.lastChatBody()
+	if up == nil {
+		t.Fatal("upstream never received the chat call")
+	}
+	// The base came from the config doc, not an env var: the request reached
+	// the fake upstream, which the suite only wires as upstream.base.
+	log := proxyOut.String()
+	if !strings.Contains(log, `api_key_name="e2e"`) {
+		t.Fatalf("completion log lacks api_key_name=\"e2e\":\n%s", log)
+	}
+	if strings.Contains(log, testAPIKey) {
+		t.Fatalf("secret leaked into the proxy log:\n%s", log)
+	}
 }
 
 // chatBody is the minimal non-streaming chat request used by most tests.

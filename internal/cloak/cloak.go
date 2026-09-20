@@ -56,12 +56,15 @@ func IsResponsesModel(model string) bool {
 	return ResponsesModelRe.MatchString(base)
 }
 
-// URL returns the upstream endpoint for the model.
+// URL returns the upstream endpoint for the model (config.ZenResponsesPath /
+// config.ZenChatPath — no other literals — joined onto the snapshot base at
+// executor.BuildURL; blockcatPrepareModel.js prepares the model, the base
+// plus path shape mirrors open-sse's request construction).
 func URL(upstreamBase, model string) string {
 	if IsResponsesModel(model) {
-		return upstreamBase + "/zen/v1/responses"
+		return upstreamBase + config.ZenResponsesPath
 	}
-	return upstreamBase + "/zen/v1/chat/completions"
+	return upstreamBase + config.ZenChatPath
 }
 
 // toolNameOf reads a tool declaration's name from either wire shape

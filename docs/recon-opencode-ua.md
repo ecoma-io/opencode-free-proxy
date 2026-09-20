@@ -104,7 +104,8 @@ runtime/bun/1.3.14` — byte-identical to the capture. This is the "chosen
      → bun segment;
   3. `.../v<version>/bun.lock` → provider-utils segment.
 - **Cadence** — `StartSync` ticker, default **1h**
-  (`OFP_UA_SYNC_INTERVAL`, milliseconds), plus one forced warm at startup.
+  (`user_agent.sync_interval`, integer seconds in the OFP_CONFIG document;
+  `0` disables), plus one forced warm at startup.
 - **Hot path** — `Get()` is a pure cache read. This deliberately diverges
   from `open-sse/utils/opencodeClientVersion.js` (9router warms lazily per
   request behind a 12h TTL, `executors/opencode.js:376`): with the ticker the

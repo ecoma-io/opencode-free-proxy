@@ -18,10 +18,12 @@
 # included — and an UNSET variable is a load error naming the variable.
 # Therefore:
 #
-#   1. export all six before loading this file:
+#   1. export all seven before loading this file:
 #        OFP_EXAMPLE_HTTP_USER   OFP_EXAMPLE_HTTP_PASS    egress http-proxy
 #        OFP_EXAMPLE_HTTPS_USER  OFP_EXAMPLE_HTTPS_PASS   egress https-proxy
 #        OFP_EXAMPLE_SOCKS_USER  OFP_EXAMPLE_SOCKS_PASS  egress socks5-proxy
+#        OFP_EXAMPLE_API_KEY                             inbound auth primary
+#
 #
 #   2. never write the placeholder syntax inside a comment (this file does
 #      not, for exactly that reason) — comments are interpolated too.
@@ -91,6 +93,36 @@
 #   cooldown           Go duration string ("30s", "1m30s"); default 30s; a
 #                      bare number is a load error; explicit 0s = no
 #                      exclusion window.
+#
+# upstream             the OpenCode Zen upstream all requests are proxied to
+#   base               string. Default https://opencode.ai
+#                      (internal/config/config.go). Must be an absolute
+#                      http/https URL with a host; trailing slashes are
+#                      normalized at Resolve. Every request endpoint
+#                      (/zen/v1/chat/completions, /zen/v1/responses,
+#                      /zen/v1/models) derives from it — no other URL
+#                      appears in config or code.
+#
+# auth                 inbound bearer authentication. Empty or omitted keys[]
+#                      = authentication disabled (requests pass unauthenticated).
+#                      Enforced with the same envelope as the removed
+#                      OFP_API_KEY env var (401 "Invalid API key provided").
+#   keys[]             named credentials, each {name, key}
+#     name             string, required, unique, control-free — the identity
+#                      matched requests log as api_key_name. Only the name is
+#                      ever logged or echoed; never the key.
+#     key              string, required, unique — the secret clients present
+#                      as "Authorization: Bearer <key>". Never a literal in
+#                      this file: reference the environment (see CREDENTIALS).
+#                      The value never reaches a log line, load error, debug
+#                      string, response, or test output.
+#
+# user_agent           the opencode free-tier gate reads a compound
+#                      User-Agent; a background loop keeps that triple fresh.
+#   sync_interval      int SECONDS — the loop's cadence. Default 3600; 0 =
+#                      disabled; negative is a load error. The request hot
+#                      path never triggers a fetch (fail-open contract).
+#                      Converted to a duration in Resolve only.
 # ---------------------------------------------------------------------------
 
 egress:
@@ -198,3 +230,21 @@ health:
   enabled: true
   failure_threshold: 5 # 5 consecutive failures arm the cooldown
   cooldown: 45s # then the egress is unschedulable for 45s
+
+upstream:
+  # The OpenCode Zen free-tier root; every /zen/v1/... endpoint derives from
+  # it. Trailing slashes would be normalized — keep it canonical anyway.
+  base: https://opencode.ai
+
+auth:
+  # Inbound bearer keys. The value is an env reference, never a literal; the
+  # matching requests log the NAME (api_key_name) and nothing else.
+  keys:
+    - name: primary
+      key: "${OFP_EXAMPLE_API_KEY}"
+  # Add a second key by appending another entry. Empty keys[] (or an omitted
+  # auth section) means authentication is off.
+
+user_agent:
+  # UA-triple sync cadence in SECONDS; default 3600. 0 disables the loop.
+  sync_interval: 3600

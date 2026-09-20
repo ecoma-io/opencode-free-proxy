@@ -9,9 +9,10 @@ name: Analysis
 # specifically decided it must not (Semgrep), and what secrets leaked into
 # the tree (Gitleaks) — and a reader chasing "what analysis is in place?"
 # should find all of it in one file. For this repository the third analyser
-# is not ceremony: client deployments may set OFP_API_KEY, and live proxy
-# credentials must never touch the tree — a red Gitleaks run is the loud
-# version of the failure class SECURITY.md treats as a vulnerability.
+# is not ceremony: client deployments may configure `auth.keys` in their
+# OFP_CONFIG document, and live proxy credentials must never touch the tree
+# — a red Gitleaks run is the loud version of the failure class SECURITY.md
+# treats as a vulnerability.
 #
 # Nothing is declared above the jobs except read permissions, and each job's
 # extra write stays at its own job level — a job-level `permissions` block

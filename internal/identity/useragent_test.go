@@ -353,7 +353,7 @@ func TestStartSyncTicker(t *testing.T) {
 	client := &http.Client{Transport: tr}
 	c := NewUserAgentCache()
 
-	stop := c.StartSync(client, 25*time.Millisecond)
+	stop := c.StartSync(client, func() time.Duration { return 25 * time.Millisecond })
 	deadline := time.After(2 * time.Second)
 	for tr.calls() < 6 { // ≥2 full sync passes
 		select {

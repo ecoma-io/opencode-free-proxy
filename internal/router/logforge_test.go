@@ -54,7 +54,7 @@ egress:
   - {id: a, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a]}
-`, pxyURL(upstreamSrv)), "http://upstream.invalid", logf)
+`, pxyURL(upstreamSrv)), logf)
 
 	rec := postJSON(t, mux, "/v1/chat/completions",
 		fmt.Sprintf(`{"model":%q,"stream":true}`, hostile), nil)

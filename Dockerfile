@@ -28,7 +28,6 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 COPY --from=build /out/opencode-free-proxy /app/opencode-free-proxy
 USER 65532:65532
 EXPOSE 8090
-ENV PORT=8090 \
-    OFP_UPSTREAM_BASE=https://opencode.ai
+ENV PORT=8090
 ENTRYPOINT ["/app/opencode-free-proxy"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD ["/app/opencode-free-proxy", "healthcheck"]

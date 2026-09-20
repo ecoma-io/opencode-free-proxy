@@ -8,27 +8,33 @@ and non-streaming.
 ## Run
 
 ```sh
-go run ./cmd/server          # listens on :8090, upstream https://opencode.ai
+go run ./cmd/server          # listens on :8090, upstream https://opencode.ai, auth off
 docker compose up -d --build # or: build + serve via compose (HOST_PORT, default 30258)
 ```
 
 Environment:
 
-| Var                    | Default               | Meaning                                                       |
-| ---------------------- | --------------------- | ------------------------------------------------------------- |
-| `PORT`                 | `8090`                | Listen port                                                   |
-| `OFP_UPSTREAM_BASE`    | `https://opencode.ai` | Zen upstream base (all routes incl. `/v1/models`)             |
-| `OFP_API_KEY`          | _(empty = auth off)_  | Bearer key required from clients                              |
-| `OFP_UA_SYNC_INTERVAL` | `3600000` (1h)        | UA identity sync cadence (ms) — see docs/recon-opencode-ua.md |
-| `OFP_CONFIG`           | _(empty = built-in)_  | Multi-egress routing config file (YAML) — see below           |
-| `OFP_CONFIG_POLL_MS`   | `1000`                | Hot-reload poll interval for `OFP_CONFIG` (ms)                |
-| `OFP_SHUTDOWN_GRACE`   | `30000` (30s)         | Drain window: active streams finish before forced close (ms)  |
+| Var                  | Default              | Meaning                                                      |
+| -------------------- | -------------------- | ------------------------------------------------------------ |
+| `PORT`               | `8090`               | Listen port                                                  |
+| `OFP_CONFIG`         | _(empty = built-in)_ | Multi-egress routing config file (YAML) — see below          |
+| `OFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval for `OFP_CONFIG` (ms)               |
+| `OFP_SHUTDOWN_GRACE` | `30000` (30s)        | Drain window: active streams finish before forced close (ms) |
+
+The upstream base, inbound auth keys and UA-sync cadence live in the
+`OFP_CONFIG` document (`upstream.base`, `auth.keys`,
+`user_agent.sync_interval`), not in environment variables. With no
+`OFP_CONFIG` the built-in runtime serves the default upstream
+(`https://opencode.ai`) with auth off.
 
 ## Multi-egress routing (`OFP_CONFIG`)
 
 `OFP_CONFIG` points at a YAML file describing egresses (per-egress proxy:
 http/https/socks5, or no proxy at all = the host's own network), routes that
-pick from them, and the global fallback/health policy. The file is re-read on
+pick from them, the global fallback/health policy, and the SERVICE settings
+that used to be env vars — the upstream base, inbound auth keys, and the
+UA-sync cadence (`upstream.base`, `auth.keys`,
+`user_agent.sync_interval`). The file is re-read on
 the `OFP_CONFIG_POLL_MS` interval — each poll hashes the bytes (SHA-256) and
 re-parses only on change; a file that fails parse or validation keeps the
 last good runtime and logs the rejection. `example.config.yaml` in the repo
@@ -113,6 +119,20 @@ threshold 3, cooldown 30s, strategy round-robin):
 | `enabled`           | bool            | `true` with a config file | the built-in no-config runtime runs with health OFF (no outage can be acquired by config-less deployments) |
 | `failure_threshold` | int ≥ 0         | `3`                       | consecutive failures that arm a cooldown; explicit `0` = never cool down                                   |
 | `cooldown`          | duration string | `30s`                     | exclusion window once the threshold fires; `0s` = no window; bare numbers are a load error                 |
+
+| `upstream` | Type   | Default               | Meaning                                                                                                                                                     |
+| ---------- | ------ | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base`     | string | `https://opencode.ai` | Zen upstream base, all routes; must be an absolute http/https URL with a host (userinfo, query and fragment rejected); trailing `/` normalized at `Resolve` |
+
+| `auth`        | Type         | Default  | Meaning                                                                                                  |
+| ------------- | ------------ | -------- | -------------------------------------------------------------------------------------------------------- |
+| `keys[]`      | [{name,key}] | empty    | named inbound bearer credentials; empty or omitted = auth off (`401 Invalid API key provided` otherwise) |
+| `keys[].name` | string       | required | unique, control-free; matched requests log it as `api_key_name` — the only part of a key ever echoed     |
+| `keys[].key`  | string       | required | unique secret (`Authorization: Bearer <key>`); env reference, never a literal; never logged or echoed    |
+
+| `user_agent`    | Type    | Default | Meaning                                                                       |
+| --------------- | ------- | ------- | ----------------------------------------------------------------------------- |
+| `sync_interval` | int sec | `3600`  | UA identity sync cadence in SECONDS; `0` = disabled; negative is a load error |
 
 ### Routing: match, then eligibility, then scheduling
 
