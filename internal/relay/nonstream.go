@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/jsonx"
 	"opencode-free-proxy/internal/translate"
 )
@@ -206,6 +207,11 @@ func ConvertResponsesStreamToJson(rawSSE string) map[string]any {
 		processAggMessage(msg, st)
 	}
 
+	// Dense placeholder fill (streamToJsonConverter.js:89-93 — sane interior
+	// gaps between present items keep their exact slots). Bounded by
+	// construction: every key in st.items passed the
+	// config.MaxResponsesOutputIndex gate at insert, so maxIndex can never
+	// make this loop allocate super-linearly.
 	output := make([]any, 0)
 	maxIndex := -1
 	for k := range st.items {
@@ -271,8 +277,27 @@ func processAggMessage(msg string, st *responsesAggState) {
 			st.created = created
 		}
 	case "response.output_item.done":
+		// streamToJsonConverter.js:29 `state.items.set(parsed.output_index ?? 0,
+		// parsed.item)` — the Map insert is O(1) whatever the key, but the
+		// ASSEMBLY is dense (streamToJsonConverter.js:89-93: `for
+		// (let i = 0; i <= maxIndex; i++)` fills a placeholder for every hole),
+		// so an upstream-controlled output_index of 1e18 would make the Go
+		// port allocate 1e18 placeholder maps and OOM the process in seconds.
+		// DIVERGENCE (deliberate, documented): JS has no guard here — V8 only
+		// stops the loop at the 2^32-1 array-length limit, and the escaping
+		// RangeError turns into the 502 envelope (sseToJsonHandler.js:298-301),
+		// i.e. JS also dies on a hostile index, just more slowly and with the
+		// whole response lost. Go drops the offending EVENT instead: indexes
+		// beyond config.MaxResponsesOutputIndex (a bound no real stream
+		// approaches) never reach the items map, the dense fill stays bounded
+		// by that constant, and an otherwise-complete response still serves.
+		// Negative indexes are dropped too — unobservable either way, since the
+		// 0..maxIndex fill never reads them.
 		idx := 0
 		if v, is := parsed["output_index"].(float64); is {
+			if v < 0 || v > float64(config.MaxResponsesOutputIndex) {
+				return
+			}
 			idx = int(v)
 		}
 		if item := jsonx.AsObj(parsed["item"]); item != nil {
