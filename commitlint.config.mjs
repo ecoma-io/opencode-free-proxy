@@ -20,6 +20,8 @@ export default {
         "relay",
         "upstream",
         "router",
+        "routing",
+        "health",
         "caps",
         "usage",
         "jsonx",
