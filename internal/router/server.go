@@ -111,12 +111,14 @@ func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
 	return c, true
 }
 
-// onGeneration runs once-per-generation maintenance for both process-wide
+// onGeneration runs once-per-generation maintenance for all three process-wide
 // state caches: when the request's snapshot is from a generation NEWER than
 // the last one serviced, prune cached transports absent from that snapshot
-// (a reload that swapped out a proxy URL) and reclaim health identities it
-// no longer names (issue #9). The guard is a monotonic CAS — a request
-// holding a STALE snapshot never prunes or reclaims against its older
+// (a reload that swapped out a proxy URL), reclaim health identities it no
+// longer names (issue #9), and drop scheduler rotation state for routes it no
+// longer names (a removed route must not carry a cursor or current_weight
+// into a future config that reuses the id). The guard is a monotonic CAS — a
+// request holding a STALE snapshot never prunes or reclaims against its older
 // keep-set (it would drop a newer generation's transports) — and the
 // CAS+maintenance pair runs under clientMu so they are ONE atomic step:
 // with the CAS advanced before an interleaved prune completed, a stale
@@ -127,9 +129,12 @@ func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
 // idle conns instead of waiting on GC. Health reclamation additionally
 // spares every identity pinned by an in-flight request (health.Registry.Pin
 // at snapshot pin time), so state an old-generation request still observes
-// is never dropped under it. NewClientFor does no I/O, so holding clientMu
-// here never blocks on a dial. Generation 0 is the built-in default runtime:
-// nothing to prune.
+// is never dropped under it; scheduler rotation state needs no such pin — a
+// route state pruned under an in-flight request is simply re-derived from
+// that request's own snapshot at its next Plan, and a mid-request reset
+// degrades to a deterministic first pick, never an error. NewClientFor does
+// no I/O, so holding clientMu here never blocks on a dial. Generation 0 is
+// the built-in default runtime: nothing to prune.
 func (s *Server) onGeneration(rt *config.Runtime) {
 	if rt.Generation == 0 {
 		return
@@ -142,10 +147,13 @@ func (s *Server) onGeneration(rt *config.Runtime) {
 			return
 		}
 		if s.prunedGen.CompareAndSwap(cur, rt.Generation) {
-			sigs, active := generationKeepSets(rt)
+			sigs, active, routes := generationKeepSets(rt)
 			s.pruneClientsLocked(sigs)
 			if s.Health != nil {
 				s.Health.Reclaim(active)
+			}
+			if s.Scheduler != nil {
+				s.Scheduler.PruneRoutes(routes)
 			}
 			return
 		}
@@ -153,13 +161,18 @@ func (s *Server) onGeneration(rt *config.Runtime) {
 }
 
 // generationKeepSets derives, from one snapshot, the transport signatures
-// the client cache keeps and the health identities the runtime can still
-// reach — the same route-referenced egresses in both cases: eligibility and
-// dialing are only ever consulted for egresses a route lists.
-func generationKeepSets(rt *config.Runtime) (sigs, active map[string]struct{}) {
+// the client cache keeps, the health identities the runtime can still reach,
+// and the route ids the scheduler keeps rotation state for. The first two
+// name the same route-referenced egresses — eligibility and dialing are only
+// ever consulted for egresses a route lists — while the third names every
+// route the snapshot declares, resolvable egresses or not (a route state's
+// fingerprint re-validates itself at the next Plan).
+func generationKeepSets(rt *config.Runtime) (sigs, active, routes map[string]struct{}) {
 	sigs = make(map[string]struct{}, len(rt.File.Egress))
 	active = make(map[string]struct{}, len(rt.File.Egress))
+	routes = make(map[string]struct{}, len(rt.Routes()))
 	for _, r := range rt.Routes() {
+		routes[r.ID] = struct{}{}
 		for _, id := range r.Egress {
 			e, ok := rt.Egress(id)
 			if !ok {
@@ -169,7 +182,7 @@ func generationKeepSets(rt *config.Runtime) (sigs, active map[string]struct{}) {
 			active[e.HealthKey()] = struct{}{}
 		}
 	}
-	return sigs, active
+	return sigs, active, routes
 }
 
 // pruneClientsLocked drops cached per-egress transports absent from the

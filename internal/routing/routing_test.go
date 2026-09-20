@@ -108,14 +108,18 @@ func TestPlanRoundRobin(t *testing.T) {
 }
 
 // TestPlanRoundRobinHeadDrop: a head dropping out (health/slots) must not
-// stall or error — the cursor advances over whatever remains.
+// stall or error — the cursor advances over whatever remains. The ROUTE stays
+// the config's route (route.Egress is fingerprint identity — shrinking it
+// would be a membership change, covered by the state-lifecycle membership
+// test); only the eligible head set shrinks.
 func TestPlanRoundRobinHeadDrop(t *testing.T) {
 	rt := config.DefaultRuntime()
 	s := NewScheduler()
-	_ = s.Plan(rt, route("r", config.StrategyRoundRobin, "a", "b", "c"), []string{"a", "b", "c"})
+	r := route("r", config.StrategyRoundRobin, "a", "b", "c")
+	_ = s.Plan(rt, r, []string{"a", "b", "c"})
 
 	// cursor is at 1 after the first plan: over [b c] that starts at c.
-	p := s.Plan(rt, route("r", config.StrategyRoundRobin, "b", "c"), []string{"b", "c"})
+	p := s.Plan(rt, r, []string{"b", "c"})
 	if p.Attempts[0] != "c" || p.Attempts[1] != "b" {
 		t.Fatalf("after head drop plan = %v, want [c b]", p.Attempts)
 	}
