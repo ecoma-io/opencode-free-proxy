@@ -127,9 +127,21 @@ func (c *UserAgentCache) Get() string {
 }
 
 // StartSync launches the background refresh loop (one Warm per interval,
-// forced). It runs until the process exits; the returned func stops it
-// (tests). Startup itself warms once before/alongside this loop.
+// forced). The loop is LAZY and explicit: constructing the cache spawns
+// nothing — the goroutine exists only between StartSync and its stop, so a
+// cache that is never started (tests, the healthcheck subcommand) has zero
+// sync goroutines. interval <= 0 starts nothing and returns a no-op stop
+// (time.NewTicker would panic) — a misconfigured cadence degrades to the
+// compiled-in fallback triple instead of crashing. The returned stop is
+// idempotent and safe to call any number of times, before any sync has run
+// or after the loop already exited; a second StartSync on the same cache
+// runs a second loop (the single-flight Warm dedupe keeps them from
+// stampeding GitHub), so callers should start once and keep the stop.
+// Startup itself warms once before/alongside this loop.
 func (c *UserAgentCache) StartSync(client *http.Client, interval time.Duration) (stop func()) {
+	if interval <= 0 {
+		return func() {}
+	}
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(interval)
