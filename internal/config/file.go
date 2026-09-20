@@ -104,10 +104,26 @@ func (e *Egress) TransportSignature() string {
 }
 
 // HealthKey is the health registry's state identity: logical egress id +
-// physical transport signature. The NUL separator cannot appear in a YAML id
-// or URL, so the concatenation is collision-free.
+// physical transport signature. The concatenation is collision-free by
+// construction, not by accident: Validate rejects control characters in ids
+// (the NUL separator cannot appear there) and url.Parse rejects them in URLs
+// (so it cannot appear in a signature either), which makes the LAST NUL of a
+// key always the separator; signatures are never empty ("direct" or type:url).
 func (e *Egress) HealthKey() string {
 	return e.ID + "\x00" + e.TransportSignature()
+}
+
+// hasControlByte reports ASCII control characters (C0 + DEL). Ids reach log
+// lines and the X-OFP-Egress response header verbatim — Go's header writer
+// strips only \r and \n, so a NUL would go over the wire — and control-free
+// ids are what makes the NUL-separated HealthKey injective by construction.
+func hasControlByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // IsEnabled reports whether the egress participates in scheduling (nil = yes).
@@ -276,6 +292,11 @@ func (f *File) Validate() error {
 		if strings.TrimSpace(e.ID) == "" {
 			return fmt.Errorf("egress[%d]: id is required", i)
 		}
+		if hasControlByte(e.ID) {
+			// The id is not echoed: it IS the control-byte payload. Ids reach
+			// log lines and the X-OFP-Egress response header verbatim.
+			return fmt.Errorf("egress[%d]: id must not contain control characters", i)
+		}
 		if seen[e.ID] {
 			return fmt.Errorf("egress %q: duplicate id", e.ID)
 		}
@@ -313,6 +334,9 @@ func (f *File) Validate() error {
 		if strings.TrimSpace(r.ID) == "" {
 			return fmt.Errorf("route[%d]: id is required", i)
 		}
+		if hasControlByte(r.ID) {
+			return fmt.Errorf("route[%d]: id must not contain control characters", i)
+		}
 		if routeSeen[r.ID] {
 			return fmt.Errorf("route %q: duplicate id", r.ID)
 		}
@@ -339,10 +363,18 @@ func (f *File) Validate() error {
 				return fmt.Errorf("route %q: invalid match model pattern %q: %w", r.ID, pat, err)
 			}
 		}
+		refSeen := map[string]bool{}
 		for _, ref := range r.Egress {
 			if !seen[ref] {
 				return fmt.Errorf("route %q: unknown egress %q (configured: %s)", r.ID, ref, strings.Join(ids, ", "))
 			}
+			// A repeated ref would let ONE request dial the same egress twice —
+			// two health strikes on one identity and two draws against the
+			// max_attempts contract ("DISTINCT egresses one request may try").
+			if refSeen[ref] {
+				return fmt.Errorf("route %q: egress %q is listed more than once (each egress is tried at most once per request)", r.ID, ref)
+			}
+			refSeen[ref] = true
 		}
 		if r.Strategy == StrategyWeightedRR {
 			usable := false
@@ -404,7 +436,15 @@ func validateProxy(id string, p *Proxy) error {
 	}
 	u, err := url.Parse(p.URL)
 	if err != nil {
-		return fmt.Errorf("egress %q: malformed proxy url: %v", id, err)
+		// *url.Error's own text embeds the RAW url — credentials included —
+		// and this error is logged verbatim on a rejected reload (the config
+		// store) and at startup. Surface only the underlying reason:
+		// credentials never reach a surfaced string (redact.go's contract).
+		reason := err
+		if inner := errors.Unwrap(err); inner != nil {
+			reason = inner
+		}
+		return fmt.Errorf("egress %q: malformed proxy url: %v", id, reason)
 	}
 	switch {
 	case u.Scheme == string(ProxyType(p.Type)):

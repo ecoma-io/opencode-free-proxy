@@ -340,6 +340,18 @@ routes: [{id: r, egress: [a, b], strategy: weighted_round_robin}]
 egress: [{id: a, models: ["["]}]
 routes: [{id: r, egress: [a]}]
 `, "invalid model pattern"},
+		{"duplicate egress reference in route", `
+egress: [{id: a}, {id: b}]
+routes: [{id: r, egress: [a, a, b]}]
+`, "more than once"},
+		{"control character in egress id", `
+egress: [{id: "a\0b"}]
+routes: [{id: r, egress: [a]}]
+`, "control characters"},
+		{"control character in route id", `
+egress: [{id: a}]
+routes: [{id: "r\0x", egress: [a]}]
+`, "control characters"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -471,5 +483,41 @@ func TestRedactProxyURL(t *testing.T) {
 	}
 	if !HasSecret("dialing http://user:secret@h:8080 failed") {
 		t.Fatal("HasSecret missed embedded credentials")
+	}
+}
+
+// TestValidationErrorsNeverCarryProxyCredentials: a malformed proxy url's
+// validation error is logged verbatim on a rejected reload (the config
+// store) and at startup — so it must carry only url.Parse's REASON, never
+// the *url.Error line, whose text embeds the raw url with the credentials
+// in it (redact.go's contract, applied to the validation surface).
+func TestValidationErrorsNeverCarryProxyCredentials(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		leak string // a substring that exists only in the raw url
+	}{
+		{"space in password", "http://admin:my secret@p.example:3128", "my secret"},
+		{"bad percent escape", "http://admin:abc%zzsup3r@p.example:3128", "abc%zzsup3r"},
+		{"control byte in url", "http://admin:s3cret\x01@p.example:3128", "s3cret"},
+		{"unclosed ipv6 bracket", "http://admin:s3cret@[::1", "s3cret"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := File{
+				Egress: []Egress{{ID: "e", Proxy: &Proxy{Type: ProxyHTTP, URL: tc.url}}},
+				Routes: []Route{{ID: "r", Egress: []string{"e"}}},
+			}
+			err := f.Validate()
+			if err == nil {
+				t.Fatalf("url %q must fail validation", tc.url)
+			}
+			if strings.Contains(err.Error(), tc.leak) {
+				t.Fatalf("validation error leaks credential material %q: %q", tc.leak, err)
+			}
+			if strings.Contains(err.Error(), tc.url) {
+				t.Fatalf("validation error embeds the raw url: %q", err)
+			}
+		})
 	}
 }

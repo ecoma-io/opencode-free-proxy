@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,6 +14,10 @@ import (
 
 	"opencode-free-proxy/internal/config"
 )
+
+// maxConnectHeaderBytes bounds the CONNECT reply's header read (stdlib
+// parity — net/http maxHeaderResponseSize, 10 MiB).
+const maxConnectHeaderBytes = 10 << 20
 
 // connectDialer owns the https-target CONNECT boundary for http/https proxy
 // egresses (issue #6). Where Go's built-in proxy support answers a refused
@@ -61,11 +66,7 @@ func newConnectDialer(proxy *url.URL, tlsConfig func() *tls.Config) *connectDial
 // conn. network is always "tcp"; addr is the origin "host:port" (the
 // transport passes cm.targetAddr because this transport's Proxy is nil).
 func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net.Conn, error) {
-	proxyAddr := d.proxy.Host
-	if _, _, err := net.SplitHostPort(proxyAddr); err != nil {
-		proxyAddr = net.JoinHostPort(proxyAddr, "1080")
-	}
-	conn, err := d.dialer.DialContext(ctx, "tcp", proxyAddr)
+	conn, err := d.dialer.DialContext(ctx, "tcp", proxyDialAddr(d.proxy))
 	if err != nil {
 		return nil, fmt.Errorf("proxy %s: dial: %w", config.RedactProxyURL(d.proxy.String()), err)
 	}
@@ -79,10 +80,15 @@ func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net
 	_ = conn.SetDeadline(deadlineFrom(ctx, config.ConnectTimeout))
 	handshakeDone := make(chan struct{})
 	defer close(handshakeDone)
+	// Capture the conn AT SPAWN: conn is reassigned to the TLS wrapper below,
+	// and a closure reading the variable would race that write (go memory
+	// model). Closing the captured TCP conn is correct on every path — every
+	// later wrapper wraps exactly this conn.
+	dialConn := conn
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = conn.Close()
+			_ = dialConn.Close()
 		case <-handshakeDone:
 		}
 	}()
@@ -146,8 +152,13 @@ func (d *connectDialer) connect(ctx context.Context, conn net.Conn, addr string)
 	}
 	// Safe to discard the buffered reader after the reply: a compliant proxy
 	// sends nothing past the CONNECT response until the client speaks (the
-	// same reasoning net/http cites for its own CONNECT reader).
-	br := bufio.NewReader(conn)
+	// same reasoning net/http cites for its own CONNECT reader). The read is
+	// BOUNDED like stdlib's (net/http/transport.go maxHeaderResponseSize): a
+	// hostile proxy streaming an unbounded header block must exhaust this
+	// limit into an error, not grow memory until the conn deadline. Not an
+	// open-sse constant — Go transport-boundary hygiene, mirrored from
+	// stdlib, which is why it lives here and not in internal/config.
+	br := bufio.NewReader(io.LimitReader(conn, maxConnectHeaderBytes))
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		return fmt.Errorf("proxy %s: connect read: %w", config.RedactProxyURL(d.proxy.String()), err)

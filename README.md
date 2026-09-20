@@ -173,6 +173,15 @@ egresses = 12 upstream calls; a credential-refusing proxy storm is 1 POST per
 egress. No inter-attempt sleep — the cooldown is health-based, per egress,
 and applies to FUTURE requests only.
 
+The client sees the LAST REAL verdict: when the plan runs out of egresses
+before the budget, the final dialed egress's own status and message are
+returned (base.js never synthesizes a failure — a 429 that outlives the plan
+stays a 429, preserving the client's backoff semantics). The synthetic
+`502 none of the eligible egresses could serve the request` appears only when
+NOTHING was dialed — every plan entry was skipped (slot-full, unknown
+egress, transport build failed) or the head set was empty (`attempts=0` in
+that request's log line).
+
 ### Health
 
 Policy and state are split (`internal/health/health.go`):
@@ -189,12 +198,19 @@ Policy and state are split (`internal/health/health.go`):
 Only real egress faults mark health: connection errors, typed proxy-auth,
 response-header timeouts (60s), and 5xx after the retry matrix. 429 and every
 other 4xx are verdicts about the REQUEST — they fall back (429) or not (4xx)
-but never mark. A success resets the streak and clears any cooldown; failures
-during an active cooldown never extend it. With health disabled the registry
-answers healthy for everything and records nothing (re-enabling resumes from
-the preserved history). A threshold DECREASE never arms retroactively — only
-a new failing observation crossing the observing request's threshold arms a
-cooldown.
+but never mark. Health is observed when response HEADERS arrive: a stream
+that dies or stalls after a 200 start is the streaming commitment's abort,
+not a health observation. Failures during an active cooldown never extend it;
+a success resets the streak and clears the deadline — but a cooling egress is
+filtered from the head set, so in practice only an in-flight request that was
+planned before the arm can deliver that clearing success; the usual ways an
+armed window ends are expiry, a process restart, or a proxy-URL swap (new
+identity). With health disabled — or an explicit `failure_threshold: 0` —
+observations record NOTHING: no streak accrual, and no clearing either, so
+`0` means "never arm" (an already-armed window still runs to expiry; a
+shortened `cooldown` in a new generation applies only on a later re-arm).
+A threshold DECREASE never arms retroactively — only a new failing
+observation crossing the observing request's threshold arms a cooldown.
 
 ### Proxy-authentication (407) classification
 
@@ -215,10 +231,13 @@ fallback, no health mark.
 `proxy_auth_error` itself falls back to the next egress, marks health, and —
 uniquely — bypasses the per-egress retry matrix: one dial, then immediate
 fallback, because the proxy will refuse the same credentials identically on
-every retry. SOCKS5 detail: REP `0x02` ("connection not allowed by ruleset")
-is a plain connection error, not proxy-auth; only RFC 1929 rejections are.
-`socks5h` is rejected at config load by name — remote-DNS semantics would
-silently change which resolver sees upstream hostnames.
+every retry. One honest exception: a 407 that loses the race against the
+connect deadline classifies as a timeout (health-marked, retried) — the
+typed proof never arrived, and text-probing to recover it is banned. SOCKS5
+detail: REP `0x02` ("connection not allowed by ruleset") is a plain
+connection error, not proxy-auth; only RFC 1929 rejections are. `socks5h` is
+rejected at config load by name — remote-DNS semantics would silently change
+which resolver sees upstream hostnames.
 
 ### Streaming commitment
 

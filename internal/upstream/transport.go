@@ -2,7 +2,9 @@ package upstream
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -39,7 +41,15 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 	}
 	u, err := url.Parse(p.URL)
 	if err != nil {
-		return nil, fmt.Errorf("egress proxy %s: %v", config.RedactProxyURL(p.URL), err)
+		// Same redaction rule as config.Validate: *url.Error's text embeds the
+		// raw url with credentials; only the reason may surface. (Unreachable
+		// via OFP_CONFIG — Validate parses the identical string first — but
+		// this constructor must not become a leak for future callers.)
+		reason := err
+		if inner := errors.Unwrap(err); inner != nil {
+			reason = inner
+		}
+		return nil, fmt.Errorf("egress proxy %s: %v", config.RedactProxyURL(p.URL), reason)
 	}
 	switch p.Type {
 	case config.ProxyHTTP, config.ProxyHTTPS:
@@ -70,4 +80,26 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		return nil, fmt.Errorf("egress proxy %s: unknown type %q", config.RedactProxyURL(p.URL), p.Type)
 	}
 	return c, nil
+}
+
+// proxyDialAddr is the TCP address the proxy-protocol dialers (connect.go,
+// socks5.go) connect to. A URL without an explicit port takes the SCHEME's
+// default — http→80 and https→443 like stdlib's own proxy dialing
+// (net/http/transport.go schemePort), socks5→1080 per RFC 1928 — so a
+// portless proxy dials the same endpoint whichever side (http-origin
+// absolute-form vs CONNECT tunnel) it serves. An IPv6 literal is bracketed
+// exactly once: url.Host keeps the brackets, Hostname() strips them,
+// JoinHostPort re-adds them.
+func proxyDialAddr(u *url.URL) string {
+	if _, _, err := net.SplitHostPort(u.Host); err == nil {
+		return u.Host
+	}
+	port := "1080"
+	switch u.Scheme {
+	case "http":
+		port = "80"
+	case "https":
+		port = "443"
+	}
+	return net.JoinHostPort(u.Hostname(), port)
 }

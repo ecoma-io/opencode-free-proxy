@@ -39,9 +39,14 @@ const (
 	// itself was rejected; another egress would repeat the 400) and never
 	// marks health.
 	ClassClientError
-	// ClassResponseStarted: reserved for the relay's mid-stream abort hook —
+	// ClassResponseStarted: reserved for the mid-stream commitment boundary —
 	// upstream died after the first downstream write; no fallback is
-	// possible (the commitment boundary), the relay synthesizes the abort.
+	// possible and the relay synthesizes the abort. No code produces it
+	// TODAY: stream.go aborts without a class, and health is observed at
+	// response-headers time (fallback.go), so a stream that dies after a 200
+	// start neither falls back (the commitment) nor marks health. The
+	// constant keeps the taxonomy total for that boundary should a producer
+	// land; do not cite it as a live classification.
 	ClassResponseStarted
 	// ClassContextCanceled: downstream disconnected. No fallback (nothing
 	// to deliver to) and no health mark (the egress did nothing wrong).
@@ -85,6 +90,14 @@ func (c Class) MarksHealth() bool {
 }
 
 // FallbackAllowed reports whether the executor may try the next egress.
+//
+// Deliberate divergence from base.js, cited per porting discipline: the JS
+// router moves to the next URL only on 429 (base.js:83-85 shouldRetry) and
+// network errors (base.js:175-178) — an exhausted 502/503/504 is returned
+// as-is from the same URL. This executor ALSO falls back on 5xx/timeouts:
+// with several egresses, a proven-bad upstream answer is a reason to try
+// another PATH, and the health registry (not the retry matrix) is what
+// absorbs the poisoning concern.
 func (c Class) FallbackAllowed() bool {
 	switch c {
 	case ClassConnectionError, ClassProxyAuthError, ClassTimeout, ClassUpstream429, ClassUpstream5xx:

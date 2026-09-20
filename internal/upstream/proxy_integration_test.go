@@ -538,3 +538,82 @@ func TestSocks5TunnelServesUpstream(t *testing.T) {
 		t.Fatalf("tunneled body = %q, want the upstream SSE chunk", body)
 	}
 }
+
+// TestProxyDialAddr: a portless proxy URL dials the SCHEME's default port —
+// http→80 / https→443 like stdlib's own proxy dialing, socks5→1080 per RFC
+// 1928 — and an IPv6 literal is bracketed exactly once. The old fallback
+// defaulted everything to 1080 and double-bracketed IPv6 ([[::1]]:1080),
+// producing unusable egresses with misleading dial errors.
+func TestProxyDialAddr(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{"http://p.example:8080", "p.example:8080"},
+		{"http://p.example", "p.example:80"},
+		{"https://p.example", "p.example:443"},
+		{"socks5://p.example", "p.example:1080"},
+		{"http://[::1]", "[::1]:80"},
+		{"http://[::1]:8080", "[::1]:8080"},
+		{"socks5://[2001:db8::1]", "[2001:db8::1]:1080"},
+		// Host carries no userinfo — credentials never reach a dial address.
+		{"http://user:pw@p.example:3128", "p.example:3128"},
+	}
+	for _, tc := range cases {
+		u, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.raw, err)
+		}
+		if got := proxyDialAddr(u); got != tc.want {
+			t.Fatalf("proxyDialAddr(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+// TestConnectReplyHeadersAreBounded: a hostile proxy flooding the CONNECT
+// reply with an unbounded header block must hit the reader's limit (stdlib
+// parity — net/http maxHeaderResponseSize) and fail the dial as a connection
+// error — never grow memory to the conn deadline and never promote to
+// proxy-auth.
+func TestConnectReplyHeadersAreBounded(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				buf := make([]byte, 4096)
+				_, _ = c.Read(buf)                                                  // the CONNECT request line (contents unused)
+				junk := bytes.Repeat([]byte("X-Junk: 0123456789abcdef\r\n"), 1<<19) // ~13 MiB
+				_, _ = c.Write(junk)
+			}(conn)
+		}
+	}()
+
+	u, err := url.Parse("http://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := newConnectDialer(u, func() *tls.Config { return nil })
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.DialTLSContext(context.Background(), "tcp", "origin.invalid:443")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the header flood must fail the dial")
+		}
+		var pae *proxyAuthError
+		if errors.As(err, &pae) {
+			t.Fatalf("a header flood is a connection error, never proxy-auth: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the bounded read did not fail the dial in time — the limit did not engage")
+	}
+}

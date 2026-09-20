@@ -47,7 +47,10 @@ type AttemptPolicy struct {
 // (commitment — the caller must not fall back after this), the winning
 // egress id, the attempts consumed, the last failure class, and the
 // client-facing UpstreamError. On success uerr is nil and class is
-// ClassSuccess; when no egress could serve, resp is nil and uerr carries the
+// ClassSuccess. When no egress could serve, resp is nil and uerr carries the
+// LAST REAL verdict of the final dialed egress (base.js never synthesizes
+// one — a 429 that outlives the plan stays a 429); only a request that never
+// dialed (every plan entry skipped, or an empty head set) gets the synthetic
 // 502 envelope.
 //
 // Invariants (issue #3):
@@ -80,10 +83,12 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 	attempts := 0
 	lastID := ""
 	lastClass := ClassConnectionError
+	var lastErr *UpstreamError
+	// The budget is checked exactly once per dial, at the continue guard
+	// below — attempts only grows after a dial and every post-dial path
+	// either returns or re-checks the budget before continuing, so no
+	// top-of-loop guard is needed (and one would be dead code today).
 	for i, id := range plan.Attempts {
-		if attempts >= budget {
-			break
-		}
 		// A skipped head (below) is a scheduling race, never a failure — with
 		// fallback ENABLED the executor moves to the next plan entry. With
 		// fallback disabled no other egress may be dialed, so a skip at the
@@ -116,6 +121,7 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 		resp, uerr, class := client.DoClassified(ctx, url, buildHeaders, bodyJSON)
 		lastClass = class
 		if uerr != nil {
+			lastErr = uerr
 			if x.slots != nil {
 				x.slots.Release(id)
 			}
@@ -140,6 +146,18 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 			resp.Body = &slotReleaseBody{ReadCloser: resp.Body, free: func() { x.slots.Release(id) }}
 		}
 		return resp, id, attempts, class, uerr
+	}
+	// Terminal verdict: the LAST REAL one when anything was dialed — a plan
+	// that ran out before the budget must not rewrite a 429/503/504 into a
+	// synthetic 502 (it would invert the client's backoff semantics and make
+	// the visible status depend on plan length vs budget). base.js never
+	// synthesizes either: an exhausted matrix returns the real response
+	// (base.js:163) and the last url's real error escapes (base.js:179). The
+	// synthetic envelope is only for a request that never dialed — every
+	// plan entry skipped (slot-full / unknown egress / transport build) or an
+	// empty plan; attempts==0 marks that case in the log.
+	if lastErr != nil {
+		return nil, lastID, attempts, lastClass, lastErr
 	}
 	return nil, lastID, attempts, lastClass, &UpstreamError{
 		Status:  http.StatusBadGateway,

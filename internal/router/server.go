@@ -114,32 +114,39 @@ func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
 // onGeneration runs once-per-generation transport-cache maintenance: when
 // the request's snapshot is from a generation NEWER than the last one
 // serviced, prune cached transports absent from that snapshot (a reload that
-// swapped out a proxy URL). The guard is a monotonic CAS: a request holding
+// swapped out a proxy URL). The guard is a monotonic CAS — a request holding
 // a STALE snapshot never prunes against its older keep-set (it would drop a
-// newer generation's transports), and concurrent racers converge instead of
-// racing a mutex. In-flight requests hold their *Client by reference (the
-// map is only a lookup), so pruning cannot invalidate them — the old client
-// lives until the request's last reference and GC drops it. Generation 0 is
-// the built-in default runtime: nothing to prune.
+// newer generation's transports) — and the CAS+prune pair runs under
+// clientMu so they are ONE atomic step: with the CAS advanced before an
+// interleaved prune completed, a stale snapshot could still evict a transport
+// the newer generation had just rebuilt (self-healing — the next dial
+// rebuilds — but needless conn churn). In-flight requests hold their *Client
+// by reference (the map is only a lookup), so pruning cannot invalidate
+// them; evicted clients close their idle conns instead of waiting on GC.
+// NewClientFor does no I/O, so holding clientMu here never blocks on a dial.
+// Generation 0 is the built-in default runtime: nothing to prune.
 func (s *Server) onGeneration(rt *config.Runtime) {
 	if rt.Generation == 0 {
 		return
 	}
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
 	for {
 		cur := s.prunedGen.Load()
 		if cur >= rt.Generation {
 			return
 		}
 		if s.prunedGen.CompareAndSwap(cur, rt.Generation) {
-			s.pruneClients(rt)
+			s.pruneClientsLocked(rt)
 			return
 		}
 	}
 }
 
-// pruneClients drops cached per-egress transports absent from the snapshot's
-// routes. Called only from onGeneration, once per generation.
-func (s *Server) pruneClients(rt *config.Runtime) {
+// pruneClientsLocked drops cached per-egress transports absent from the
+// snapshot's routes; clientMu must be held. Called only from onGeneration,
+// once per generation.
+func (s *Server) pruneClientsLocked(rt *config.Runtime) {
 	keep := make(map[string]struct{}, 8)
 	for _, r := range rt.Routes() {
 		for _, id := range r.Egress {
@@ -148,10 +155,9 @@ func (s *Server) pruneClients(rt *config.Runtime) {
 			}
 		}
 	}
-	s.clientMu.Lock()
-	defer s.clientMu.Unlock()
-	for sig := range s.clients {
+	for sig, c := range s.clients {
 		if _, ok := keep[sig]; !ok {
+			c.CloseIdleConnections()
 			delete(s.clients, sig)
 		}
 	}

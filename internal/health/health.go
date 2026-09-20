@@ -58,8 +58,16 @@ func PolicyFromSnapshot(rt *config.Runtime) Policy {
 // changes the key, so a fresh physical transport never inherits the old
 // transport's failure streak or cooldown.
 type Registry struct {
-	mu     sync.Mutex
-	now    func() time.Time
+	mu  sync.Mutex
+	now func() time.Time
+	// states is process-lifetime and deliberately NEVER pruned — the mirror
+	// image of the router's client cache, which IS pruned per generation.
+	// Entries are keyed by transport identity, so a generation-scoped
+	// eviction would erase the history a policy-only reload must keep (the
+	// identity contract). Growth is bounded by the number of DISTINCT
+	// transports ever configured — an operator-driven input (proxy
+	// URL/credential rotation), not a per-request one — and each entry is two
+	// small fields.
 	states map[string]*state
 }
 

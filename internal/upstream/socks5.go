@@ -29,11 +29,7 @@ func newSocks5Dialer(proxy *url.URL) *socks5Dialer {
 // DialContext establishes the tunnel for addr ("host:port" of the UPSTREAM —
 // resolved locally). The returned conn is ready for the caller's traffic.
 func (d *socks5Dialer) DialContext(ctx context.Context, _ string, addr string) (net.Conn, error) {
-	proxyHost := d.proxy.Host
-	if _, _, err := net.SplitHostPort(proxyHost); err != nil {
-		proxyHost = net.JoinHostPort(proxyHost, "1080") // RFC 1928 default port
-	}
-	conn, err := d.dialer.DialContext(ctx, "tcp", proxyHost)
+	conn, err := d.dialer.DialContext(ctx, "tcp", proxyDialAddr(d.proxy))
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
 	}

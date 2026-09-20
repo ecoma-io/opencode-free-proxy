@@ -151,6 +151,18 @@ func drainAndClose(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
+// CloseIdleConnections closes the idle pooled conns of every transport the
+// client owns. The router calls it when a generation prune evicts the client:
+// without it an evicted transport's idle conns linger until GC finalizes
+// them (up to ~2 minutes between forced collections), making the FD
+// accounting of an egress swap nondeterministic.
+func (c *Client) CloseIdleConnections() {
+	c.HTTP.CloseIdleConnections()
+	if c.tunneled != nil {
+		c.tunneled.CloseIdleConnections()
+	}
+}
+
 // attempt performs one POST without touching the response body; netErr
 // distinguishes transport failures. The transport is picked by TARGET scheme:
 // https through an HTTP(S) proxy rides the tunneled CONNECT boundary, http
@@ -176,13 +188,16 @@ func (c *Client) attempt(ctx context.Context, url string, headers map[string]str
 // (`if (attempts <= 0 || retryAttemptsByUrl[urlIndex] >= attempts) return
 // false; retryAttemptsByUrl[url]++`).
 func (c *Client) tryRetry(ctx context.Context, used *int, rule config.RetryRule) bool {
+	// The ctx check comes FIRST: a dead request draws no budget it can never
+	// spend. (The call terminates on this path either way — used is local to
+	// one DoClassified — so this is ordering hygiene, not semantics.)
+	if ctx.Err() != nil {
+		return false
+	}
 	if rule.Attempts <= 0 || *used >= rule.Attempts {
 		return false
 	}
 	*used++
-	if ctx.Err() != nil {
-		return false
-	}
 	c.Sleep(rule.Delay)
 	return true
 }
