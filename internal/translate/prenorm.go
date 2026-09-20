@@ -275,8 +275,12 @@ var validOpenAIContentTypes = map[string]bool{
 	"input_audio": true, "audio_url": true, "file": true,
 }
 
+// cloneMsg shallow-copies one message. The size hint is exactly len(msg) —
+// no +1 reserve: the hint is not a bound, growth is the map's job, and the
+// arithmetic is what code scanning's allocation-size-overflow flags
+// (issue #17).
 func cloneMsg(msg map[string]any) map[string]any {
-	out := make(map[string]any, len(msg)+1)
+	out := make(map[string]any, len(msg))
 	for k, v := range msg {
 		out[k] = v
 	}

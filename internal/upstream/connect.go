@@ -97,14 +97,7 @@ func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net
 		// TLS to the proxy first (an https proxy endpoint); the CONNECT then
 		// travels inside that TLS layer. No h2 on this hop — the proxy speaks
 		// HTTP/1.1 CONNECT regardless of what the tunnel carries.
-		cfg := &tls.Config{ServerName: d.proxy.Hostname()}
-		if d.proxyTLS != nil {
-			cfg = d.proxyTLS.Clone()
-			if cfg.ServerName == "" {
-				cfg.ServerName = d.proxy.Hostname()
-			}
-		}
-		tlsConn := tls.Client(conn, cfg)
+		tlsConn := tls.Client(conn, d.proxyTLSConfig())
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("proxy %s: tls: %w", config.RedactProxyURL(d.proxy.String()), err)
@@ -173,10 +166,42 @@ func (d *connectDialer) connect(ctx context.Context, conn net.Conn, addr string)
 	return nil
 }
 
+// tlsMinVersion is the package TLS floor, stated on every tls.Config this
+// dialer builds rather than inherited from the stdlib default (code scanning
+// go/missing-ssl-minversion, issue #18). Parity-neutral: Go 1.22+'s default
+// minimum is already 1.2, and the ported open-sse runtime is Node, whose TLS
+// floor has been 1.2 since Node 12.
+const tlsMinVersion = tls.VersionTLS12
+
+// floorTLS raises cfg's minimum to the package floor. It never lowers an
+// explicit higher floor, and an unset MinVersion (0 — "stdlib default") is
+// treated as needing the floor stated, not as an intentional downgrade.
+func floorTLS(cfg *tls.Config) {
+	if cfg.MinVersion < tlsMinVersion {
+		cfg.MinVersion = tlsMinVersion
+	}
+}
+
+// proxyTLSConfig builds the PROXY-hop TLS settings for an https proxy
+// endpoint: ServerName from the proxy host unless the injected config names
+// one; the TLS floor applies to the literal and to every injected clone.
+func (d *connectDialer) proxyTLSConfig() *tls.Config {
+	cfg := &tls.Config{ServerName: d.proxy.Hostname(), MinVersion: tlsMinVersion}
+	if d.proxyTLS != nil {
+		cfg = d.proxyTLS.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName = d.proxy.Hostname()
+		}
+		floorTLS(cfg)
+	}
+	return cfg
+}
+
 // originTLSConfig clones the client TLS settings for the origin hop,
-// pinning ServerName to the dialed host and offering h2 + http/1.1.
+// pinning ServerName to the dialed host, offering h2 + http/1.1, and
+// flooring the minimum on the literal and on every injected clone.
 func (d *connectDialer) originTLSConfig(addr string) *tls.Config {
-	cfg := &tls.Config{NextProtos: []string{"h2", "http/1.1"}}
+	cfg := &tls.Config{NextProtos: []string{"h2", "http/1.1"}, MinVersion: tlsMinVersion}
 	if d.tlsConfig != nil {
 		if base := d.tlsConfig(); base != nil {
 			cfg = base.Clone()
@@ -188,6 +213,7 @@ func (d *connectDialer) originTLSConfig(addr string) *tls.Config {
 			if len(cfg.NextProtos) == 0 {
 				cfg.NextProtos = []string{"h2", "http/1.1"}
 			}
+			floorTLS(cfg)
 		}
 	} else if host, _, err := net.SplitHostPort(addr); err == nil {
 		cfg.ServerName = host

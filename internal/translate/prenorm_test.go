@@ -549,3 +549,18 @@ func TestFallbackToolCallIDShape(t *testing.T) {
 		t.Fatalf("FallbackToolCallID = %q, want call_<unixmilli>", FallbackToolCallID())
 	}
 }
+
+func TestCloneMsgShallowCopy(t *testing.T) {
+	// Go-side hygiene (issue #17): the size hint carries no arithmetic, but
+	// the semantics callers rely on are pinned — an equal copy that does not
+	// alias the source, with room for the key FilterToOpenAIFormat adds.
+	msg := map[string]any{"role": "assistant", "content": "x"}
+	out := cloneMsg(msg)
+	if len(out) != 2 || out["role"] != "assistant" || out["content"] != "x" {
+		t.Fatalf("cloneMsg = %v, want an equal copy of %v", out, msg)
+	}
+	out["tool_calls"] = []any{}
+	if _, ok := msg["tool_calls"]; ok {
+		t.Fatal("cloneMsg must not alias the source map")
+	}
+}
