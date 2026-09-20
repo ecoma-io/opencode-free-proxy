@@ -1,0 +1,339 @@
+package upstream
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+
+	"net"
+	"opencode-free-proxy/internal/config"
+	"opencode-free-proxy/internal/health"
+	"opencode-free-proxy/internal/routing"
+	"time"
+)
+
+// scriptedRecorder collects upstream calls per egress id.
+type scriptedRecorder struct {
+	mu    sync.Mutex
+	calls map[string]int
+}
+
+func (r *scriptedRecorder) count(id string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls[id]
+}
+
+func (r *scriptedRecorder) total() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, c := range r.calls {
+		n += c
+	}
+	return n
+}
+
+// scriptedUpstream serves every request with the given status; the recorder
+// tags it by egress name.
+func scriptedUpstream(t *testing.T, name string, status int, rec *scriptedRecorder) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.mu.Lock()
+		if rec.calls == nil {
+			rec.calls = map[string]int{}
+		}
+		rec.calls[name]++
+		rec.mu.Unlock()
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(status)
+	}))
+}
+
+// executorFixture wires one httptest upstream per egress, each returning its
+// own fixed status. plan/policy are sized to the caller's scenario.
+type executorFixture struct {
+	servers map[string]*httptest.Server
+	rec     *scriptedRecorder
+	exec    *Executor
+	health  *health.Registry
+	slots   *Limiter
+}
+
+func newExecutorFixture(t *testing.T, statuses map[string]int) *executorFixture {
+	t.Helper()
+	f := &executorFixture{
+		servers: map[string]*httptest.Server{},
+		rec:     &scriptedRecorder{calls: map[string]int{}},
+		health:  health.New(),
+		slots:   NewLimiter(),
+	}
+	// The request path Configure()s the registry per request; use threshold
+	// 1 here so a single observed failure flips eligibility in tests.
+	f.health.Configure(true, 1, time.Minute)
+
+	for id, status := range statuses {
+		f.servers[id] = scriptedUpstream(t, id, status, f.rec)
+	}
+	clients := map[string]*Client{}
+	for id := range statuses {
+		c := NewClient()
+		// Pin each egress's dial to ITS OWN listener, independent of the URL
+		// host (production differentiates egresses by proxy transport; here
+		// the dial is the differentiator).
+		addr := f.servers[id].Listener.Addr().String()
+		c.HTTP.Transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		}
+		clients[id] = c
+	}
+	f.exec = NewExecutor(func(id string) (*Client, bool) {
+		c, ok := clients[id]
+		return c, ok
+	}, f.health, f.slots)
+	return f
+}
+
+func (f *executorFixture) Close() {
+	for _, s := range f.servers {
+		s.Close()
+	}
+}
+
+// plan builds a RoutePlan from the route + eligible heads (no scheduler).
+func plan(routeID string, heads ...string) routing.RoutePlan {
+	return routing.RoutePlan{RouteID: routeID, Strategy: config.StrategyRoundRobin, Attempts: heads}
+}
+
+func policy(fallback bool, max int) AttemptPolicy {
+	return AttemptPolicy{FallbackEnabled: fallback, MaxAttempts: max, MaxConcurrency: map[string]int{}}
+}
+
+// TestExecuteFirstEgressServes: a success on the first attempt returns the
+// live response with zero fallback traffic, and marks the egress healthy.
+func TestExecuteFirstEgressServes(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 200})
+	defer f.Close()
+
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL+"/zen/v1/chat/completions",
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a"), policy(true, 3))
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr = %v", uerr)
+	}
+	_ = resp.Body.Close()
+	if id != "a" || attempts != 1 || class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d class=%s", id, attempts, class)
+	}
+	if f.rec.total() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", f.rec.total())
+	}
+	if !f.health.Healthy("a") {
+		t.Fatal("success must mark the egress healthy")
+	}
+}
+
+// TestExecuteFallsBackOn5xx: a 500-class failure on the first egress falls
+// back to the next; health is marked; the winner's success clears it.
+func TestExecuteFallsBackOn5xx(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 200})
+	defer f.Close()
+
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a", "b"), policy(true, 3))
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr = %v", uerr)
+	}
+	_ = resp.Body.Close()
+	if id != "b" || attempts != 2 || class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d class=%s", id, attempts, class)
+	}
+	if f.rec.count("a") != 1 || f.rec.count("b") != 1 {
+		t.Fatalf("calls a=%d b=%d, want 1 each", f.rec.count("a"), f.rec.count("b"))
+	}
+	if f.health.Healthy("a") {
+		t.Fatal("a's 500 must mark it unhealthy")
+	}
+	if !f.health.Healthy("b") {
+		t.Fatal("b's success must mark it healthy")
+	}
+}
+
+// TestExecute429FallsBackWithoutMarkingHealth: 429 falls back but is a
+// verdict about the request, never about the egress.
+func TestExecute429FallsBackWithoutMarkingHealth(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 429, "b": 200})
+	defer f.Close()
+
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a", "b"), policy(true, 3))
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr = %v", uerr)
+	}
+	_ = resp.Body.Close()
+	if id != "b" || attempts != 2 || class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d class=%s", id, attempts, class)
+	}
+	if !f.health.Healthy("a") {
+		t.Fatal("429 must NOT mark the egress unhealthy")
+	}
+}
+
+// TestExecuteAllUnhealthyReturns502: when every egress fails, Execute
+// returns the terminal error WITHOUT a response — the caller must not have
+// written anything downstream yet, so the 502 envelope is safe.
+func TestExecuteAllUnhealthyReturns502(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 500})
+	defer f.Close()
+
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a", "b"), policy(true, 3))
+	if resp != nil {
+		t.Fatal("must not return a response when all egresses failed")
+	}
+	if uerr == nil || uerr.Status != http.StatusBadGateway {
+		t.Fatalf("uerr = %+v, want 502", uerr)
+	}
+	if attempts != 2 || class != ClassUpstream5xx {
+		t.Fatalf("attempts=%d class=%s", attempts, class)
+	}
+	if id != "b" {
+		t.Fatalf("last id = %q, want b", id)
+	}
+}
+
+// TestExecuteBudgetCapsAttempts: MaxAttempts bounds DISTINCT egresses tried
+// (default 3); the rest of the plan is never dialed.
+func TestExecuteBudgetCapsAttempts(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 500, "c": 200, "d": 200})
+	defer f.Close()
+
+	resp, id, attempts, _, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a", "b", "c", "d"), policy(true, 2))
+	if resp != nil || uerr == nil {
+		t.Fatalf("resp=%v uerr=%v, want terminal 502", resp, uerr)
+	}
+	if attempts != 2 || id != "b" {
+		t.Fatalf("attempts = %d id=%q, want 2 on b (budget cap)", attempts, id)
+	}
+	if f.rec.count("c") != 0 || f.rec.count("d") != 0 {
+		t.Fatalf("beyond-budget egresses must never be dialed: c=%d d=%d", f.rec.count("c"), f.rec.count("d"))
+	}
+}
+
+// TestExecuteFallbackDisabled: fallback off → one attempt only, even with a
+// plan of many.
+func TestExecuteFallbackDisabled(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 200})
+	defer f.Close()
+
+	resp, id, attempts, _, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a", "b"), policy(false, 3))
+	if resp != nil || uerr == nil {
+		t.Fatalf("resp=%v uerr=%v, want 502", resp, uerr)
+	}
+	if attempts != 1 || id != "a" {
+		t.Fatalf("attempts=%d id=%q, want single attempt on a", attempts, id)
+	}
+	if f.rec.count("b") != 0 {
+		t.Fatal("fallback disabled must never dial b")
+	}
+}
+
+// TestExecuteFullSlotSkippedNotFailed: an egress whose slot fills between
+// plan and dial is SKIPPED (not a failure) — the head moves on, and when the
+// slot frees the egress serves again.
+func TestExecuteFullSlotSkippedNotFailed(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200})
+	defer f.Close()
+	f.slots.Acquire("a", 1) // fill a's single slot before the request
+
+	p := AttemptPolicy{
+		FallbackEnabled: true,
+		MaxAttempts:     3,
+		MaxConcurrency:  map[string]int{"a": 1, "b": 1},
+	}
+	resp, id, _, _, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a", "b"), p)
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr = %v", uerr)
+	}
+	_ = resp.Body.Close()
+	if id != "b" {
+		t.Fatalf("id = %q, want b (a's slot full → skip)", id)
+	}
+	if f.rec.count("a") != 0 {
+		t.Fatalf("a must not have been dialed: %d calls", f.rec.count("a"))
+	}
+	if !f.health.Healthy("a") {
+		t.Fatal("a must not be marked unhealthy for a skipped dial")
+	}
+}
+
+// TestExecuteUnknownEgressSkipped: an egress that left the config mid-flight
+// is skipped, not a failure.
+func TestExecuteUnknownEgressSkipped(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"b": 200})
+	defer f.Close()
+
+	resp, id, attempts, _, uerr := f.exec.Execute(
+		context.Background(), f.servers["b"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "ghost", "b"), policy(true, 3))
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr = %v", uerr)
+	}
+	_ = resp.Body.Close()
+	if id != "b" || attempts != 1 {
+		t.Fatalf("id=%q attempts=%d, want b after skipping ghost", id, attempts)
+	}
+}
+
+// TestExecuteContextCanceledShortCircuits: a canceled context must stop the
+// attempt loop immediately and return the caller's error, not fall back.
+func TestExecuteContextCanceledShortCircuits(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 200})
+	defer f.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Force the transport to honor the canceled ctx via a closed server.
+	f.servers["a"].Close()
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		ctx, f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a", "b"), policy(true, 3))
+	if resp != nil {
+		t.Fatal("canceled request must not return a response")
+	}
+	if class != ClassContextCanceled {
+		t.Fatalf("class = %s, want ClassContextCanceled", class)
+	}
+	if attempts != 1 || id != "a" {
+		t.Fatalf("attempts=%d id=%q; a canceled attempt must not fall back", attempts, id)
+	}
+	if uerr == nil || !strings.Contains(uerr.Message, "context canceled") {
+		t.Fatalf("uerr = %+v, want the canceled context error", uerr)
+	}
+	_ = resp
+}
