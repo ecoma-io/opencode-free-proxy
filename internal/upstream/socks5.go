@@ -13,10 +13,15 @@ import (
 )
 
 // socks5Dialer implements a minimal SOCKS5 CONNECT dialer (RFC 1928 §3-4)
-// with username/password auth (RFC 1929). Hostnames resolve LOCALLY: CONNECT
-// carries the resolved IP — matching the config-level rejection of socks5h,
-// whose remote-DNS semantics are deliberately out of scope. No x/net dep:
-// the protocol is small enough to hand-roll with the stdlib.
+// with username/password auth (RFC 1929). The DNS side follows the proxy
+// URL's scheme (issue #8): socks5:// resolves the target hostname LOCALLY
+// and CONNECTs the IP literal — the proxy never sees the hostname (the
+// historical form, byte-for-byte unchanged) — while socks5h:// CONNECTs the
+// hostname itself (ATYP=3, RFC 1928 §5) and leaves resolution to the proxy,
+// which is what vendors that refuse IP-literal CONNECT targets require.
+// Either way the PROXY host is dialed locally: it must be reachable before
+// any tunnel exists. No x/net dep: the protocol is small enough to hand-roll
+// with the stdlib.
 type socks5Dialer struct {
 	proxy  *url.URL
 	dialer net.Dialer
@@ -128,8 +133,16 @@ func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
 	}
 }
 
-// connect sends CONNECT for addr with the host resolved LOCALLY and validates
-// the reply, consuming the variable-length bind address (RFC 1928 §4, §6).
+// connect sends CONNECT for addr and validates the reply, consuming the
+// variable-length bind address (RFC 1928 §4, §6). The CONNECT address form
+// follows the proxy URL's scheme (issue #8): socks5h:// carries the hostname
+// (ATYP=3 domain form — 1 length byte + FQDN) and the proxy resolves it;
+// socks5:// resolves LOCALLY and sends the IP literal. An IP-literal target
+// keeps its literal form (ATYP=1/4) in both modes — it needs no DNS, and
+// ATYP=3 is defined for FQDNs, not dotted quads. A failed remote-resolve
+// CONNECT fails exactly like any other CONNECT error: same reply codes, same
+// error class — there is no silent fallback to local resolution and no
+// retry.
 func (d *socks5Dialer) connect(ctx context.Context, conn net.Conn, addr string) error {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -139,22 +152,41 @@ func (d *socks5Dialer) connect(ctx context.Context, conn net.Conn, addr string) 
 	if err != nil {
 		return fmt.Errorf("socks5: bad target port %q: %w", portStr, err)
 	}
-	// LOCAL resolution: the proxy never sees the hostname. This is the
-	// socks5 contract — socks5h would flip DNS to the proxy side.
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil || len(addrs) == 0 {
-		if err == nil {
-			err = fmt.Errorf("no addresses")
-		}
-		return fmt.Errorf("socks5: resolve %q locally: %w", host, err)
-	}
-	ip := addrs[0].IP
 	var atyp byte
 	var addrBytes []byte
-	if v4 := ip.To4(); v4 != nil {
-		atyp, addrBytes = 0x01, v4
-	} else {
-		atyp, addrBytes = 0x04, ip.To16()
+	switch ip := net.ParseIP(host); {
+	case ip != nil:
+		// Literal target: no resolution on either side of the tunnel.
+		if v4 := ip.To4(); v4 != nil {
+			atyp, addrBytes = 0x01, v4
+		} else {
+			atyp, addrBytes = 0x04, ip.To16()
+		}
+	case d.proxy.Scheme == "socks5h":
+		// REMOTE resolution (issue #8): the proxy sees the hostname and does
+		// the lookup — the measured class of vendors that instantly refuse
+		// IP-literal targets tunnels fine for the same hostnames. Domain
+		// form (RFC 1928 §5): 1 length byte, then the FQDN.
+		if len(host) > 255 {
+			return fmt.Errorf("socks5: hostname %q exceeds the RFC 1928 domain-form limit of 255 bytes", host)
+		}
+		atyp, addrBytes = 0x03, append([]byte{byte(len(host))}, host...)
+	default:
+		// LOCAL resolution: the proxy never sees the hostname. This is the
+		// socks5:// contract — unchanged historical behavior.
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil || len(addrs) == 0 {
+			if err == nil {
+				err = fmt.Errorf("no addresses")
+			}
+			return fmt.Errorf("socks5: resolve %q locally: %w", host, err)
+		}
+		ip := addrs[0].IP
+		if v4 := ip.To4(); v4 != nil {
+			atyp, addrBytes = 0x01, v4
+		} else {
+			atyp, addrBytes = 0x04, ip.To16()
+		}
 	}
 	req := []byte{0x05, 0x01, 0x00, atyp}
 	req = append(req, addrBytes...)

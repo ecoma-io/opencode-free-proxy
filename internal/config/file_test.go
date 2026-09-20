@@ -362,10 +362,10 @@ routes: [{id: r, egress: [a]}]
 egress: [{id: a, proxy: {type: socks5h, url: "socks5h://h:1"}}]
 routes: [{id: r, egress: [a]}]
 `, "socks5h"},
-		{"socks5h url scheme rejected", `
-egress: [{id: a, proxy: {type: socks5, url: "socks5h://h:1"}}]
+		{"socks5 with http url rejected", `
+egress: [{id: a, proxy: {type: socks5, url: "http://h:1"}}]
 routes: [{id: r, egress: [a]}]
-`, "socks5h"},
+`, "does not match type"},
 		{"malformed proxy url", `
 egress: [{id: a, proxy: {type: http, url: "://no-host"}}]
 routes: [{id: r, egress: [a]}]
@@ -441,6 +441,43 @@ routes: [{id: "r\0x", egress: [a]}]
 				t.Fatalf("error %q does not contain %q", err, tc.wantSub)
 			}
 		})
+	}
+}
+
+// TestSocks5hSchemeIsRemoteResolve (issue #8): type socks5 accepts TWO url
+// schemes — socks5:// (local resolve, byte-for-byte the historical form) and
+// socks5h:// (the CONNECT carries the hostname; the proxy resolves). The url
+// is kept verbatim so the transport signature — type + url — differs between
+// the two: flipping the DNS side is a proxy-url swap and starts a fresh
+// health identity (issue #6 semantics).
+func TestSocks5hSchemeIsRemoteResolve(t *testing.T) {
+	local, err := resolveYAML(t, `
+egress: [{id: a, proxy: {type: socks5, url: "socks5://h:1080"}}]
+routes: [{id: r, egress: [a]}]
+`)
+	if err != nil {
+		t.Fatalf("socks5:// rejected: %v", err)
+	}
+	remote, err := resolveYAML(t, `
+egress: [{id: a, proxy: {type: socks5, url: "socks5h://user:secret@h:1080"}}]
+routes: [{id: r, egress: [a]}]
+`)
+	if err != nil {
+		t.Fatalf("socks5h:// rejected: %v", err)
+	}
+	e, _ := local.Egress("a")
+	if e.Proxy.URL != "socks5://h:1080" {
+		t.Fatalf("socks5 url not verbatim: %q", e.Proxy.URL)
+	}
+	if e.TransportSignature() != "socks5:socks5://h:1080" {
+		t.Fatalf("socks5 signature = %q", e.TransportSignature())
+	}
+	e, _ = remote.Egress("a")
+	if e.Proxy.URL != "socks5h://user:secret@h:1080" {
+		t.Fatalf("socks5h url not verbatim: %q", e.Proxy.URL)
+	}
+	if e.TransportSignature() != "socks5:socks5h://user:secret@h:1080" {
+		t.Fatalf("socks5h signature = %q", e.TransportSignature())
 	}
 }
 
@@ -548,6 +585,7 @@ func TestRedactProxyURL(t *testing.T) {
 		{"http://user:secret@h:8080", "http://h:8080"},
 		{"https://user:secret@h:8443", "https://h:8443"},
 		{"socks5://user:secret@h:1080", "socks5://h:1080"},
+		{"socks5h://user:secret@h:1080", "socks5h://h:1080"},
 		{"http://h:8080", "http://h:8080"},
 		{"not a url", "<invalid proxy url>"},
 	}

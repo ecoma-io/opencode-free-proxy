@@ -36,9 +36,12 @@
 # egress[]                                        at least one; unique id
 #   id               string, required, unique
 #   proxy            omit the whole key for the host's own network (direct)
-#     type           http | https | socks5. socks5h is REJECTED at load —
-#                    hostnames must resolve locally; remote-DNS semantics
-#                    are deliberately out of scope.
+#     type           http | https | socks5. A socks5 egress picks its DNS
+#                    side by url scheme: socks5:// resolves the target
+#                    locally (CONNECT carries the IP); socks5h:// sends the
+#                    hostname in the CONNECT (RFC 1928 ATYP 3) and the proxy
+#                    resolves it. The type NAME socks5h is still rejected —
+#                    the scheme is the opt-in, never a silent normalization.
 #     url            scheme must equal type; host required; userinfo optional
 #   enabled          bool, default true (false = configured, never scheduled)
 #   weight           int, default 1, must be >= 0. Feeds
@@ -107,9 +110,10 @@ egress:
       url: "https://${OFP_EXAMPLE_HTTPS_USER}:${OFP_EXAMPLE_HTTPS_PASS}@https-proxy.example.net:8443"
     weight: 3
     max_body_bytes: 4194304 # eligibility gate: bodies over 4 MiB never pick it
-  # SOCKS5 with RFC 1929 username/password auth. NOT socks5h: hostnames are
-  # resolved locally before the CONNECT, and a socks5h type or url scheme is
-  # rejected at load by name instead of being silently normalized.
+  # SOCKS5 with RFC 1929 username/password auth. socks5:// resolves target
+  # hostnames locally before the CONNECT (ATYP 1); a socks5h:// url instead
+  # carries the hostname (ATYP 3) for proxies that refuse IP-literal
+  # targets — same dialer, same auth, only the address form flips.
   - id: socks5-proxy
     proxy:
       type: socks5

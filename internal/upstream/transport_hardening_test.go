@@ -70,11 +70,11 @@ func TestSocks5AuthDemandedWithoutCredentials(t *testing.T) {
 	}
 }
 
-// TestSocks5HostnameArrivesAsIP is the socks5h rejection made real on the
-// wire: the origin is given as a HOSTNAME and must be resolved LOCALLY — the
-// CONNECT request carries atyp 0x01/0x04 with raw address bytes, never
-// 0x03 + domain (socks5.go's LOCAL resolution; the config-level socks5h
-// rejection is the policy, this is the proof).
+// TestSocks5HostnameArrivesAsIP is the socks5:// local-resolve contract made
+// real on the wire: the origin is given as a HOSTNAME and must be resolved
+// LOCALLY — the CONNECT request carries atyp 0x01/0x04 with raw address
+// bytes, never 0x03 + domain (socks5.go's LOCAL resolution; remote resolve
+// is the socks5h:// scheme's opt-in, never the default — this is the proof).
 func TestSocks5HostnameArrivesAsIP(t *testing.T) {
 	// no-auth greet; REP 0x01 ends the dial deterministically right after the
 	// CONNECT has been recorded — the target is never dialed (port 1).

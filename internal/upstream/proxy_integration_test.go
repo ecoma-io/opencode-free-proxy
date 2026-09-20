@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -352,6 +353,13 @@ type socks5Fake struct {
 	// gotConnect records the CONNECT request exactly as it hit the wire
 	// (atyp + address bytes + port) — the local-DNS/atyp assertions read it.
 	gotConnect atomic.Pointer[socks5ConnectRecord]
+	// mu guards the resolve map below: the test goroutine writes it before
+	// dialing, handler goroutines read it.
+	mu sync.Mutex
+	// resolve maps ATYP=3 hostnames to dialable "host:port" — the fake's
+	// stand-in for proxy-side DNS (under socks5h the NAME resolves at the
+	// proxy, not in the test process). A miss dials the name itself.
+	resolve map[string]string
 }
 
 // socks5ConnectRecord is the recorded CONNECT wire shape.
@@ -367,10 +375,18 @@ func newSocks5Fake(t *testing.T, method, authRep, rep byte) *socks5Fake {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &socks5Fake{ln: ln, url: "socks5://" + ln.Addr().String(), method: method, authRep: authRep, rep: rep}
+	f := &socks5Fake{ln: ln, url: "socks5://" + ln.Addr().String(), method: method, authRep: authRep, rep: rep, resolve: map[string]string{}}
 	go f.serve()
 	t.Cleanup(func() { _ = ln.Close() })
 	return f
+}
+
+// resolveAtProxy teaches the fake where an ATYP=3 hostname should dial —
+// its stand-in for proxy-side resolution. Call before the first dial.
+func (f *socks5Fake) resolveAtProxy(name, addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resolve[name] = addr
 }
 
 func (f *socks5Fake) serve() {
@@ -469,7 +485,25 @@ func (f *socks5Fake) handle(conn net.Conn) error {
 		return nil
 	}
 
-	target, err := net.Dial("tcp", net.JoinHostPort(net.IP(addr).String(), strconv.Itoa(int(port[0])<<8|int(port[1]))))
+	// Resolve the CONNECT address the way a proxy would: IP literals dial
+	// at the frame's port; an ATYP=3 hostname goes through the resolve map
+	// (proxy-side DNS — a map hit is a full resolved "host:port" endpoint),
+	// falling back to dialing the name itself at the frame's port.
+	var dialAddr string
+	framePort := strconv.Itoa(int(port[0])<<8 | int(port[1]))
+	switch req[3] {
+	case 0x03:
+		name := string(addr)
+		f.mu.Lock()
+		dialAddr = f.resolve[name]
+		f.mu.Unlock()
+		if dialAddr == "" {
+			dialAddr = net.JoinHostPort(name, framePort)
+		}
+	default:
+		dialAddr = net.JoinHostPort(net.IP(addr).String(), framePort)
+	}
+	target, err := net.Dial("tcp", dialAddr)
 	if err != nil {
 		return err
 	}
@@ -554,6 +588,159 @@ func TestSocks5TunnelServesUpstream(t *testing.T) {
 	}
 }
 
+// TestSocks5hConnectCarriesHostname (issue #8): a socks5h:// egress sends
+// the CONNECT target as ATYP=3 — 1 length byte followed by the EXACT
+// hostname bytes — and the proxy does the resolution; the greeting, the
+// auth method choice, and the reply handling are the same wire flow as
+// socks5. The fake "resolves" the name proxy-side, proving the full
+// round-trip works with the hostname never appearing in any local lookup.
+func TestSocks5hConnectCarriesHostname(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {}\n\n")
+	}))
+	defer upstream.Close()
+
+	f := newSocks5Fake(t, 0x00, 0x00, 0x00) // no-auth, tunnel everything
+	f.resolveAtProxy("target.example", strings.TrimPrefix(upstream.URL, "http://"))
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://" + strings.TrimPrefix(f.url, "socks5://")}))
+	resp, uerr, class := c.DoClassified(context.Background(), "http://target.example:80/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	if uerr != nil || class != ClassSuccess {
+		t.Fatalf("uerr=%v class=%s, want success through the hostname-form CONNECT", uerr, class)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("data: {}")) {
+		t.Fatalf("tunneled body = %q, want the upstream SSE chunk", body)
+	}
+	got := f.gotConnect.Load()
+	if got == nil {
+		t.Fatal("the proxy never received a CONNECT request")
+	}
+	if got.atyp != 0x03 {
+		t.Fatalf("CONNECT ATYP = %#x, want 0x03 (domain form)", got.atyp)
+	}
+	if string(got.addrs) != "target.example" {
+		t.Fatalf("CONNECT address = %q, want the exact hostname bytes", got.addrs)
+	}
+	if got.port != 80 {
+		t.Fatalf("CONNECT port = %d, want 80", got.port)
+	}
+}
+
+// TestSocks5ConnectCarriesResolvedIP: the socks5:// form is byte-for-byte
+// the historical behavior (issue #8 non-goal: zero change) — the hostname
+// resolves LOCALLY and the CONNECT carries ATYP=1/4 with the resolved
+// address. Membership, not order: the frame must carry one of the
+// addresses the local resolver produces for the name. Only the wire form is
+// asserted (tunnel success is TestSocks5TunnelServesUpstream's proof); if
+// the fake cannot reach addrs[0] the dial error is irrelevant here.
+func TestSocks5ConnectCarriesResolvedIP(t *testing.T) {
+	f := newSocks5Fake(t, 0x00, 0x00, 0x00)
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
+	_, _, _ = c.DoClassified(context.Background(), "http://localhost:8080/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+
+	addrs, err := net.DefaultResolver.LookupIPAddr(context.Background(), "localhost")
+	if err != nil || len(addrs) == 0 {
+		t.Fatalf("test precondition: resolve localhost: %v", err)
+	}
+	want := map[string]bool{}
+	for _, a := range addrs {
+		if v4 := a.IP.To4(); v4 != nil {
+			want[string(v4)] = true
+		} else {
+			want[string(a.IP.To16())] = true
+		}
+	}
+	got := f.gotConnect.Load()
+	if got == nil {
+		t.Fatal("the proxy never received a CONNECT request")
+	}
+	if got.atyp != 0x01 && got.atyp != 0x04 {
+		t.Fatalf("CONNECT ATYP = %#x, want 0x01/0x04 (resolved IP literal)", got.atyp)
+	}
+	if !want[string(got.addrs)] {
+		t.Fatalf("CONNECT address %v not among the locally resolved IPs", net.IP(got.addrs))
+	}
+	if got.port != 8080 {
+		t.Fatalf("CONNECT port = %d, want 8080", got.port)
+	}
+}
+
+// TestSocks5hIPLiteralStaysLiteral: an IP-literal TARGET never becomes an
+// ATYP=3 "domain" — RFC 1928 defines the domain form for FQDNs, and a
+// literal needs no DNS on either side. It keeps its ATYP=1/4 form under
+// socks5h too (documented choice, curl-shaped). Only the wire form is
+// asserted; nothing listens on port 1 and the dial error is irrelevant.
+func TestSocks5hIPLiteralStaysLiteral(t *testing.T) {
+	f := newSocks5Fake(t, 0x00, 0x00, 0x00)
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://" + strings.TrimPrefix(f.url, "socks5://")}))
+	_, _, _ = c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+
+	got := f.gotConnect.Load()
+	if got == nil {
+		t.Fatal("the proxy never received a CONNECT request")
+	}
+	if got.atyp != 0x01 {
+		t.Fatalf("CONNECT ATYP = %#x, want 0x01 (literal stays literal)", got.atyp)
+	}
+	if !net.IP(got.addrs).Equal(net.IPv4(127, 0, 0, 1)) {
+		t.Fatalf("CONNECT address = %v, want 127.0.0.1", net.IP(got.addrs))
+	}
+	if got.port != 1 {
+		t.Fatalf("CONNECT port = %d, want 1", got.port)
+	}
+}
+
+// TestSocks5hRep05StaysConnectionError (issue #8 failure mode): a refused
+// remote-resolve CONNECT fails EXACTLY like any other CONNECT refusal — the
+// vendor's instant REP 0x05 surfaces as the same connection-error class and
+// the 502 envelope. No silent fallback to local resolution, no retry, and
+// the frame that was refused is still the hostname form.
+func TestSocks5hRep05StaysConnectionError(t *testing.T) {
+	f := newSocks5Fake(t, 0x00, 0x00, 0x05) // no-auth greet, REP 0x05 refused
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://" + strings.TrimPrefix(f.url, "socks5://")}))
+	resp, uerr, class := c.DoClassified(context.Background(), "http://target.example:443/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if class != ClassConnectionError {
+		t.Fatalf("class = %s, want ClassConnectionError", class)
+	}
+	if uerr == nil || uerr.Status != http.StatusBadGateway {
+		t.Fatalf("uerr = %+v, want the 502 envelope", uerr)
+	}
+	if uerr == nil || !strings.Contains(uerr.Message, "connection refused") {
+		t.Fatalf("uerr.Message = %q, want the REP 0x05 text (replyErr maps 0x05 to it)", uerr.Message)
+	}
+	got := f.gotConnect.Load()
+	if got == nil {
+		t.Fatal("the proxy never received a CONNECT request")
+	}
+	if got.atyp != 0x03 || string(got.addrs) != "target.example" || got.port != 443 {
+		t.Fatalf("refused frame = ATYP %#x %q:%d, want the hostname form", got.atyp, got.addrs, got.port)
+	}
+}
+
+// TestSocks5hAuthFlowUnchanged: the RFC 1929 credential flow is scheme-
+// independent — a socks5h:// egress offers and answers username/password
+// auth exactly like socks5://, and a rejection is still the typed
+// proxyAuthError (one dial, immediate fallback).
+func TestSocks5hAuthFlowUnchanged(t *testing.T) {
+	f := newSocks5Fake(t, 0x02, 0x01, 0x00) // auth required, reject creds
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://user:bad@" + strings.TrimPrefix(f.url, "socks5://")}))
+	resp, uerr, class := c.DoClassified(context.Background(), "http://target.example/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if class != ClassProxyAuthError {
+		t.Fatalf("class = %s, want ClassProxyAuthError", class)
+	}
+	if uerr == nil || !strings.Contains(uerr.Message, "proxy authentication failed") {
+		t.Fatalf("uerr.Message = %q, want the auth-failure text", uerr.Message)
+	}
+}
+
 // TestProxyDialAddr: a portless proxy URL dials the SCHEME's default port —
 // http→80 / https→443 like stdlib's own proxy dialing, socks5→1080 per RFC
 // 1928 — and an IPv6 literal is bracketed exactly once. The old fallback
@@ -565,6 +752,7 @@ func TestProxyDialAddr(t *testing.T) {
 		{"http://p.example", "p.example:80"},
 		{"https://p.example", "p.example:443"},
 		{"socks5://p.example", "p.example:1080"},
+		{"socks5h://p.example", "p.example:1080"}, // same default port; only the CONNECT form differs
 		{"http://[::1]", "[::1]:80"},
 		{"http://[::1]:8080", "[::1]:8080"},
 		{"socks5://[2001:db8::1]", "[2001:db8::1]:1080"},

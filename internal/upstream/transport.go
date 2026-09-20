@@ -27,8 +27,10 @@ import (
 //     proxy refusal is a typed *proxyAuthError instead of stdlib's
 //     reason-phrase-only error. Client.attempt picks it by URL scheme.
 //
-// Hostnames resolve LOCALLY for socks5 (config-level contract). The proxy
-// URL itself is never logged; errors carry the redacted form.
+// Hostnames resolve LOCALLY for a socks5:// proxy; a socks5h:// proxy sends
+// the hostname in the CONNECT instead (RFC 1928 ATYP=3) and resolves at the
+// proxy — the pairing is validated at config load (issue #8). The proxy URL
+// itself is never logged; errors carry the redacted form.
 //
 // Redirects: both http.Clients below (and Client.HTTP from NewClient) leave
 // CheckRedirect unset, so http.Client follows up to 10 redirects — faithful
@@ -96,8 +98,8 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 // proxyDialAddr is the TCP address the proxy-protocol dialers (connect.go,
 // socks5.go) connect to. A URL without an explicit port takes the SCHEME's
 // default — http→80 and https→443 like stdlib's own proxy dialing
-// (net/http/transport.go schemePort), socks5→1080 per RFC 1928 — so a
-// portless proxy dials the same endpoint whichever side (http-origin
+// (net/http/transport.go schemePort), socks5/socks5h→1080 per RFC 1928 — so
+// a portless proxy dials the same endpoint whichever side (http-origin
 // absolute-form vs CONNECT tunnel) it serves. An IPv6 literal is bracketed
 // exactly once: url.Host keeps the brackets, Hostname() strips them,
 // JoinHostPort re-adds them.

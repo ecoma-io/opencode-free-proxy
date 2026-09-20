@@ -62,9 +62,9 @@ func TestExampleConfigLoads(t *testing.T) {
 	}
 
 	// Every supported proxy type appears exactly once; direct is the absence
-	// of a proxy key. (socks5h has no row here on purpose — the loader
-	// rejects it by name, so a load success already proves the example uses
-	// only http/https/socks5.)
+	// of a proxy key. (The socks5 row carries a socks5:// url — the
+	// socks5h:// scheme is equally valid at load; only the type NAME socks5h
+	// is rejected.)
 	cases := []struct {
 		id     string
 		ptype  ProxyType

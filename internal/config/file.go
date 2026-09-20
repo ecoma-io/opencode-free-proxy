@@ -20,9 +20,14 @@ import (
 )
 
 // ProxyType is the outbound proxy scheme an egress dials through. Exactly
-// these three are supported; socks5h is deliberately NOT (remote-DNS
-// semantics would silently change which resolver sees upstream hostnames —
-// validation rejects it by name).
+// these three types are supported. A socks5 egress picks its DNS side by URL
+// scheme (issue #8): socks5:// resolves target hostnames LOCALLY and sends
+// the IP literal in the CONNECT, while socks5h:// sends the hostname itself
+// (RFC 1928 ATYP=3) and leaves resolution to the proxy — the opt-in for
+// vendors that refuse IP-literal CONNECT targets. validateProxy enforces the
+// type/scheme pairing; the dialer (internal/upstream/socks5.go) branches on
+// the scheme. The type name "socks5h" itself is rejected with an error
+// pointing at the scheme form.
 type ProxyType string
 
 const (
@@ -509,18 +514,21 @@ func (rt *Runtime) HealthCooldown() time.Duration {
 	return time.Duration(*rt.Health.Cooldown)
 }
 
-// validateProxy checks the proxy type/scheme pair. socks5h is rejected BY
-// NAME — silently normalizing it into socks5 would flip DNS resolution to
-// the proxy side without the operator noticing. id arrives already bounded
-// (Validate only calls this with boundedEcho(e.ID)); the type and url echoes
-// below are bounded here — the url only after RedactProxyURL, so the bound
-// can never reintroduce what redaction removed.
+// validateProxy checks the proxy type/scheme pair. socks5 is the one type
+// with TWO valid url schemes: socks5:// (local resolve, the historical form)
+// and socks5h:// (remote resolve — the CONNECT carries the hostname, issue
+// #8). The scheme is the opt-in, never a silent normalization: an operator
+// writes socks5h:// exactly when they want the proxy's resolver. The type
+// NAME "socks5h" is still rejected, pointing at the scheme form. id arrives
+// already bounded (Validate only calls this with boundedEcho(e.ID)); the
+// type and url echoes below are bounded here — the url only after
+// RedactProxyURL, so the bound can never reintroduce what redaction removed.
 func validateProxy(id string, p *Proxy) error {
 	switch p.Type {
 	case ProxyHTTP, ProxyHTTPS, ProxySOCKS5:
 	default:
 		if p.Type == "socks5h" {
-			return fmt.Errorf("egress %q: proxy type \"socks5h\" is not supported (remote-DNS semantics are deliberately out of scope; use \"socks5\", which resolves hostnames locally)", id)
+			return fmt.Errorf("egress %q: proxy type \"socks5h\" is not supported (use type \"socks5\" with a \"socks5h://\" url — the scheme opts the egress into remote resolution)", id)
 		}
 		return fmt.Errorf("egress %q: unknown proxy type %q (want http, https, or socks5)", id, boundedEcho(string(p.Type)))
 	}
@@ -542,7 +550,8 @@ func validateProxy(id string, p *Proxy) error {
 	switch {
 	case u.Scheme == string(ProxyType(p.Type)):
 	case p.Type == ProxySOCKS5 && u.Scheme == "socks5h":
-		return fmt.Errorf("egress %q: proxy url scheme \"socks5h://\" is not supported (use \"socks5://\" — hostnames resolve locally)", id)
+		// Remote resolve (issue #8): same dialer, the CONNECT carries the
+		// hostname (upstream/socks5.go branches on the scheme).
 	default:
 		return fmt.Errorf("egress %q: proxy url scheme %q does not match type %q", id, boundedEcho(RedactProxyURL(p.URL)), p.Type)
 	}

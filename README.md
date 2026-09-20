@@ -44,7 +44,7 @@ bytes, comments included, so keep placeholder syntax out of comments.)
 egress:
   - id: primary
     proxy:
-      type: http # http | https | socks5 — socks5h is rejected at load
+      type: http # http | https | socks5 — socks5h:// url = resolve at the proxy
       url: "http://${PROXY_USER}:${PROXY_PASS}@proxy-a.example:8080"
     max_concurrency: 4 # in-flight cap; 0 = unlimited (default)
     models: ["*-free"] # glob allow-list (OR); empty = every model
@@ -79,18 +79,18 @@ Types and defaults (applied at `Resolve`, `internal/config/file.go`, from the
 constants in `internal/config/config.go` — weight 1, max_attempts 3, health
 threshold 3, cooldown 30s, strategy round-robin):
 
-| `egress[]`        | Type                          | Default               | Meaning                                                                                                                                  |
-| ----------------- | ----------------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`              | string                        | required, unique      | referenced by routes; names the egress in logs and `X-OFP-Egress`                                                                        |
-| `proxy`           | map                           | _(omitted = direct)_  | `{ type, url }`; the transport an egress dials through                                                                                   |
-| `proxy.type`      | `http` \| `https` \| `socks5` | required with `proxy` | `socks5h` is rejected by name — hostnames resolve locally, remote-DNS is out of scope by design                                          |
-| `proxy.url`       | string                        | required with `proxy` | scheme must equal `type`; host required; optional `user:password@` userinfo (env-interpolated at load, redacted in every log/error path) |
-| `enabled`         | bool                          | `true`                | `false` = configured but never scheduled                                                                                                 |
-| `weight`          | int ≥ 0                       | `1`                   | feeds `weighted_round_robin` only (ignored under `round_robin`); shapes which egress STARTS, never eligibility                           |
-| `max_concurrency` | int ≥ 0                       | `0` = unlimited       | in-flight requests/streams; an egress at capacity is skipped at dial time (a skip is not a failure)                                      |
-| `models`          | []glob                        | empty = every model   | allow-list — ANY pattern matching admits the model (`path.Match` syntax against the suffix-stripped id)                                  |
-| `streaming`       | bool                          | `true`                | `false` = streaming requests never pick this egress                                                                                      |
-| `max_body_bytes`  | int ≥ 0                       | `0` = unlimited       | eligibility gate: larger requests never pick this egress (not a request cap — see [Body limits](#body-limits))                           |
+| `egress[]`        | Type                          | Default               | Meaning                                                                                                                                                                                        |
+| ----------------- | ----------------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | string                        | required, unique      | referenced by routes; names the egress in logs and `X-OFP-Egress`                                                                                                                              |
+| `proxy`           | map                           | _(omitted = direct)_  | `{ type, url }`; the transport an egress dials through                                                                                                                                         |
+| `proxy.type`      | `http` \| `https` \| `socks5` | required with `proxy` | a `socks5` egress picks its DNS side by url scheme — `socks5h://` sends the hostname in the CONNECT (ATYP 3, remote resolve); the type name `socks5h` is rejected, use the scheme              |
+| `proxy.url`       | string                        | required with `proxy` | scheme must equal `type` (`socks5` also accepts `socks5h://` = remote resolve); host required; optional `user:password@` userinfo (env-interpolated at load, redacted in every log/error path) |
+| `enabled`         | bool                          | `true`                | `false` = configured but never scheduled                                                                                                                                                       |
+| `weight`          | int ≥ 0                       | `1`                   | feeds `weighted_round_robin` only (ignored under `round_robin`); shapes which egress STARTS, never eligibility                                                                                 |
+| `max_concurrency` | int ≥ 0                       | `0` = unlimited       | in-flight requests/streams; an egress at capacity is skipped at dial time (a skip is not a failure)                                                                                            |
+| `models`          | []glob                        | empty = every model   | allow-list — ANY pattern matching admits the model (`path.Match` syntax against the suffix-stripped id)                                                                                        |
+| `streaming`       | bool                          | `true`                | `false` = streaming requests never pick this egress                                                                                                                                            |
+| `max_body_bytes`  | int ≥ 0                       | `0` = unlimited       | eligibility gate: larger requests never pick this egress (not a request cap — see [Body limits](#body-limits))                                                                                 |
 
 | `routes[]`             | Type                                    | Default             | Meaning                                                                    |
 | ---------------------- | --------------------------------------- | ------------------- | -------------------------------------------------------------------------- |
@@ -235,9 +235,13 @@ every retry. One honest exception: a 407 that loses the race against the
 connect deadline classifies as a timeout (health-marked, retried) — the
 typed proof never arrived, and text-probing to recover it is banned. SOCKS5
 detail: REP `0x02` ("connection not allowed by ruleset") is a plain
-connection error, not proxy-auth; only RFC 1929 rejections are. `socks5h` is
-rejected at config load by name — remote-DNS semantics would silently change
-which resolver sees upstream hostnames.
+connection error, not proxy-auth; only RFC 1929 rejections are. A `socks5`
+egress picks its DNS side by url scheme: `socks5://` resolves the target
+locally and CONNECTs the IP literal;
+`socks5h://` CONNECTs the hostname (RFC 1928 ATYP 3) and the proxy resolves
+it — the opt-in for vendors that refuse IP-literal CONNECT targets. Either
+way the proxy host itself is dialed locally, and a failed remote resolve is
+the same visible connection error as any other CONNECT refusal.
 
 ### Streaming commitment
 
