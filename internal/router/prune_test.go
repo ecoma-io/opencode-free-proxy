@@ -9,8 +9,10 @@ package router
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"opencode-free-proxy/internal/config"
+	"opencode-free-proxy/internal/health"
 	"opencode-free-proxy/internal/upstream"
 )
 
@@ -163,5 +165,54 @@ func TestGenerationZeroNeverPrunes(t *testing.T) {
 	}
 	if probes["a"].closes != 0 {
 		t.Fatalf("generation 0 closed a client: %d", probes["a"].closes)
+	}
+}
+
+// swapRuntime resolves a one-egress snapshot whose proxy URL is given, for
+// health-identity reclamation tests (the identity is id + transport).
+func swapRuntime(t *testing.T, gen uint64, id, url string) *config.Runtime {
+	t.Helper()
+	f := config.File{
+		Egress: []config.Egress{{ID: id, Proxy: &config.Proxy{Type: config.ProxyHTTP, URL: url}}},
+		Routes: []config.Route{{ID: "r", Egress: []string{id}}},
+	}
+	rt, err := f.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.Generation = gen
+	return rt
+}
+
+// TestGenerationSwapReclaimsAbandonedHealthIdentities: the once-per-generation
+// maintenance covers health state too (issue #9) — an identity the new runtime
+// no longer names is reclaimed by the same pass that prunes the transport
+// cache, and a pinned identity survives even when abandoned (an in-flight
+// request may still be observing it) until its pin releases.
+func TestGenerationSwapReclaimsAbandonedHealthIdentities(t *testing.T) {
+	oldKey := (&config.Egress{ID: "a", Proxy: &config.Proxy{Type: config.ProxyHTTP, URL: "http://old.example:3128"}}).HealthKey()
+	p := health.Policy{Enabled: true, Threshold: 1, Cooldown: time.Minute}
+	healthy := health.Policy{Enabled: true}
+
+	s := &Server{clients: map[string]*upstream.Client{}, Health: health.New()}
+
+	s.Health.Observe(oldKey, false, p) // old transport arms its cooldown
+	s.onGeneration(swapRuntime(t, 2, "a", "http://new.example:3128"))
+	if !s.Health.Healthy(oldKey, healthy) {
+		t.Fatal("abandoned identity must be reclaimed by the generation swap")
+	}
+
+	// A pinned abandoned identity survives the swap; the next swap after the
+	// pin releases collects it.
+	s.Health.Observe(oldKey, false, p)
+	release := s.Health.Pin([]string{oldKey})
+	s.onGeneration(swapRuntime(t, 3, "a", "http://third.example:3128"))
+	if s.Health.Healthy(oldKey, healthy) {
+		t.Fatal("pinned identity must survive the generation swap")
+	}
+	release()
+	s.onGeneration(swapRuntime(t, 4, "a", "http://fourth.example:3128"))
+	if !s.Health.Healthy(oldKey, healthy) {
+		t.Fatal("after the pin releases, the next swap reclaims the identity")
 	}
 }

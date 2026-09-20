@@ -57,18 +57,30 @@ func PolicyFromSnapshot(rt *config.Runtime) Policy {
 // history continues across generations; swapping an egress's proxy URL
 // changes the key, so a fresh physical transport never inherits the old
 // transport's failure streak or cooldown.
+//
+// Lifecycle (issue #9): an entry is reclaimed when its identity is neither
+// ACTIVE (derivable from the current runtime's routes — health.ActiveKeys)
+// nor PINNED by an in-flight request (Pin/Release, taken at the request's
+// snapshot pin and held for the request's whole lifetime). The router runs
+// one Reclaim per generation swap, next to its transport-cache prune, so
+// reclamation is deterministic and testable — never a timer. A pinned
+// identity can never vanish mid-request, and an identity absent from every
+// new generation does not linger forever.
 type Registry struct {
 	mu  sync.Mutex
 	now func() time.Time
-	// states is process-lifetime and deliberately NEVER pruned — the mirror
-	// image of the router's client cache, which IS pruned per generation.
-	// Entries are keyed by transport identity, so a generation-scoped
-	// eviction would erase the history a policy-only reload must keep (the
-	// identity contract). Growth is bounded by the number of DISTINCT
-	// transports ever configured — an operator-driven input (proxy
-	// URL/credential rotation), not a per-request one — and each entry is two
-	// small fields.
+	// states holds one entry per identity SEEN since its last reclaim.
+	// Entries survive reloads (the identity contract) and are dropped only by
+	// Reclaim. Growth between reclaims is bounded by the number of distinct
+	// transports configured in the generations live in that window — an
+	// operator-driven input (proxy URL/credential rotation), not a
+	// per-request one — and each entry is two small fields.
 	states map[string]*state
+	// refs counts in-flight Pin holds per identity. A nonzero count shields
+	// the identity's state from Reclaim even when no current runtime names
+	// it — an old-generation request keeps adjudicating against the history
+	// it planned against.
+	refs map[string]int
 }
 
 type state struct {
@@ -77,7 +89,77 @@ type state struct {
 }
 
 func New() *Registry {
-	return &Registry{now: time.Now, states: map[string]*state{}}
+	return &Registry{now: time.Now, states: map[string]*state{}, refs: map[string]int{}}
+}
+
+// Pin takes one in-flight reference on each key and returns the matching
+// release. The caller pins the health keys of its matched route at snapshot
+// pin time — BEFORE eligibility consults the registry — and releases exactly
+// once at request end, so Reclaim can never drop a state the request is
+// mid-way through using. Pinning does not create state; it only shields
+// whatever exists (or will be created by this request's observations).
+func (r *Registry) Pin(keys []string) (release func()) {
+	r.mu.Lock()
+	for _, k := range keys {
+		r.refs[k]++
+	}
+	r.mu.Unlock()
+	return func() {
+		r.mu.Lock()
+		for _, k := range keys {
+			if r.refs[k] > 0 {
+				r.refs[k]--
+				if r.refs[k] == 0 {
+					delete(r.refs, k)
+				}
+			}
+		}
+		r.mu.Unlock()
+	}
+}
+
+// Reclaim deletes the state of every identity that is neither in the active
+// set (the identities the CURRENT runtime's routes can reach —
+// health.ActiveKeys) nor pinned by an in-flight request. One call per
+// generation swap, from the router's generation maintenance next to the
+// transport-cache prune. A policy-only reload's active set names the same
+// identities, so history continues; a transport swap's set names only the
+// new identity, so the abandoned one is reclaimed here; a pinned identity is
+// skipped whatever the active set says, and a later Reclaim — after the
+// pin's release — collects it. Returns the number of entries dropped (a
+// count only: the keys embed transport signatures and are never logged).
+func (r *Registry) Reclaim(active map[string]struct{}) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	dropped := 0
+	for k := range r.states {
+		if _, isActive := active[k]; isActive {
+			continue
+		}
+		if r.refs[k] > 0 {
+			continue
+		}
+		delete(r.states, k)
+		dropped++
+	}
+	return dropped
+}
+
+// ActiveKeys derives the identity set a runtime can still reach: every
+// route-referenced egress's HealthKey. Route-referenced, not every defined
+// egress — eligibility and observation are only ever consulted for egresses
+// a route lists, mirroring the transport cache's keep-set; an egress no
+// route references has no live identity to protect.
+func ActiveKeys(rt *config.Runtime) map[string]struct{} {
+	active := make(map[string]struct{}, len(rt.File.Egress))
+	for _, route := range rt.Routes() {
+		for _, id := range route.Egress {
+			if e, ok := rt.Egress(id); ok {
+				active[e.HealthKey()] = struct{}{}
+			}
+		}
+	}
+	return active
 }
 
 // Observe records one outcome for the identity, judged under the OBSERVING

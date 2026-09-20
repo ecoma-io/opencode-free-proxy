@@ -111,20 +111,25 @@ func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
 	return c, true
 }
 
-// onGeneration runs once-per-generation transport-cache maintenance: when
-// the request's snapshot is from a generation NEWER than the last one
-// serviced, prune cached transports absent from that snapshot (a reload that
-// swapped out a proxy URL). The guard is a monotonic CAS — a request holding
-// a STALE snapshot never prunes against its older keep-set (it would drop a
-// newer generation's transports) — and the CAS+prune pair runs under
-// clientMu so they are ONE atomic step: with the CAS advanced before an
-// interleaved prune completed, a stale snapshot could still evict a transport
-// the newer generation had just rebuilt (self-healing — the next dial
-// rebuilds — but needless conn churn). In-flight requests hold their *Client
-// by reference (the map is only a lookup), so pruning cannot invalidate
-// them; evicted clients close their idle conns instead of waiting on GC.
-// NewClientFor does no I/O, so holding clientMu here never blocks on a dial.
-// Generation 0 is the built-in default runtime: nothing to prune.
+// onGeneration runs once-per-generation maintenance for both process-wide
+// state caches: when the request's snapshot is from a generation NEWER than
+// the last one serviced, prune cached transports absent from that snapshot
+// (a reload that swapped out a proxy URL) and reclaim health identities it
+// no longer names (issue #9). The guard is a monotonic CAS — a request
+// holding a STALE snapshot never prunes or reclaims against its older
+// keep-set (it would drop a newer generation's transports) — and the
+// CAS+maintenance pair runs under clientMu so they are ONE atomic step:
+// with the CAS advanced before an interleaved prune completed, a stale
+// snapshot could still evict a transport the newer generation had just
+// rebuilt (self-healing — the next dial rebuilds — but needless conn churn).
+// In-flight requests hold their *Client by reference (the map is only a
+// lookup), so pruning cannot invalidate them; evicted clients close their
+// idle conns instead of waiting on GC. Health reclamation additionally
+// spares every identity pinned by an in-flight request (health.Registry.Pin
+// at snapshot pin time), so state an old-generation request still observes
+// is never dropped under it. NewClientFor does no I/O, so holding clientMu
+// here never blocks on a dial. Generation 0 is the built-in default runtime:
+// nothing to prune.
 func (s *Server) onGeneration(rt *config.Runtime) {
 	if rt.Generation == 0 {
 		return
@@ -137,24 +142,40 @@ func (s *Server) onGeneration(rt *config.Runtime) {
 			return
 		}
 		if s.prunedGen.CompareAndSwap(cur, rt.Generation) {
-			s.pruneClientsLocked(rt)
+			sigs, active := generationKeepSets(rt)
+			s.pruneClientsLocked(sigs)
+			if s.Health != nil {
+				s.Health.Reclaim(active)
+			}
 			return
 		}
 	}
 }
 
-// pruneClientsLocked drops cached per-egress transports absent from the
-// snapshot's routes; clientMu must be held. Called only from onGeneration,
-// once per generation.
-func (s *Server) pruneClientsLocked(rt *config.Runtime) {
-	keep := make(map[string]struct{}, 8)
+// generationKeepSets derives, from one snapshot, the transport signatures
+// the client cache keeps and the health identities the runtime can still
+// reach — the same route-referenced egresses in both cases: eligibility and
+// dialing are only ever consulted for egresses a route lists.
+func generationKeepSets(rt *config.Runtime) (sigs, active map[string]struct{}) {
+	sigs = make(map[string]struct{}, len(rt.File.Egress))
+	active = make(map[string]struct{}, len(rt.File.Egress))
 	for _, r := range rt.Routes() {
 		for _, id := range r.Egress {
-			if e, ok := rt.Egress(id); ok {
-				keep[e.TransportSignature()] = struct{}{}
+			e, ok := rt.Egress(id)
+			if !ok {
+				continue
 			}
+			sigs[e.TransportSignature()] = struct{}{}
+			active[e.HealthKey()] = struct{}{}
 		}
 	}
+	return sigs, active
+}
+
+// pruneClientsLocked drops cached per-egress transports absent from the
+// keep set; clientMu must be held. Called only from onGeneration, once per
+// generation.
+func (s *Server) pruneClientsLocked(keep map[string]struct{}) {
 	for sig, c := range s.clients {
 		if _, ok := keep[sig]; !ok {
 			c.CloseIdleConnections()
@@ -194,6 +215,19 @@ func (s *Server) routeHeads(rt *config.Runtime, route config.Route, p routing.Pr
 		heads = append(heads, id)
 	}
 	return heads
+}
+
+// routeHealthKeys resolves the route's egress list to the health identities
+// the request may touch (eligibility checks and observations), for
+// health.Registry.Pin.
+func routeHealthKeys(rt *config.Runtime, route config.Route) []string {
+	keys := make([]string, 0, len(route.Egress))
+	for _, id := range route.Egress {
+		if e, ok := rt.Egress(id); ok {
+			keys = append(keys, e.HealthKey())
+		}
+	}
+	return keys
 }
 
 // newRequestID is the per-request correlation id in every structured log

@@ -248,6 +248,14 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		writeError(w, http.StatusBadRequest, "No route matched this request")
 		return
 	}
+	// Pin the route's health identities for the request's whole lifetime —
+	// released when relay returns, after the executor's last observation. A
+	// generation swap that stops referencing them must not reclaim the state
+	// this request plans against (issue #9); the pin precedes routeHeads, the
+	// first registry consult.
+	if s.Health != nil {
+		defer s.Health.Pin(routeHealthKeys(rt, route))()
+	}
 	heads := s.routeHeads(rt, route, profile, hp)
 	if len(heads) == 0 {
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("No eligible egress for route %q", route.ID))

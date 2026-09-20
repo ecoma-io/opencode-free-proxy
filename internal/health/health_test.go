@@ -1,6 +1,7 @@
 package health
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -10,7 +11,7 @@ import (
 // newTest returns a registry with a controllable clock.
 func newTest(now time.Time) (*Registry, *testClock) {
 	c := &testClock{now: now}
-	return &Registry{now: c.Now, states: map[string]*state{}}, c
+	return &Registry{now: c.Now, states: map[string]*state{}, refs: map[string]int{}}, c
 }
 
 type testClock struct{ now time.Time }
@@ -272,4 +273,230 @@ func TestStatesKeyedPerHealthIdentity(t *testing.T) {
 	if !r.Healthy(keyB, p) {
 		t.Fatal("other ids must be unaffected")
 	}
+}
+
+// ---- lifecycle (issue #9): active identities + in-flight pins + per-swap GC ----
+
+// healthRuntime builds a runtime-shaped fixture through the real loader
+// (File.Resolve): one route referencing every given egress, so ActiveKeys
+// names exactly those egresses' identities.
+func healthRuntime(t *testing.T, egs ...config.Egress) *config.Runtime {
+	t.Helper()
+	ids := make([]string, len(egs))
+	for i, e := range egs {
+		ids[i] = e.ID
+	}
+	rt, err := (&config.File{
+		Egress: egs,
+		Routes: []config.Route{{ID: "r", Egress: ids}},
+	}).Resolve()
+	if err != nil {
+		t.Fatalf("fixture runtime: %v", err)
+	}
+	return rt
+}
+
+// directProxy is a small shorthand for a proxied egress fixture.
+func directProxy(id, url string) config.Egress {
+	return config.Egress{ID: id, Proxy: &config.Proxy{Type: config.ProxyHTTP, URL: url}}
+}
+
+// TestHealthStateSurvivesPolicyOnlyReload: a policy-only reload names the
+// SAME identities, so the reclaim pass must drop nothing — the failure
+// streak carries across the swap and arms at the carried count, exactly as
+// if no reload had happened (issue #9: history continuity).
+func TestHealthStateSurvivesPolicyOnlyReload(t *testing.T) {
+	now := time.Now()
+	r, _ := newTest(now)
+	p := policy(true, 3, time.Minute)
+
+	active := ActiveKeys(healthRuntime(t,
+		config.Egress{ID: "a"}, config.Egress{ID: "b"},
+	))
+
+	r.Observe(keyA, false, p)
+	r.Observe(keyA, false, p)
+
+	if dropped := r.Reclaim(active); dropped != 0 {
+		t.Fatalf("policy-only reload: active identities must never be reclaimed, dropped %d", dropped)
+	}
+	// The streak survived: the next failure arms.
+	r.Observe(keyA, false, p)
+	if r.Healthy(keyA, p) {
+		t.Fatal("history must continue across a policy-only reload")
+	}
+}
+
+// TestHealthStateSeparatesTransportReplacement: swapping an egress's proxy
+// URL changes its identity. The new identity starts clean; once no runtime
+// references the old one, its state is reclaimable — and until then it stays
+// (a stale-generation request may still be observing it).
+func TestHealthStateSeparatesTransportReplacement(t *testing.T) {
+	now := time.Now()
+	r, _ := newTest(now)
+	p := policy(true, 1, time.Minute)
+
+	oldEg := directProxy("a", "http://old:8080")
+	newEg := directProxy("a", "http://new:8080")
+	oldK := oldEg.HealthKey()
+	newK := newEg.HealthKey()
+	if oldK == newK {
+		t.Fatal("a proxy swap must change the health identity")
+	}
+
+	r.Observe(oldK, false, p) // old transport arms its cooldown
+
+	// Generation 1 still serves the old identity: not reclaimable.
+	if dropped := r.Reclaim(ActiveKeys(healthRuntime(t, oldEg))); dropped != 0 {
+		t.Fatalf("active identity must not be reclaimed, dropped %d", dropped)
+	}
+	// Generation 2 swaps the proxy: old identity reclaimable, new one clean.
+	if dropped := r.Reclaim(ActiveKeys(healthRuntime(t, newEg))); dropped != 1 {
+		t.Fatalf("abandoned transport identity must be reclaimed exactly once, dropped %d", dropped)
+	}
+	if !r.Healthy(newK, p) {
+		t.Fatal("the fresh transport must start clean")
+	}
+	if !r.Healthy(oldK, p) {
+		t.Fatal("the reclaimed identity must read as unknown (healthy) afterwards")
+	}
+	if dropped := r.Reclaim(ActiveKeys(healthRuntime(t, newEg))); dropped != 0 {
+		t.Fatal("reclaim must be idempotent")
+	}
+}
+
+// TestHealthStateReclaimsUnusedIdentity: an identity absent from the active
+// set and unpinned is reclaimed; reclamation is exactly the unknown-state
+// semantics (healthy, fresh streak on the next observation).
+func TestHealthStateReclaimsUnusedIdentity(t *testing.T) {
+	now := time.Now()
+	r, _ := newTest(now)
+	p := policy(true, 2, time.Minute)
+
+	r.Observe(keyA, false, p)                      // streak 1
+	rt := healthRuntime(t, config.Egress{ID: "b"}) // gen2 dropped egress a
+	if dropped := r.Reclaim(ActiveKeys(rt)); dropped != 1 {
+		t.Fatalf("unused identity must be reclaimed, dropped %d", dropped)
+	}
+	if !r.Healthy(keyA, p) {
+		t.Fatal("reclaimed identity must be healthy again (unknown)")
+	}
+	// Observations after reclamation start a fresh streak — the identity is
+	// gone, not poisoned: one failure stays below the threshold of 2 (an
+	// inherited streak would arm here), and the SECOND failure arms.
+	r.Observe(keyA, false, p)
+	if !r.Healthy(keyA, p) {
+		t.Fatal("post-reclaim observation must start from zero, not inherit the old streak")
+	}
+	r.Observe(keyA, false, p)
+	if r.Healthy(keyA, p) {
+		t.Fatal("a fresh streak must still arm at the threshold")
+	}
+}
+
+// TestHealthStateDoesNotReclaimInFlightIdentity: a request pins its route's
+// identities at snapshot time; even when a swap removes them from the active
+// set, the pinned state must survive until the request's release — the
+// request keeps adjudicating against the history it planned against.
+func TestHealthStateDoesNotReclaimInFlightIdentity(t *testing.T) {
+	now := time.Now()
+	r, _ := newTest(now)
+	p := policy(true, 1, time.Minute)
+
+	r.Observe(keyA, false, p) // cooling
+	release := r.Pin([]string{keyA})
+
+	rt := healthRuntime(t, config.Egress{ID: "b"}) // gen2 no longer references egress a
+	if dropped := r.Reclaim(ActiveKeys(rt)); dropped != 0 {
+		t.Fatalf("a pinned identity must never be reclaimed, dropped %d", dropped)
+	}
+	if r.Healthy(keyA, p) {
+		t.Fatal("the in-flight request must still see its armed cooldown")
+	}
+
+	// The state must survive while ANY pin is held, and become reclaimable
+	// after the last release.
+	release2 := r.Pin([]string{keyA})
+	release()
+	if dropped := r.Reclaim(ActiveKeys(rt)); dropped != 0 {
+		t.Fatal("state must survive while any pin is held")
+	}
+	release2()
+	if dropped := r.Reclaim(ActiveKeys(rt)); dropped != 1 {
+		t.Fatal("after the last release the identity must be reclaimable")
+	}
+}
+
+// TestConcurrentHealthObserveAndIdentityGC: observations, health checks,
+// pin/release churn and reclaim passes race under -race; a pinned identity
+// must survive every concurrent reclaim while held. Go's map hazard
+// (concurrent write + iteration) is exactly what this test exists to catch.
+func TestConcurrentHealthObserveAndIdentityGC(t *testing.T) {
+	now := time.Now()
+	r, _ := newTest(now)
+	p := policy(true, 2, time.Minute)
+	stale := ActiveKeys(healthRuntime(t, config.Egress{ID: "ghost"}))
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Observers hammer the pinned identity and an unpinned one.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := keyA
+			if i%2 == 1 {
+				key = keyB
+			}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				r.Observe(key, i%2 == 0, p)
+				r.Healthy(key, p)
+			}
+		}(i)
+	}
+	// A request-shaped pin holder: keyA must survive reclaims while held.
+	pinned := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		release := r.Pin([]string{keyA})
+		close(pinned)
+		<-stop
+		release()
+	}()
+	// The reclaimer loops GC passes for an active set that never names the
+	// observed identities.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-pinned
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				r.Reclaim(stale)
+			}
+		}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	r.mu.Lock()
+	_, alive := r.states[keyA]
+	r.mu.Unlock()
+	if !alive {
+		t.Fatal("pinned identity must survive concurrent reclaims")
+	}
+	close(stop)
+	wg.Wait()
+
+	// After the pin released and the observers stopped, one pass reclaims
+	// whatever is unused; nothing panics and the map stays walkable.
+	r.Reclaim(stale)
 }
