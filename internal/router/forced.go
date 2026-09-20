@@ -1,12 +1,16 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"opencode-free-proxy/internal/cloak"
+	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/relay"
 )
 
@@ -41,8 +45,21 @@ func forcedUpstreamIsSSE(resp *http.Response) bool {
 func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *http.Response, sourceFormat, targetFormat relay.Format, model string, customToolNames map[string]bool, reqBody map[string]any, upstreamModel string, intent *cloak.ThinkingCfg) {
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, err := io.ReadAll(resp.Body)
+	// The read is bounded BOTH ways (hardening with no JS counterpart —
+	// sseToJsonHandler.js:306 `await providerResponse.text()` leans on
+	// undici's cancellable streams): a progress-stall deadline (the same
+	// config.StreamStall watchdog the streaming ScanLines path enforces —
+	// ResponseHeaderTimeout is satisfied once headers arrive, so without this
+	// a proxy that trickles forever would hang the goroutine + connection
+	// indefinitely) and a total byte cap (config.MaxForcedSSEBytes). Either
+	// bound answers the same 502 envelope as any other forced-conversion
+	// failure (sseToJsonHandler.js:308-313, 373-376); the specific reason goes
+	// to the log only.
+	raw, err := readBoundedSSE(r.Context(), resp.Body, config.MaxForcedSSEBytes, config.StreamStall)
 	if err != nil {
+		if errors.Is(err, errForcedSSEStall) || errors.Is(err, errForcedSSETooLarge) {
+			s.logf("forced SSE→JSON aborted: %v", err)
+		}
 		writeError(w, http.StatusBadGateway, "Failed to convert streaming response to JSON")
 		return
 	}
@@ -106,4 +123,86 @@ func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
 	corsHeaders(w.Header(), false)
 	w.WriteHeader(status)
 	_, _ = w.Write(b)
+}
+
+// errForcedSSEStall / errForcedSSETooLarge are the two bounded-read
+// violations. Both surface to the client as the generic forced-conversion 502;
+// they are distinguished only in the log (the client never learns internals).
+var (
+	errForcedSSEStall    = errors.New("upstream SSE stalled: no bytes within the stall deadline")
+	errForcedSSETooLarge = errors.New("upstream SSE response exceeded the forced-conversion size cap")
+)
+
+// readBoundedSSE drains an upstream SSE body under three abort conditions:
+//
+//   - stall: no bytes arrived for the given deadline (progress-reset, the
+//     same STREAM_STALL semantics as upstream.ScanLines on the streaming
+//     path — every chunk that arrives buys a fresh window);
+//   - size: more than maxBytes in total would be buffered;
+//   - ctx: the request context died (client disconnect).
+//
+// The chunked design keeps memory bounded even against a newline-free flood:
+// each Read is delivered through a fresh slice and copied into the result
+// before the next read is consumed, so nothing — not the accumulator, not a
+// line buffer — can grow past one chunk beyond the cap. A stalled read leaves
+// its reader goroutine parked inside body.Read; the caller's body Close
+// (and the request-context cancellation wired to the same request) unblocks
+// it, so nothing leaks past the request's lifetime.
+func readBoundedSSE(ctx context.Context, body io.Reader, maxBytes int64, stall time.Duration) ([]byte, error) {
+	type chunk struct {
+		data []byte
+		err  error
+	}
+	chunks := make(chan chunk, 1)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			buf := make([]byte, 32*1024)
+			n, err := body.Read(buf)
+			select {
+			case chunks <- chunk{data: buf[:n], err: err}:
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	var out []byte
+	timer := time.NewTimer(stall)
+	defer timer.Stop()
+	for {
+		select {
+		case ch := <-chunks:
+			if len(ch.data) > 0 {
+				if int64(len(out))+int64(len(ch.data)) > maxBytes {
+					return nil, errForcedSSETooLarge
+				}
+				out = append(out, ch.data...)
+				// Progress: buy a fresh stall window.
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(stall)
+			}
+			if ch.err != nil {
+				if errors.Is(ch.err, io.EOF) {
+					return out, nil
+				}
+				return nil, ch.err
+			}
+		case <-timer.C:
+			return nil, errForcedSSEStall
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
