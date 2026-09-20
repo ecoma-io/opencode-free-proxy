@@ -42,10 +42,19 @@ func ModelAllowed(pats []string, model string) bool {
 // scheduler's pick, the rest are the route's other eligible egresses in
 // deterministic order. IDs are distinct; the executor re-checks slots at
 // dial time and may skip (skip ≠ failure) an egress that filled up.
+//
+// Egresses carries the same ordered ids RESOLVED against the request's
+// snapshot inside Plan: index i is the *config.Egress for Attempts[i]. A
+// request thereafter dials transports from this pinned list — no runtime
+// re-lookup exists downstream, so a hot reload mid-request cannot swap or
+// drop an egress under it. Egresses may be shorter than Attempts when a
+// head no longer resolves (defensive; heads always come from the same rt);
+// the executor skips unresolved ids.
 type RoutePlan struct {
 	RouteID  string
 	Strategy config.Strategy
 	Attempts []string
+	Egresses []*config.Egress
 }
 
 // Scheduler owns per-route rotation state. Round-robin rotates a per-route
@@ -101,7 +110,21 @@ func (s *Scheduler) Plan(rt *config.Runtime, route config.Route, heads []string)
 		plan.Attempts = append(append([]string{}, heads[i:]...), heads[:i]...)
 		s.rr[route.ID]++
 	}
+	plan.Egresses = resolveEgresses(rt, plan.Attempts)
 	return plan
+}
+
+// resolveEgresses pins Attempts to their snapshot *config.Egress, one per
+// id and index-aligned. An id absent from rt yields a nil slot the executor
+// skips (defensive — heads are always resolved from this same snapshot).
+func resolveEgresses(rt *config.Runtime, ids []string) []*config.Egress {
+	out := make([]*config.Egress, len(ids))
+	for i, id := range ids {
+		if e, ok := rt.Egress(id); ok {
+			out[i] = e
+		}
+	}
+	return out
 }
 
 func weightOf(rt *config.Runtime, id string) int {

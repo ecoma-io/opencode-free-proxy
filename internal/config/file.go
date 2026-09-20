@@ -180,6 +180,12 @@ type Runtime struct {
 	// Direct marks the synthetic single-egress runtime used when no config
 	// file is set — byte-identical behavior to the pre-routing proxy.
 	Direct bool
+	// Generation is the store's monotonic config version: first file load 1,
+	// each successful swap +1, the built-in default runtime 0. It names the
+	// snapshot in logs/tests and drives once-per-generation health tuning.
+	// Hot reload stamps only the NEW snapshot; an in-flight request keeps
+	// the generation it started with.
+	Generation uint64
 }
 
 // Egress resolves an egress id from this snapshot.

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 
+	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/health"
 	"opencode-free-proxy/internal/routing"
 )
@@ -17,15 +18,17 @@ import (
 // attempt. Fallback never happens once a live response exists: the calling
 // relay owns commitment from the moment Execute returns a non-nil response.
 type Executor struct {
-	clientFor func(id string) (*Client, bool)
+	clientFor func(*config.Egress) (*Client, bool)
 	health    *health.Registry // nil = health disabled
 	slots     *Limiter         // nil = unlimited
 }
 
-// NewExecutor wires the per-egress client resolver. clientFor must resolve
-// egress ids to their CURRENT transport (built lazily, cached per proxy
-// signature); health and slots are optional — nil disables them.
-func NewExecutor(clientFor func(string) (*Client, bool), h *health.Registry, slots *Limiter) *Executor {
+// NewExecutor wires the per-egress client resolver. clientFor resolves a
+// SNAPSHOT-resolved egress (routing.Plan pins it at request start) to its
+// transport; the executor itself never touches the config store, so a hot
+// reload cannot move a client out from under an in-flight request. health
+// and slots are optional — nil disables them.
+func NewExecutor(clientFor func(*config.Egress) (*Client, bool), h *health.Registry, slots *Limiter) *Executor {
 	return &Executor{clientFor: clientFor, health: h, slots: slots}
 }
 
@@ -74,15 +77,35 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 	attempts := 0
 	lastID := ""
 	lastClass := ClassConnectionError
-	for _, id := range plan.Attempts {
+	for i, id := range plan.Attempts {
 		if attempts >= budget {
 			break
 		}
-		client, ok := x.clientFor(id)
+		// A skipped head (below) is a scheduling race, never a failure — with
+		// fallback ENABLED the executor moves to the next plan entry. With
+		// fallback disabled no other egress may be dialed, so a skip at the
+		// head ends the plan: the loop falls through to the 502 envelope.
+		// The egress was resolved from the request's snapshot by the
+		// scheduler; a nil slot only happens if a head left the snapshot
+		// between Plan and here — skip, not failure.
+		if i >= len(plan.Egresses) || plan.Egresses[i] == nil {
+			if !policy.FallbackEnabled {
+				break
+			}
+			continue
+		}
+		eg := plan.Egresses[i]
+		client, ok := x.clientFor(eg)
 		if !ok {
-			continue // egress left the config mid-flight: skip, not failure
+			if !policy.FallbackEnabled {
+				break // transport build failed and no fallback: nothing else to try
+			}
+			continue // transport build failed: skip, not failure
 		}
 		if x.slots != nil && !x.slots.Acquire(id, policy.MaxConcurrency[id]) {
+			if !policy.FallbackEnabled {
+				break // head's slot full and no fallback: nothing else to try
+			}
 			continue // slots filled between plan and dial: skip ≠ failure
 		}
 		attempts++

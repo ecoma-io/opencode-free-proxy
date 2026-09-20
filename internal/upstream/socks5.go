@@ -113,7 +113,12 @@ func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
 		}
 		return nil
 	case 0xff:
-		return fmt.Errorf("socks5: no acceptable authentication method")
+		// NO ACCEPTABLE METHODS (RFC 1928 §3): the proxy rejected every
+		// method we offered — if we offered only 0x00, it demanded auth we
+		// never sent; with 0x02 offered it refused our credential mechanism.
+		// Same proxyAuthError contract as the 0x02 branch above (failure.go:
+		// "a proxy that demanded auth we never sent").
+		return &proxyAuthError{msg: "socks5: no acceptable authentication method"}
 	default:
 		return fmt.Errorf("socks5: proxy chose unknown method %d", buf[1])
 	}
@@ -191,7 +196,11 @@ func replyErr(rep byte) error {
 	case 0x01:
 		return fmt.Errorf("socks5: general failure")
 	case 0x02:
-		return &proxyAuthError{msg: "socks5: connection not allowed by ruleset"}
+		// RFC 1928 §6: "connection not allowed by ruleset" — a policy
+		// refusal, NOT a credential failure. Plain error on purpose so it
+		// lands in ClassConnectionError (same fallback+health behavior,
+		// correct label); only RFC 1929 auth failures are ClassProxyAuthError.
+		return fmt.Errorf("socks5: connection not allowed by ruleset")
 	case 0x03:
 		return fmt.Errorf("socks5: network unreachable")
 	case 0x04:

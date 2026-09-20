@@ -26,6 +26,11 @@ type Store struct {
 	interval time.Duration
 	cur      atomic.Pointer[Runtime]
 	logf     func(format string, args ...any)
+	// gen stamps Runtime.Generation on every successful load; it is the
+	// store-side monotonic config version (first load 1, each swap +1) so
+	// logs and tests can name a request's exact snapshot. Generation 0 is
+	// reserved for the built-in default runtime (never stamped here).
+	gen atomic.Uint64
 
 	// initHash is the content hash at startup; the poller seeds its compare
 	// from it so an unchanged file is never reparsed on the first tick.
@@ -56,6 +61,7 @@ func NewStore(path string, interval time.Duration, logf func(string, ...any)) (*
 		stopCh:   make(chan struct{}),
 		done:     make(chan struct{}),
 	}
+	rt.Generation = s.gen.Add(1)
 	s.cur.Store(rt)
 	if interval > 0 {
 		if raw, err := os.ReadFile(path); err == nil {
@@ -145,7 +151,8 @@ func (s *Store) tick(lastHash *string) {
 	// between our read and LoadFile's re-read, the hash we compared is stale
 	// and a second tick will converge on the newer content.
 	*lastHash = hash
+	rt.Generation = s.gen.Add(1)
 	s.cur.Store(rt)
-	s.logf("config reload: swapped to new config (%d egresses, %d routes)", len(rt.File.Egress),
-		len(rt.File.Routes))
+	s.logf("config reload: swapped to new config (generation %d, %d egresses, %d routes)",
+		rt.Generation, len(rt.File.Egress), len(rt.File.Routes))
 }

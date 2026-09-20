@@ -314,3 +314,66 @@ routes: [{id: r, egress: [a]}]
 	wg.Wait()
 	s.Stop() // must still be safe after the concurrent batch
 }
+
+// TestStoreGenerationStartsAtOne: the first loaded snapshot is generation 1
+// (DefaultRuntime is 0); each swap bumps it. A held snapshot keeps its own
+// generation forever — the immutability proof for in-flight requests.
+func TestStoreGenerationStartsAtOne(t *testing.T) {
+	dir := t.TempDir()
+	p := writeConfig(t, dir, "cfg.yaml", `
+egress: [{id: a}]
+routes: [{id: r, egress: [a]}]
+`)
+	s, err := NewStore(p, pollInterval, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	rt0 := s.Get()
+	if rt0.Generation != 1 {
+		t.Fatalf("first load generation = %d, want 1", rt0.Generation)
+	}
+
+	writeConfig(t, dir, "cfg.yaml", `
+egress: [{id: a}, {id: b}]
+routes: [{id: r, egress: [a, b]}]
+`)
+	deadline := time.Now().Add(2 * time.Second)
+	for s.Get().Generation == rt0.Generation && time.Now().Before(deadline) {
+		time.Sleep(2 * pollInterval)
+	}
+	if s.Get().Generation != 2 {
+		t.Fatalf("after first reload generation = %d, want 2", s.Get().Generation)
+	}
+	if rt0.Generation != 1 {
+		t.Fatalf("held snapshot generation mutated: %d, want 1 (in-flight request sees the old snapshot)", rt0.Generation)
+	}
+}
+
+// TestStoreInvalidReloadKeepsGeneration: a rejected config must neither swap
+// the snapshot nor burn a generation — the id space stays contiguous, so a
+// "generation" in logs is unambiguous.
+func TestStoreInvalidReloadKeepsGeneration(t *testing.T) {
+	dir := t.TempDir()
+	p := writeConfig(t, dir, "cfg.yaml", `
+egress: [{id: a}]
+routes: [{id: r, egress: [a]}]
+`)
+	s, err := NewStore(p, pollInterval, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	g0 := s.Get().Generation
+
+	// Duplicate egress id — must be rejected by Validate.
+	writeConfig(t, dir, "cfg.yaml", `
+egress: [{id: a}, {id: a}]
+routes: [{id: r, egress: [a]}]
+`)
+	// Give the poller a few cycles to attempt (and reject) the reload.
+	time.Sleep(6 * pollInterval)
+	if g := s.Get().Generation; g != g0 {
+		t.Fatalf("generation changed on rejected reload: %d -> %d", g0, g)
+	}
+}

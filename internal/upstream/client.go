@@ -24,11 +24,17 @@ type Client struct {
 	HTTP  *http.Client
 	Sleep func(time.Duration)
 	Now   func() time.Time
+
+	// Proxy is the egress transport descriptor, carried so the failure
+	// taxonomy can tell a proxy's 407 from the origin's. Direct clients
+	// leave it nil.
+	Proxy *config.Proxy
 }
 
 // NewClient wires an http.Client whose response-header wait is the connect
 // timeout (FETCH_CONNECT_TIMEOUT_MS semantics: time to first response byte
-// headers; the SSE body itself streams unbounded).
+// headers; the SSE body itself streams unbounded). The direct transport: no
+// proxy, no credentials.
 func NewClient() *Client {
 	return &Client{
 		HTTP: &http.Client{
@@ -87,9 +93,12 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 			// Network/fetch exceptions map to the 502 retry rule
 			// (base.js:173 tryRetry(urlIndex, BAD_GATEWAY, `network …`)). The
 			// [502]: prefix is applied at write time like every other error.
-			// The class is the REAL class (timeout vs connection vs ctx) —
-			// the 502 status is only the client-facing envelope.
-			class := classifyNetErr(ctx, netErr)
+			// The class is the REAL class (proxy-auth vs timeout vs
+			// connection vs ctx) — the 502 status is only the client-facing
+			// envelope. classifyNetErrFor knows whether a proxy was
+			// configured, so a CONNECT 407 (which only a proxy can produce)
+			// is proxy-auth while a direct dial error is not.
+			class := classifyNetErrFor(ctx, netErr, c.Proxy != nil)
 			if !c.tryRetry(ctx, &used, config.RetryRules[502]) {
 				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 			}
@@ -108,7 +117,7 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 		if resp.StatusCode >= 400 {
 			raw, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			return nil, parseUpstreamError(resp.StatusCode, raw), classifyStatus(resp.StatusCode)
+			return nil, parseUpstreamError(resp.StatusCode, raw), classifyStatusFor(resp.StatusCode, c.Proxy, url)
 		}
 		return resp, nil, ClassSuccess
 	}

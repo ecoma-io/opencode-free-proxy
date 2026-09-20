@@ -873,3 +873,40 @@ func TestDownstreamCapture(t *testing.T) {
 		}
 	})
 }
+
+// TestDrainGateRejectsNewRequests: Drain() must make relay answer 503 BEFORE
+// reading the body — nothing upstream is dialed after the gate trips. This is
+// the deterministic unit counterpart to the e2e shutdown tests, whose drain
+// poll races the listener close (connection-refused) and can never reliably
+// observe the 503 branch itself.
+func TestDrainGateRejectsNewRequests(t *testing.T) {
+	rec := &upstreamRecorder{}
+	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
+	defer up.Close()
+	s, mux := newRouter(up.URL, "")
+
+	// Before draining: the request flows to the upstream.
+	res := postJSON(t, mux, "/v1/chat/completions",
+		`{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":false}`,
+		nil)
+	if res.Code != 200 {
+		t.Fatalf("pre-drain status = %d, body %s", res.Code, res.Body.String())
+	}
+	if rec.count() != 1 {
+		t.Fatalf("upstream calls before drain = %d, want 1", rec.count())
+	}
+
+	s.Drain()
+	res = postJSON(t, mux, "/v1/chat/completions",
+		`{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":false}`,
+		nil)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("drained status = %d, want 503", res.Code)
+	}
+	if !strings.Contains(res.Body.String(), "shutting down") {
+		t.Fatalf("drained body = %q, want the shutdown error envelope", res.Body.String())
+	}
+	if rec.count() != 1 {
+		t.Fatalf("upstream calls after drain = %d, want 1 (gate must reject before dialing)", rec.count())
+	}
+}

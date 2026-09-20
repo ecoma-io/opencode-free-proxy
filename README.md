@@ -69,9 +69,47 @@ references egresses in fallback order — the planner rotates the head, the
 executor walks the rest. 429s fall back but never mark an egress unhealthy;
 5xx/network/connection errors count toward `failure_threshold` consecutive
 failures and cool the egress for `cooldown`; 4xx (other than 429) never fall
-back (the request is the problem, not the egress). Concurrency caps
+fall back (the request is the problem, not the egress). Concurrency caps
 (`max_concurrency`) skip an egress at capacity — a skip is not a failure. On
 total failure the client gets a 502 envelope.
+
+### Retry × fallback budgets
+
+The upstream retry matrix (502/503 ×4 POSTs per attempt, 504 ×3, 500 ×1, 429
+×1 POST — the 429 retry budget is 0, so no retry) sits INSIDE each fallback
+attempt; the fallback loop adds at most
+`fallback.max_attempts` DISTINCT egresses per request (default 3, including
+the first). Worst case for a 502 storm: 4 POSTs × 3 egresses = 12 upstream
+calls, bounded. No inter-attempt sleep — the cooldown is health-based, per
+egress, and applies to FUTURE requests only.
+
+### Proxy-authentication (407) classification
+
+When an egress dials through a proxy, the client distinguishes a 407 from
+the PROXY (transport-level `Proxy Authentication Required` / `proxy
+authentication failed`) — classified as a connection-class failure:
+fallback + unhealthy, like any other egress fault. A 407 returned by the
+UPSTREAM (an origin responding 407 behind the tunnel, or a proxy without
+credentials configured) is a client-class error: surfaced to the client, no
+fallback, no health effect. A proxy URL with `user:password@` credentials
+that still gets a proxy 407 is a proxy-auth failure (credentials present but
+rejected); a proxy without credentials never is. SOCKS5 follows RFC 1928:
+method/status rejection (RFC 1929) is proxy-auth; a CONNECT `REP 0x02`
+(ruleset denial) is a plain connection error. `socks5h` is rejected at config
+load — remote-DNS semantics would silently change which resolver sees
+upstream hostnames.
+
+### Snapshot semantics (one request = one config generation)
+
+Every request captures ONE immutable `Runtime` from the store (first file
+load = generation 1, each hot-reload swap +1, no-config default = 0) and uses
+it for its whole lifetime — route match, egress resolution, and the pinned
+`*config.Egress` list the executor dials. A reload mid-request cannot change
+which egresses that request may fall back to: the swap stamps only the NEW
+snapshot. Log lines carry `generation=N`; the success log ends with
+`fallback=true` when an attempt actually fell back. Responses carry
+`X-OFP-Egress: <id>` naming the egress that served them (observability +
+the e2e suite's wire-level evidence).
 
 Defaults with a config file: health enabled (`failure_threshold` 3, `cooldown`
 30s), fallback `max_attempts` 3 — set `health.enabled: false` to disable

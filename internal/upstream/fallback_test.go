@@ -2,18 +2,20 @@ package upstream
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"net"
 	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/health"
 	"opencode-free-proxy/internal/routing"
-	"time"
 )
 
 // scriptedRecorder collects upstream calls per egress id.
@@ -62,6 +64,10 @@ type executorFixture struct {
 	exec    *Executor
 	health  *health.Registry
 	slots   *Limiter
+	// rt is the fixture's snapshot: one egress per scripted server, used by
+	// plan() to resolve Attempts into *config.Egress exactly like the
+	// scheduler does in production.
+	rt *config.Runtime
 }
 
 func newExecutorFixture(t *testing.T, statuses map[string]int) *executorFixture {
@@ -72,8 +78,9 @@ func newExecutorFixture(t *testing.T, statuses map[string]int) *executorFixture 
 		health:  health.New(),
 		slots:   NewLimiter(),
 	}
-	// The request path Configure()s the registry per request; use threshold
-	// 1 here so a single observed failure flips eligibility in tests.
+	// The request path Configure()s the registry once per generation; use
+	// threshold 1 here so a single observed failure flips eligibility in
+	// tests.
 	f.health.Configure(true, 1, time.Minute)
 
 	for id, status := range statuses {
@@ -93,11 +100,36 @@ func newExecutorFixture(t *testing.T, statuses map[string]int) *executorFixture 
 		}
 		clients[id] = c
 	}
-	f.exec = NewExecutor(func(id string) (*Client, bool) {
-		c, ok := clients[id]
+	f.rt = fixtureRuntime(statuses)
+	f.exec = NewExecutor(func(e *config.Egress) (*Client, bool) {
+		c, ok := clients[e.ID]
 		return c, ok
 	}, f.health, f.slots)
 	return f
+}
+
+// fixtureRuntime builds a snapshot the same shape production gets from a
+// config file: numeric ids sorted for determinism, one route over all of
+// them. Resolve suceeds: ids are unique and routes reference only present
+// egresses.
+func fixtureRuntime(statuses map[string]int) *config.Runtime {
+	ids := make([]string, 0, len(statuses))
+	for id := range statuses {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	file := config.File{
+		Egress: make([]config.Egress, 0, len(ids)),
+		Routes: []config.Route{{ID: "r", Egress: ids}},
+	}
+	for _, id := range ids {
+		file.Egress = append(file.Egress, config.Egress{ID: id})
+	}
+	rt, err := file.Resolve()
+	if err != nil {
+		panic(fmt.Sprintf("fixture runtime: %v", err))
+	}
+	return rt
 }
 
 func (f *executorFixture) Close() {
@@ -106,17 +138,25 @@ func (f *executorFixture) Close() {
 	}
 }
 
-// plan builds a RoutePlan from the route + eligible heads (no scheduler).
-func plan(routeID string, heads ...string) routing.RoutePlan {
-	return routing.RoutePlan{RouteID: routeID, Strategy: config.StrategyRoundRobin, Attempts: heads}
+// plan builds a RoutePlan from the route + eligible heads (no scheduler),
+// resolving each head against the fixture snapshot — the production shape
+// Scheduler.Plan produces. A head absent from the runtime yields a nil
+// Egresses slot, which the executor skips.
+func (f *executorFixture) plan(routeID string, heads ...string) routing.RoutePlan {
+	p := routing.RoutePlan{RouteID: routeID, Strategy: config.StrategyRoundRobin, Attempts: heads}
+	p.Egresses = make([]*config.Egress, len(heads))
+	for i, id := range heads {
+		if e, ok := f.rt.Egress(id); ok {
+			p.Egresses[i] = e
+		}
+	}
+	return p
 }
 
+// policy builds an AttemptPolicy straight from the two knobs the tests vary.
 func policy(fallback bool, max int) AttemptPolicy {
-	return AttemptPolicy{FallbackEnabled: fallback, MaxAttempts: max, MaxConcurrency: map[string]int{}}
+	return AttemptPolicy{FallbackEnabled: fallback, MaxAttempts: max}
 }
-
-// TestExecuteFirstEgressServes: a success on the first attempt returns the
-// live response with zero fallback traffic, and marks the egress healthy.
 func TestExecuteFirstEgressServes(t *testing.T) {
 	f := newExecutorFixture(t, map[string]int{"a": 200})
 	defer f.Close()
@@ -124,7 +164,7 @@ func TestExecuteFirstEgressServes(t *testing.T) {
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL+"/zen/v1/chat/completions",
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a"), policy(true, 3))
+		[]byte(`{}`), f.plan("r", "a"), policy(true, 3))
 	if uerr != nil || resp == nil {
 		t.Fatalf("uerr = %v", uerr)
 	}
@@ -149,7 +189,7 @@ func TestExecuteFallsBackOn5xx(t *testing.T) {
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a", "b"), policy(true, 3))
+		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
 	if uerr != nil || resp == nil {
 		t.Fatalf("uerr = %v", uerr)
 	}
@@ -177,7 +217,7 @@ func TestExecute429FallsBackWithoutMarkingHealth(t *testing.T) {
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a", "b"), policy(true, 3))
+		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
 	if uerr != nil || resp == nil {
 		t.Fatalf("uerr = %v", uerr)
 	}
@@ -200,7 +240,7 @@ func TestExecuteAllUnhealthyReturns502(t *testing.T) {
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a", "b"), policy(true, 3))
+		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
 	if resp != nil {
 		t.Fatal("must not return a response when all egresses failed")
 	}
@@ -224,7 +264,7 @@ func TestExecuteBudgetCapsAttempts(t *testing.T) {
 	resp, id, attempts, _, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a", "b", "c", "d"), policy(true, 2))
+		[]byte(`{}`), f.plan("r", "a", "b", "c", "d"), policy(true, 2))
 	if resp != nil || uerr == nil {
 		t.Fatalf("resp=%v uerr=%v, want terminal 502", resp, uerr)
 	}
@@ -245,7 +285,7 @@ func TestExecuteFallbackDisabled(t *testing.T) {
 	resp, id, attempts, _, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a", "b"), policy(false, 3))
+		[]byte(`{}`), f.plan("r", "a", "b"), policy(false, 3))
 	if resp != nil || uerr == nil {
 		t.Fatalf("resp=%v uerr=%v, want 502", resp, uerr)
 	}
@@ -273,7 +313,7 @@ func TestExecuteFullSlotSkippedNotFailed(t *testing.T) {
 	resp, id, _, _, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a", "b"), p)
+		[]byte(`{}`), f.plan("r", "a", "b"), p)
 	if uerr != nil || resp == nil {
 		t.Fatalf("uerr = %v", uerr)
 	}
@@ -298,7 +338,7 @@ func TestExecuteUnknownEgressSkipped(t *testing.T) {
 	resp, id, attempts, _, uerr := f.exec.Execute(
 		context.Background(), f.servers["b"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "ghost", "b"), policy(true, 3))
+		[]byte(`{}`), f.plan("r", "ghost", "b"), policy(true, 3))
 	if uerr != nil || resp == nil {
 		t.Fatalf("uerr = %v", uerr)
 	}
@@ -322,7 +362,7 @@ func TestExecuteContextCanceledShortCircuits(t *testing.T) {
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		ctx, f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a", "b"), policy(true, 3))
+		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
 	if resp != nil {
 		t.Fatal("canceled request must not return a response")
 	}
@@ -353,7 +393,7 @@ func TestExecuteReleasesSlotOnFailure(t *testing.T) {
 	resp, id, _, _, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a"), p)
+		[]byte(`{}`), f.plan("r", "a"), p)
 	if resp != nil || uerr == nil || id != "a" {
 		t.Fatalf("resp=%v id=%q uerr=%v, want terminal failure on a", resp, id, uerr)
 	}
@@ -378,7 +418,7 @@ func TestExecuteHoldsSlotUntilBodyClosed(t *testing.T) {
 	resp, id, _, _, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), plan("r", "a"), p)
+		[]byte(`{}`), f.plan("r", "a"), p)
 	if uerr != nil || resp == nil || id != "a" {
 		t.Fatalf("uerr=%v id=%q, want success on a", uerr, id)
 	}

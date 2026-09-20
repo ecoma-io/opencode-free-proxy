@@ -37,6 +37,29 @@ Covered, end to end through the wire:
 - `image_url` on a non-vision model → stripped, placeholder text upstream
 - `/v1/models` → free filter (`-free` + `big-pickle`, dead ids dropped, sorted)
 
+### Config snapshot, fallback & shutdown (`reload_test.go`, `shutdown_test.go`)
+
+Each test spawns its OWN server subprocess with bespoke env
+(`OFP_CONFIG`, `OFP_CONFIG_POLL_MS`, `OFP_SHUTDOWN_GRACE`) and real HTTP
+forward proxies per egress — per-egress behavior is observable on the wire
+even though `OFP_UPSTREAM_BASE` is a single value:
+
+- hot reload mid-request: an in-flight request keeps its generation-1 plan,
+  falls back to the OLD route's egress, never dials the new route, and logs
+  `generation=1 fallback=true`; the next request pins generation 2 and dials
+  the new egress (`X-OFP-Egress` headers prove both)
+- 429 falls back but never marks the egress unhealthy (a later round-robin
+  request is served by it again); a 5xx DOES poison it with
+  `health.failure_threshold: 1` — `TestEgress429FallsBackButStaysHealthy`
+  proves the exclusion with a final round that would round-robin onto the
+  500-egress if it were still eligible, and asserts its call count stayed 3
+  (the two 429s + the one 500 it actually served).
+- streaming commitment: after the first byte is written, a mid-stream
+  upstream death never triggers fallback
+- SIGTERM: new requests answer 503 (drain gate) while the in-flight stream
+  finishes under grace; a stream that stalls past `OFP_SHUTDOWN_GRACE` is
+  force-closed
+
 ### Tool pipeline & client personas (`tools_test.go`)
 
 Cross-interface checks — clients with different tool shapes must all reach

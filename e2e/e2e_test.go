@@ -266,6 +266,7 @@ var (
 	fake      *fakeUpstream
 	proxyOut  syncBuf
 	proxyCmd  *exec.Cmd
+	proxyBin  string // server binary path, available to per-test spawns
 )
 
 func TestMain(m *testing.M) {
@@ -290,6 +291,10 @@ func runSuite(m *testing.M) (int, error) {
 	defer os.RemoveAll(tmp)
 	bin := filepath.Join(tmp, "server")
 
+	// Tests that need their OWN server lifecycle (hot reload, graceful
+	// shutdown) spawn proxyBin as a subprocess with bespoke env; the shared
+	// suite instance keeps using bin via proxyCmd below.
+
 	goBin := filepath.Join(runtime.GOROOT(), "bin", "go")
 	if _, err := os.Stat(goBin); err != nil {
 		goBin = "go"
@@ -299,6 +304,7 @@ func runSuite(m *testing.M) (int, error) {
 	if out, err := build.CombinedOutput(); err != nil {
 		return 1, fmt.Errorf("go build: %v\n%s", err, out)
 	}
+	proxyBin = bin
 
 	fake = &fakeUpstream{}
 	mux := http.NewServeMux()

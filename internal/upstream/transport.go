@@ -28,11 +28,19 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		}
 		switch p.Type {
 		case config.ProxyHTTP, config.ProxyHTTPS:
+			// http.ProxyURL derives Proxy-Authorization from the userinfo.
 			tr.Proxy = http.ProxyURL(u)
 		case config.ProxySOCKS5:
 			tr.DialContext = newSocks5Dialer(u).DialContext
 		}
+		return &Client{
+			HTTP:  &http.Client{Transport: tr},
+			Sleep: time.Sleep,
+			Now:   time.Now,
+			Proxy: p,
+		}, nil
 	}
+	// The direct transport: no proxy, no credentials.
 	return &Client{
 		HTTP:  &http.Client{Transport: tr},
 		Sleep: time.Sleep,

@@ -5,7 +5,10 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+
+	"opencode-free-proxy/internal/config"
 )
 
 // Class is the executor's failure taxonomy. It exists to keep three concerns
@@ -19,8 +22,11 @@ const (
 	// ClassConnectionError: transport failure (dial, DNS for the proxy or
 	// target, reset before response). 502-mapped in the retry matrix.
 	ClassConnectionError
-	// ClassProxyAuthError: the proxy refused credentials (SOCKS5 REP 0x02,
-	// RFC 1929 status != 0, HTTP 407-style proxy rejection).
+	// ClassProxyAuthError: the proxy refused credentials (SOCKS5 RFC 1929
+	// status != 0, HTTP(S) CONNECT 407). SOCKS5 REP 0x02 is NOT auth — RFC
+	// 1928 §6 calls it "connection not allowed by ruleset", a plain
+	// connection refusal (fallback + health mark either way, only the label
+	// changes).
 	ClassProxyAuthError
 	// ClassTimeout: response headers took longer than ConnectTimeout.
 	ClassTimeout
@@ -88,19 +94,24 @@ func (c Class) FallbackAllowed() bool {
 }
 
 // proxyAuthError marks dialer-level proxy authentication failures (SOCKS5
-// RFC 1929 / REP 0x02) so classifyNetErr can single them out.
+// RFC 1929 status != 0, or a proxy that demanded auth we never sent) so
+// classifyNetErrFor can single them out. SOCKS5 REP 0x02 is deliberately NOT
+// one (RFC 1928 §6: "connection not allowed by ruleset" — plain refusal).
 type proxyAuthError struct{ msg string }
 
 func (e *proxyAuthError) Error() string { return e.msg }
 
-// classifyNetErr maps a transport error to its class. A canceled context
+// classifyNetErrFor maps a transport error to its class. A canceled context
 // wins over everything (the request is gone); proxy-auth markers beat
 // generic timeouts; timeouts beat connection errors (net.Error.Timeout). The
-// 407 check carries BOTH the numeric code and the canonical reason phrase:
-// Go stdlib proxy errors embed the status line ("407 Proxy Authentication
-// Required" — net/http transport), but the phrase wording is not a stable
-// API contract, so the numeric marker is the durable half of the match.
-func classifyNetErr(ctx context.Context, err error) Class {
+// canonical reason phrase "Proxy Authentication Required" is the PRIMARY
+// 407 marker: Go's stdlib strips the numeric code from a failed CONNECT
+// (transport.go: strings.Cut(resp.Status, " ") → errors.New(text)), so a
+// real CONNECT-407 error's text is the phrase only. The bare "407" probe is
+// secondary, for non-stdlib error shapes — and it fires ONLY when a proxy
+// was configured: without one the text is a dial error (an IPv6 octet, say)
+// and would misfire.
+func classifyNetErrFor(ctx context.Context, err error, hasProxy bool) Class {
 	if ctx.Err() != nil {
 		return ClassContextCanceled
 	}
@@ -108,7 +119,7 @@ func classifyNetErr(ctx context.Context, err error) Class {
 	if errors.As(err, &pae) {
 		return ClassProxyAuthError
 	}
-	if strings.Contains(err.Error(), "407") || strings.Contains(err.Error(), "Proxy Authentication Required") {
+	if hasProxy && (strings.Contains(err.Error(), "407") || strings.Contains(err.Error(), "Proxy Authentication Required")) {
 		return ClassProxyAuthError
 	}
 	var ne net.Error
@@ -118,16 +129,57 @@ func classifyNetErr(ctx context.Context, err error) Class {
 	return ClassConnectionError
 }
 
-// classifyStatus maps a terminal (post-retry-matrix) response status to a
-// class. Only >= 400 reach it (below that Do returns the response as a
-// success); 429 is its own class so fallback can treat it specially.
-func classifyStatus(status int) Class {
-	switch {
-	case status == http.StatusTooManyRequests:
+// classifyStatusFor is classifyStatus plus proxy knowledge for the 407
+// ambiguity — the one status whose owner determines the class. The decision
+// matrix (transport/proxy boundary):
+//
+//	429                   → Upstream429 (fallback, no health mark)
+//	>= 500                → Upstream5xx
+//	407, no proxy         → ClientError (an origin's 407 is a plain 4xx)
+//	407, proxy, https     → ClientError: an https target is CONNECT-tunneled,
+//	                         so the proxy could never inject a 407 response —
+//	                         only the origin behind the tunnel could; its 407
+//	                         is a request verdict, not a proxy-credential one.
+//	407, proxy, http, creds → ProxyAuth: we sent Proxy-Authorization and got
+//	                         407 back — the proxy gated the request, the
+//	                         origin never saw it. Definitive proxy-auth.
+//	407, proxy, http, no creds → ClientError (ambiguous, conservative: the
+//	                         proxy may want credentials we never sent, or the
+//	                         origin may have answered; both are the operator's
+//	                         4xx-style verdict, and falling back would repeat
+//	                         the rejection on the next proxy).
+//	407, socks5 proxy       → ClientError always: a SOCKS5 tunnel authenticates
+//	                         once via RFC 1929 at connect time — nothing on the
+//	                         wire carries Proxy-Authorization — so any 407 the
+//	                         client sees is the origin's verdict.
+func classifyStatusFor(status int, proxy *config.Proxy, targetURL string) Class {
+	if status == http.StatusTooManyRequests {
 		return ClassUpstream429
-	case status >= 500:
-		return ClassUpstream5xx
-	default:
-		return ClassClientError
 	}
+	if status >= 500 {
+		return ClassUpstream5xx
+	}
+	if status == http.StatusProxyAuthRequired && proxy != nil {
+		// Only HTTP(S) forward proxies speak Proxy-Authorization and can
+		// gate a request with a 407: an http target goes absolute-form, an
+		// https target CONNECTs — either way the origin's requests carry the
+		// header Go derives from the URL userinfo. A SOCKS5 proxy has NO
+		// HTTP layer: credentials are exchanged once at tunnel setup (RFC
+		// 1929), so a 407 that surfaces after the tunnel is up can only be
+		// the origin's verdict — same as the https row below.
+		if proxy.Type != config.ProxySOCKS5 {
+			if u, err := url.Parse(targetURL); err == nil && u.Scheme == "http" && proxyHasCredentials(proxy) {
+				return ClassProxyAuthError
+			}
+		}
+	}
+	return ClassClientError
+}
+
+// proxyHasCredentials reports whether the proxy URL carries userinfo (http
+// proxies: Go derives Proxy-Authorization from it; socks5: it drives
+// RFC 1929 auth). Credentials never leave transport.go.
+func proxyHasCredentials(p *config.Proxy) bool {
+	u, err := url.Parse(p.URL)
+	return err == nil && u.User != nil
 }

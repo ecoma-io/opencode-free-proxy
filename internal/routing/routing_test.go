@@ -33,11 +33,26 @@ func weightedRuntime(eg ...config.Egress) *config.Runtime {
 	return rt
 }
 
+// wrrRuntime resolves a weighted_round_robin snapshot with the given route
+// egress list (weightedRuntime's fixed [a b c] route does not fit every row).
+func wrrRuntime(routeEgress []string, eg ...config.Egress) *config.Runtime {
+	spec := config.File{
+		Egress: eg,
+		Routes: []config.Route{route("r", config.StrategyWeightedRR, routeEgress...)},
+	}
+	rt, err := spec.Resolve()
+	if err != nil {
+		panic(err)
+	}
+	return rt
+}
+
 // TestModelAllowed: exact ids match themselves; globs use path.Match
 // semantics; an EMPTY list admits nothing (the router's len>0 guard owns the
 // "no allow-list = every model" contract); a malformed pattern never matches
 // (path.ErrBadPattern is a miss, not a panic).
 func TestModelAllowed(t *testing.T) {
+
 	if !ModelAllowed([]string{"qwen3-coder-free"}, "qwen3-coder-free") {
 		t.Fatal("exact id must match")
 	}
@@ -148,5 +163,111 @@ func TestPlanWeightedRRMissingEgress(t *testing.T) {
 	}).Resolve()
 	if err == nil {
 		t.Fatal("route referencing an unknown egress must fail validation")
+	}
+}
+
+// TestPlanEgressesResolvedFromSnapshot: Plan pins every attempt to the
+// snapshot's *config.Egress, index-aligned with Attempts and pointer-identical
+// to rt.Egress — the executor dials transports from this pinned list, never a
+// runtime re-lookup (P1: one request = one snapshot).
+func TestPlanEgressesResolvedFromSnapshot(t *testing.T) {
+	rt := weightedRuntime(egress("a", 5), egress("b", 1), egress("c", 1))
+	s := NewScheduler()
+	p := s.Plan(rt, route("r", config.StrategyWeightedRR, "a", "b", "c"), []string{"a", "b", "c"})
+	if len(p.Egresses) != len(p.Attempts) {
+		t.Fatalf("Egresses len = %d, Attempts len = %d — must be index-aligned", len(p.Egresses), len(p.Attempts))
+	}
+	for i, id := range p.Attempts {
+		want, ok := rt.Egress(id)
+		if !ok {
+			t.Fatalf("Attempts[%d] = %q not in snapshot", i, id)
+		}
+		if e := p.Egresses[i]; e != want {
+			t.Fatalf("Egresses[%d] = %p (%s), want the snapshot egress %p (%s) — pinning failed",
+				i, e, e.ID, want, want.ID)
+		}
+	}
+}
+
+// TestPlanEgressesNilSlotForAbsentHead: a head that left the snapshot before
+// Plan yields a nil slot (not a panic, not a lookup against a newer runtime);
+// the executor treats nil Egresses as skip, not failure.
+func TestPlanEgressesNilSlotForAbsentHead(t *testing.T) {
+	rt := wrrRuntime([]string{"a", "b"}, egress("a", 1), egress("b", 1))
+	s := NewScheduler()
+	p := s.Plan(rt, route("r", config.StrategyRoundRobin, "a", "b"), []string{"a", "ghost"})
+	for i, id := range p.Attempts {
+		if id == "ghost" && p.Egresses[i] != nil {
+			t.Fatalf("ghost head must resolve to a nil Egresses slot, got %v", p.Egresses[i])
+		}
+		if id == "a" && p.Egresses[i] == nil {
+			t.Fatalf("known head %q must resolve", id)
+		}
+	}
+}
+
+// TestPlanWeightedRREqualWeights: two equal candidates alternate strictly —
+// smooth WRR degenerates to round-robin only when weights are equal.
+func TestPlanWeightedRREqualWeights(t *testing.T) {
+	rt := wrrRuntime([]string{"a", "b"}, egress("a", 2), egress("b", 2)) // a,b head set only
+	s := NewScheduler()
+	want := []string{"a", "b", "a", "b", "a", "b"}
+	for i, w := range want {
+		p := s.Plan(rt, route("r", config.StrategyWeightedRR, "a", "b"), []string{"a", "b"})
+		if p.Attempts[0] != w {
+			t.Fatalf("round %d: head = %q, want %q", i, p.Attempts[0], w)
+		}
+	}
+}
+
+// TestPlanWeightedRRHeavyVsLight: weights 10:1 produce the exact nginx
+// smooth-WRR sequence a a a a a b a a a a a a over 12 rounds — the heavy
+// candidate dominates without starving the light one (a smooth 11-round
+// cycle, so round 12 restarts on a).
+func TestPlanWeightedRRHeavyVsLight(t *testing.T) {
+	rt := wrrRuntime([]string{"a", "b"}, egress("a", 10), egress("b", 1))
+	s := NewScheduler()
+	want := []string{"a", "a", "a", "a", "a", "b", "a", "a", "a", "a", "a", "a"}
+	for i, w := range want {
+		p := s.Plan(rt, route("r", config.StrategyWeightedRR, "a", "b"), []string{"a", "b"})
+		if p.Attempts[0] != w {
+			t.Fatalf("round %d: head = %q, want %q", i, p.Attempts[0], w)
+		}
+	}
+}
+
+// TestPlanWeightedRRHeavyPlusTwo: 10:1:1 distributes 10/1/1 over one WRR
+// cycle (12 rounds) — the heavy follows the canonical smooth sequence with
+// the two light candidates each scheduled exactly once.
+func TestPlanWeightedRRHeavyPlusTwo(t *testing.T) {
+	rt := weightedRuntime(egress("a", 10), egress("b", 1), egress("c", 1))
+	s := NewScheduler()
+	want := []string{"a", "a", "a", "a", "b", "a", "a", "a", "c", "a", "a", "a"}
+	for i, w := range want {
+		p := s.Plan(rt, route("r", config.StrategyWeightedRR, "a", "b", "c"), []string{"a", "b", "c"})
+		if p.Attempts[0] != w {
+			t.Fatalf("round %d: head = %q, want %q", i, p.Attempts[0], w)
+		}
+	}
+}
+
+// TestPlanWeightedRRZeroWeightNeverScheduled: an explicit weight 0 is
+// "configured but never a route head" — a competing positive-weight egress
+// wins every round.
+func TestPlanWeightedRRZeroWeightNeverScheduled(t *testing.T) {
+	file := config.File{
+		Egress: []config.Egress{egress("a", 0), egress("b", 1)},
+		Routes: []config.Route{route("r", config.StrategyWeightedRR, "a", "b")},
+	}
+	rt, err := file.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewScheduler()
+	for i := 0; i < 6; i++ {
+		p := s.Plan(rt, route("r", config.StrategyWeightedRR, "a", "b"), []string{"a", "b"})
+		if p.Attempts[0] != "b" {
+			t.Fatalf("round %d: head = %q, want b (weight-0 a must never be scheduled)", i, p.Attempts[0])
+		}
 	}
 }

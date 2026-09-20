@@ -226,17 +226,14 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	}
 
 	// ---- routing: match the CURRENT snapshot, filter to the eligible head
-	// set and let the scheduler order it. Health config is applied per
-	// request so a reload of threshold/cooldown takes effect immediately;
+	// set and let the scheduler order it. Health tuning is applied once per
+	// generation (generation CAS, seeded at NewServer) so a reload of
+	// threshold/cooldown takes effect on the first request of the new config;
 	// routing (start selection), fallback (attempt loop) and health
 	// (temporary eligibility) stay three separate decisions.
 	rt := s.runtime()
 	if s.Health != nil {
-		s.Health.Configure(
-			rt.Health.Enabled == nil || *rt.Health.Enabled,
-			rt.HealthThreshold(),
-			rt.HealthCooldown(),
-		)
+		s.applyHealth(rt)
 	}
 	profile := routing.Profile{
 		Model:     cleanModel,
@@ -290,15 +287,14 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	latency := time.Since(start)
 	if uerr != nil {
 		cancelUpstream()
-		s.logf("%s route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%s endpoint=%s fallback=%t",
-			reqID, plan.RouteID, egID, attempts, class, uerr.Status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
+		s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%s endpoint=%s fallback=%t",
+			reqID, rt.Generation, plan.RouteID, egID, attempts, class, uerr.Status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 		writeError(w, uerr.Status, fmt.Sprintf("[%d]: %s", uerr.Status, uerr.Message))
 		return
 	}
 	w.Header().Set("X-OFP-Egress", egID)
-	s.logf("%s route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%s endpoint=%s fallback=%t",
-		reqID, plan.RouteID, egID, attempts, class, resp.StatusCode, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
-
+	s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%s endpoint=%s fallback=%t",
+		reqID, rt.Generation, plan.RouteID, egID, attempts, class, resp.StatusCode, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 	// Forced SSE→JSON needs the upstream reply to actually be SSE
 	// (sseToJsonHandler.js:185-188): when it is not, chatCore falls through to
 	// the streaming path — a non-streaming client behind a non-SSE upstream
