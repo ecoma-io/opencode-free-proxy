@@ -163,7 +163,22 @@ type Config struct {
 	APIKey         string // optional inbound API key; empty = no auth
 	UpstreamBase   string
 	UASyncInterval time.Duration
+	// ConfigPath is OFP_CONFIG: the routing config file. Empty = the
+	// default single-egress runtime.
+	ConfigPath string
+	// ShutdownGrace is OFP_SHUTDOWN_GRACE: how long draining waits for
+	// active requests/streams before forced close.
+	ShutdownGrace time.Duration
+	// ConfigPoll is OFP_CONFIG_POLL_MS: the hot-reload poll interval.
+	ConfigPoll time.Duration
 }
+
+// DefaultShutdownGrace is used when OFP_SHUTDOWN_GRACE is unset.
+const DefaultShutdownGrace = 30 * time.Second
+
+// DefaultConfigPoll is the hot-reload poll interval (the rotation-proxy
+// gateway design polled at 1 s; repeated writes coalesce).
+const DefaultConfigPoll = time.Second
 
 func FromEnv() *Config {
 	return &Config{
@@ -171,7 +186,22 @@ func FromEnv() *Config {
 		APIKey:         os.Getenv("OFP_API_KEY"),
 		UpstreamBase:   envOr("OFP_UPSTREAM_BASE", UpstreamBase),
 		UASyncInterval: envMs("OFP_UA_SYNC_INTERVAL", UASyncInterval),
+		ConfigPath:     os.Getenv("OFP_CONFIG"),
+		ShutdownGrace:  envDur("OFP_SHUTDOWN_GRACE", DefaultShutdownGrace),
+		ConfigPoll:     envMs("OFP_CONFIG_POLL_MS", DefaultConfigPoll),
 	}
+}
+
+// envDur parses a Go duration string ("30s"); invalid or empty falls back.
+func envDur(key string, def time.Duration) time.Duration {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	return def
 }
 
 func envOr(key, def string) string {
