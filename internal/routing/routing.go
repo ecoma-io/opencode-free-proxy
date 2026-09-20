@@ -245,9 +245,11 @@ func (s *Scheduler) PruneRoutes(keep map[string]struct{}) int {
 	return dropped
 }
 
-// resolveEgresses pins Attempts to their snapshot *config.Egress, one per
-// id and index-aligned. An id absent from rt yields a nil slot the executor
-// skips (defensive — heads are always resolved from this same snapshot).
+// resolveEgresses pins each attempt to a private copy of its snapshot
+// *config.Egress, one per id and index-aligned — the plan owns its memory
+// and never aliases the snapshot (config.Egress clone-per-call). An id
+// absent from rt yields a nil slot the executor skips (defensive — heads
+// are always resolved from this same snapshot).
 func resolveEgresses(rt *config.Runtime, ids []string) []*config.Egress {
 	out := make([]*config.Egress, len(ids))
 	for i, id := range ids {

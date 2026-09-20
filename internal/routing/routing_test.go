@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"reflect"
 	"testing"
 
 	"opencode-free-proxy/internal/config"
@@ -170,10 +171,11 @@ func TestPlanWeightedRRMissingEgress(t *testing.T) {
 	}
 }
 
-// TestPlanEgressesResolvedFromSnapshot: Plan pins every attempt to the
-// snapshot's *config.Egress, index-aligned with Attempts and pointer-identical
-// to rt.Egress — the executor dials transports from this pinned list, never a
-// runtime re-lookup (P1: one request = one snapshot).
+// TestPlanEgressesResolvedFromSnapshot: Plan pins every attempt to a PRIVATE
+// COPY of the snapshot's egress, index-aligned with Attempts and value-
+// equivalent to rt.Egress — the executor dials transports from this pinned
+// list, never a runtime re-lookup (P1: one request = one snapshot). The copy
+// must not alias the snapshot: mutating the plan's egress leaves rt intact.
 func TestPlanEgressesResolvedFromSnapshot(t *testing.T) {
 	rt := weightedRuntime(egress("a", 5), egress("b", 1), egress("c", 1))
 	s := NewScheduler()
@@ -186,10 +188,18 @@ func TestPlanEgressesResolvedFromSnapshot(t *testing.T) {
 		if !ok {
 			t.Fatalf("Attempts[%d] = %q not in snapshot", i, id)
 		}
-		if e := p.Egresses[i]; e != want {
-			t.Fatalf("Egresses[%d] = %p (%s), want the snapshot egress %p (%s) — pinning failed",
-				i, e, e.ID, want, want.ID)
+		if e := p.Egresses[i]; !reflect.DeepEqual(e, want) {
+			t.Fatalf("Egresses[%d] = %+v, want a copy of the snapshot egress %+v — pinning failed",
+				i, e, want)
 		}
+	}
+
+	// The pin is a copy, not an alias: writing through it cannot touch the
+	// snapshot (and rt.Egress re-derives the untouched value).
+	p.Egresses[0].MaxConcurrency = 999999
+	after, _ := rt.Egress(p.Attempts[0])
+	if after.MaxConcurrency == 999999 {
+		t.Fatal("mutating a plan's pinned egress must never reach the snapshot")
 	}
 }
 

@@ -249,25 +249,24 @@ type Runtime struct {
 	Generation uint64
 }
 
-// Egress resolves an egress id from this snapshot. The returned pointer
-// ALIASES the snapshot's own egress: it is READ-ONLY by contract, because the
-// scheduler pins exactly these pointers into a request's RoutePlan (one
-// request = one snapshot) and the executor dials from that pinned list for
-// the request's whole lifetime.
+// Egress resolves an egress id from this snapshot as a PRIVATE COPY: the
+// caller can hold and read it for its whole lifetime — the scheduler pins
+// these into a request's RoutePlan (one request = one snapshot) — and a
+// write through the returned pointer can never reach the live snapshot. No
+// accessor hands out snapshot memory.
 //
-// Accessor audit (snapshot hardening): every in-repo caller only reads
-// through it (routing's resolveEgresses/weightOf, the router's routeHeads/
-// routeHealthKeys/generationKeepSets/clientForEgress, health.ActiveKeys, the
-// upstream budget/fallback tests). The strict fix — a private per-call copy —
-// was built and then rejected here: internal/routing's
-// TestPlanEgressesResolvedFromSnapshot asserts pointer identity with
-// rt.Egress as its proof that a plan resolves against a single snapshot, and
-// that package is outside this hardening's scope. Until a coordinated change
-// lands there, this is the ONE accessor that hands out snapshot memory —
-// deliberately, documented, and unused for writes anywhere in the repo.
+// The copy is per call: two resolutions of the same id yield equal-but-
+// distinct egresses, so tests pin by VALUE equivalence, never pointer
+// identity. Hot-path cost is one small struct copy per resolution site —
+// resolveEgresses clones once per attempt, routeHeads once per candidate
+// egress per request, generationKeepSets once per egress per generation.
 func (rt *Runtime) Egress(id string) (*Egress, bool) {
 	e, ok := rt.byID[id]
-	return e, ok
+	if !ok {
+		return nil, false
+	}
+	cp := cloneEgress(e)
+	return &cp, true
 }
 
 // Routes returns the snapshot's routes in deterministic match order as a deep

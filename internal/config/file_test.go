@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -729,16 +730,12 @@ routes:
     egress: [a, b]
 `
 
-// TestEgressAccessorPinnedSnapshotPointer: Egress(id) deliberately returns
-// the snapshot's own pointer — internal/routing pins pointer identity as its
-// proof that a RoutePlan resolves against ONE snapshot
-// (TestPlanEgressesResolvedFromSnapshot there), so a per-call copy is a
-// cross-package change, not a config-local one. This test pins the contract
-// that contract relies on: stable pointer per (snapshot, id), content exactly
-// the resolved egress, (nil, false) for unknown ids — and documents that
-// writes through the pointer are forbidden (no in-repo caller does; see the
-// accessor audit in the Egress doc comment).
-func TestEgressAccessorPinnedSnapshotPointer(t *testing.T) {
+// TestEgressAccessorReturnsPrivateCopy: Egress(id) hands out a per-call deep
+// copy — two resolutions of one id are value-equal but pointer-distinct, the
+// content is exactly the resolved egress, unknown ids stay (nil, false), and
+// a write through the returned pointer never reaches the snapshot (no
+// accessor does — see the Egress doc comment).
+func TestEgressAccessorReturnsPrivateCopy(t *testing.T) {
 	rt, err := resolveYAML(t, accessorDoc)
 	if err != nil {
 		t.Fatal(err)
@@ -748,8 +745,14 @@ func TestEgressAccessorPinnedSnapshotPointer(t *testing.T) {
 		t.Fatal("egress a missing")
 	}
 	e2, ok := rt.Egress("a")
-	if !ok || e2 != e {
-		t.Fatalf("two resolutions of the same id differ: %p vs %p — the pinning contract broke", e2, e)
+	if !ok {
+		t.Fatal("second resolution missing")
+	}
+	if e == e2 {
+		t.Fatal("two resolutions must be distinct copies, not one shared pointer")
+	}
+	if !reflect.DeepEqual(e, e2) {
+		t.Fatalf("copies diverge: %+v vs %+v", e, e2)
 	}
 	if e.ID != "a" || e.Proxy == nil || e.Proxy.Type != ProxyHTTP || e.Proxy.URL != "http://a.example:1" {
 		t.Fatalf("resolved content wrong: %+v", e)
@@ -760,10 +763,15 @@ func TestEgressAccessorPinnedSnapshotPointer(t *testing.T) {
 	if len(e.Models) != 1 || e.Models[0] != "m-*" {
 		t.Fatalf("resolved models wrong: %v", e.Models)
 	}
-	// Pointer identity holds across the snapshot's own surfaces too: the id
-	// map entry IS the File slice element (one egress, one truth).
-	if &rt.File.Egress[0] != e {
-		t.Fatalf("byID entry %p aliases a different egress than File %p", e, &rt.File.Egress[0])
+
+	// The copy isolates the snapshot: mutating every layer of the returned
+	// egress leaves the snapshot (and a fresh resolution) untouched.
+	e.Proxy.URL = "http://mutated:9"
+	e.Models[0] = "mutated"
+	*e.Weight = 0
+	fresh, _ := rt.Egress("a")
+	if fresh.Proxy.URL != "http://a.example:1" || fresh.Models[0] != "m-*" || fresh.EffectiveWeight() != 3 {
+		t.Fatalf("a write through one resolution reached the snapshot: %+v", fresh)
 	}
 	// Unknown ids keep the documented (nil, false) shape.
 	if g, ok := rt.Egress("nope"); ok || g != nil {

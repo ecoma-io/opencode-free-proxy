@@ -11,6 +11,7 @@ package routing
 // snapshot it was planned from.
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -333,7 +334,7 @@ func TestSchedulerReloadRace(t *testing.T) {
 				}
 				for k, id := range p.Attempts {
 					want, ok := rt.Egress(id)
-					if !ok || p.Egresses[k] != want {
+					if !ok || !reflect.DeepEqual(p.Egresses[k], want) {
 						t.Errorf("attempt %q did not pin to the snapshot it was planned from", id)
 					}
 				}
