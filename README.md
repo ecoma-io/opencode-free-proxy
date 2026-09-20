@@ -27,32 +27,42 @@ Environment:
 ## Multi-egress routing (`OFP_CONFIG`)
 
 `OFP_CONFIG` points at a YAML file describing egresses (per-egress proxy:
-http/https/socks5 or direct), routes that pick from them, and the global
-fallback/health policy. The file is re-read on the `OFP_CONFIG_POLL_MS`
-interval — route/egress/health edits apply without a restart; invalid files
-keep the last good runtime and are logged.
+http/https/socks5, or no proxy at all = the host's own network), routes that
+pick from them, and the global fallback/health policy. The file is re-read on
+the `OFP_CONFIG_POLL_MS` interval — each poll hashes the bytes (SHA-256) and
+re-parses only on change; a file that fails parse or validation keeps the
+last good runtime and logs the rejection. `example.config.yaml` in the repo
+root is the complete annotated schema, and
+`internal/config/example_test.go` loads it through the real loader so the
+example and the parser cannot drift.
+
+Credentials in the file are `${VAR}` env references, never literals — an
+unset variable is a load error naming it. (Interpolation runs over the raw
+bytes, comments included, so keep placeholder syntax out of comments.)
 
 ```yaml
 egress:
   - id: primary
-    proxy: { type: http, url: "https://creds@proxy-a.example:8080" }
-    # max_concurrency: 4   # in-flight cap; 0 = unlimited (default)
-    # models: ["*-free"]   # glob allow-list; empty = every model
-    # streaming: true      # accepts streaming; default true
-    # max_body_bytes: 0    # inbound body bound; 0 = unlimited
-    # weight: 5            # share under weighted_round_robin
+    proxy:
+      type: http # http | https | socks5 — socks5h is rejected at load
+      url: "http://${PROXY_USER}:${PROXY_PASS}@proxy-a.example:8080"
+    max_concurrency: 4 # in-flight cap; 0 = unlimited (default)
+    models: ["*-free"] # glob allow-list (OR); empty = every model
+    streaming: true # streaming requests allowed; default true
+    max_body_bytes: 0 # eligibility gate; 0 = unlimited
+    weight: 5 # weighted_round_robin share only
   - id: backup
-    proxy: { type: socks5, url: "socks5://user:secret@proxy-b.example:1080" }
-  - id: direct
-    enabled: true # false = configured but never scheduled
+    proxy: { type: socks5, url: "socks5://${PROXY_USER}:${PROXY_PASS}@proxy-b.example:1080" }
+  - id: direct # no proxy key = host's own network
 routes:
   - id: default
-    egress: [primary, backup, direct]
+    priority: 0 # higher wins; file order breaks ties; first match serves
+    egress: [primary, backup, direct] # fallback order after the head
     strategy: round_robin # or weighted_round_robin
     match: # AND of the set conditions; empty = catch-all
-      # models: ["*-free", "big-pickle"]
+      # models: ["*-free"]       # AND here — every pattern must match
       # streaming: true
-      # min_body_bytes: 0
+      # min_body_bytes: 0        # raw inbound body bytes
       # max_body_bytes: 10485760
 fallback:
   enabled: true
@@ -60,56 +70,184 @@ fallback:
 health:
   enabled: true # default true with a config file
   failure_threshold: 3 # consecutive failures before cooldown; 0 = never
-  cooldown: 1m # Go duration string ("30s", "1m")
+  cooldown: 30s # Go duration string; bare numbers are a load error
 ```
 
-Head selection is round-robin; a per-egress `weight` switches a route to
-smooth weighted rotation (`strategy: weighted_round_robin`). A route
-references egresses in fallback order — the planner rotates the head, the
-executor walks the rest. 429s fall back but never mark an egress unhealthy;
-5xx/network/connection errors count toward `failure_threshold` consecutive
-failures and cool the egress for `cooldown`; 4xx (other than 429) never fall
-fall back (the request is the problem, not the egress). Concurrency caps
-(`max_concurrency`) skip an egress at capacity — a skip is not a failure. On
-total failure the client gets a 502 envelope.
+### Schema
+
+Types and defaults (applied at `Resolve`, `internal/config/file.go`, from the
+constants in `internal/config/config.go` — weight 1, max_attempts 3, health
+threshold 3, cooldown 30s, strategy round-robin):
+
+| `egress[]`        | Type                          | Default               | Meaning                                                                                                                                  |
+| ----------------- | ----------------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | string                        | required, unique      | referenced by routes; names the egress in logs and `X-OFP-Egress`                                                                        |
+| `proxy`           | map                           | _(omitted = direct)_  | `{ type, url }`; the transport an egress dials through                                                                                   |
+| `proxy.type`      | `http` \| `https` \| `socks5` | required with `proxy` | `socks5h` is rejected by name — hostnames resolve locally, remote-DNS is out of scope by design                                          |
+| `proxy.url`       | string                        | required with `proxy` | scheme must equal `type`; host required; optional `user:password@` userinfo (env-interpolated at load, redacted in every log/error path) |
+| `enabled`         | bool                          | `true`                | `false` = configured but never scheduled                                                                                                 |
+| `weight`          | int ≥ 0                       | `1`                   | feeds `weighted_round_robin` only (ignored under `round_robin`); shapes which egress STARTS, never eligibility                           |
+| `max_concurrency` | int ≥ 0                       | `0` = unlimited       | in-flight requests/streams; an egress at capacity is skipped at dial time (a skip is not a failure)                                      |
+| `models`          | []glob                        | empty = every model   | allow-list — ANY pattern matching admits the model (`path.Match` syntax against the suffix-stripped id)                                  |
+| `streaming`       | bool                          | `true`                | `false` = streaming requests never pick this egress                                                                                      |
+| `max_body_bytes`  | int ≥ 0                       | `0` = unlimited       | eligibility gate: larger requests never pick this egress (not a request cap — see [Body limits](#body-limits))                           |
+
+| `routes[]`             | Type                                    | Default             | Meaning                                                                    |
+| ---------------------- | --------------------------------------- | ------------------- | -------------------------------------------------------------------------- |
+| `id`                   | string                                  | required, unique    | names the route in logs                                                    |
+| `priority`             | int                                     | `0`                 | HIGHER wins; equal priorities keep file order; the first match serves      |
+| `match.streaming`      | bool                                    | _(unset = any)_     | the client asked for `stream: true`                                        |
+| `match.models`         | []glob                                  | _(unset = any)_     | AND — every listed pattern must match (disjoint globs would match nothing) |
+| `match.min_body_bytes` | int                                     | `0` = unset         | raw inbound body must be ≥                                                 |
+| `match.max_body_bytes` | int                                     | `0` = unset         | raw inbound body must be ≤                                                 |
+| `egress`               | []id                                    | required, non-empty | ids must exist; order is the FALLBACK order after the scheduler's head     |
+| `strategy`             | `round_robin` \| `weighted_round_robin` | `round_robin`       | how the head is picked per route (state is per route id, process-wide)     |
+
+| `fallback`     | Type | Default | Meaning                                                                                   |
+| -------------- | ---- | ------- | ----------------------------------------------------------------------------------------- |
+| `enabled`      | bool | `true`  | `false` pins every request to its single scheduled head                                   |
+| `max_attempts` | int  | `3`     | DISTINCT egresses one request may try, first included; `0` = default 3; negative rejected |
+
+| `health`            | Type            | Default                   | Meaning                                                                                                    |
+| ------------------- | --------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `enabled`           | bool            | `true` with a config file | the built-in no-config runtime runs with health OFF (no outage can be acquired by config-less deployments) |
+| `failure_threshold` | int ≥ 0         | `3`                       | consecutive failures that arm a cooldown; explicit `0` = never cool down                                   |
+| `cooldown`          | duration string | `30s`                     | exclusion window once the threshold fires; `0s` = no window; bare numbers are a load error                 |
+
+### Routing: match, then eligibility, then scheduling
+
+Three separate decisions, in this order:
+
+1. **Route matching** (`Runtime.MatchRoute`, `internal/config/file.go`):
+   routes are sorted priority-descending (stable — file order breaks ties)
+   and the FIRST route whose `match` holds serves the request. No match →
+   400 `No route matched this request`.
+2. **Hard eligibility** (`Server.routeHeads`, `internal/router/server.go`):
+   the matched route's egress list is filtered — egress enabled, streaming
+   gate, model allow-list, `max_body_bytes`, health-eligible, and under its
+   concurrency cap (a soft check; re-checked at dial time). Empty result →
+   502 `No eligible egress for route …`.
+3. **Scheduling** (`routing.Scheduler.Plan`, `internal/routing/routing.go`):
+   orders the INITIAL attempt among the survivors only — `round_robin`
+   rotates a per-route cursor; `weighted_round_robin` is nginx's smooth
+   weighted algorithm. The rest of the plan stays in the route's listed
+   order for fallback.
+
+`weight` never decides eligibility: every eligible egress stays in the
+attempt list whatever its weight. A `weight: 0` egress contributes nothing to
+the smooth-WRR totals and never heads the plan while any positive-weight
+sibling is eligible; only when every eligible head is weight 0 does the first
+listed one serve (deterministically). Under `round_robin`, weight is ignored
+entirely.
+
+### Body limits
+
+Three different layers — do not conflate them:
+
+1. **Server-level request cap: 8 MiB** (`internal/router/handler.go`) — any
+   larger (or unreadable) body is rejected with 400 before routing. This is
+   the only true request limit.
+2. **`match.min_body_bytes` / `match.max_body_bytes`** — gate ROUTE
+   SELECTION against the raw inbound body size; an unmatched size just picks
+   a different route (or none → 400).
+3. **`max_body_bytes` on an egress** — eligibility only: an over-limit
+   egress is filtered out of the head set (all egresses filtered → 502), and
+   `0` = unlimited. It never rejects a request by itself.
 
 ### Retry × fallback budgets
 
-The upstream retry matrix (502/503 ×4 POSTs per attempt, 504 ×3, 500 ×1, 429
-×1 POST — the 429 retry budget is 0, so no retry) sits INSIDE each fallback
-attempt; the fallback loop adds at most
-`fallback.max_attempts` DISTINCT egresses per request (default 3, including
-the first). Worst case for a 502 storm: 4 POSTs × 3 egresses = 12 upstream
-calls, bounded. No inter-attempt sleep — the cooldown is health-based, per
-egress, and applies to FUTURE requests only.
+The upstream retry matrix sits INSIDE each fallback attempt:
+429 → 0 retries (fail fast by contract), 502 → 3 retries @3s (4 POSTs),
+503 → 3 @2s, 504 → 2 @3s; unlisted statuses never retry. Network errors draw
+the 502 rule. The counter is ONE per URL shared by every retryable status and
+network errors alike, and the cap is the firing rule's (base.js parity) —
+alternating 502/503 gives up after 3 combined attempts, not 3 of each. A
+typed proxy-auth failure is the exception: exactly ONE dial, no budget
+consumed, straight to fallback (see
+[Proxy-authentication (407)](#proxy-authentication-407-classification)).
+
+The fallback loop then adds at most `fallback.max_attempts` DISTINCT egresses
+per request (default 3, including the first; `enabled: false` or a budget < 1
+pins the request to one attempt). Worst case for a 502 storm: 4 POSTs × 3
+egresses = 12 upstream calls; a credential-refusing proxy storm is 1 POST per
+egress. No inter-attempt sleep — the cooldown is health-based, per egress,
+and applies to FUTURE requests only.
+
+### Health
+
+Policy and state are split (`internal/health/health.go`):
+
+- **Policy** (`enabled`, `failure_threshold`, `cooldown`) is captured from
+  the request's config snapshot and travels with it — a hot reload affects
+  only requests that have not started.
+- **State** (failure streak + cooldown deadline) is process-wide, keyed by
+  egress id + transport signature (`type:url`). A policy-only reload keeps
+  the key, so history continues across generations; swapping an egress's
+  proxy URL changes the key, so a fresh transport never inherits the old
+  transport's streak or cooldown.
+
+Only real egress faults mark health: connection errors, typed proxy-auth,
+response-header timeouts (60s), and 5xx after the retry matrix. 429 and every
+other 4xx are verdicts about the REQUEST — they fall back (429) or not (4xx)
+but never mark. A success resets the streak and clears any cooldown; failures
+during an active cooldown never extend it. With health disabled the registry
+answers healthy for everything and records nothing (re-enabling resumes from
+the preserved history). A threshold DECREASE never arms retroactively — only
+a new failing observation crossing the observing request's threshold arms a
+cooldown.
 
 ### Proxy-authentication (407) classification
 
-When an egress dials through a proxy, the client distinguishes a 407 from
-the PROXY (transport-level `Proxy Authentication Required` / `proxy
-authentication failed`) — classified as a connection-class failure:
-fallback + unhealthy, like any other egress fault. A 407 returned by the
-UPSTREAM (an origin responding 407 behind the tunnel, or a proxy without
-credentials configured) is a client-class error: surfaced to the client, no
-fallback, no health effect. A proxy URL with `user:password@` credentials
-that still gets a proxy 407 is a proxy-auth failure (credentials present but
-rejected); a proxy without credentials never is. SOCKS5 follows RFC 1928:
-method/status rejection (RFC 1929) is proxy-auth; a CONNECT `REP 0x02`
-(ruleset denial) is a plain connection error. `socks5h` is rejected at config
-load — remote-DNS semantics would silently change which resolver sees
-upstream hostnames.
+A 407 is classified `proxy_auth_error` ONLY when this proxy itself read the
+proxy's status line — the proof is a typed `*proxyAuthError` produced at the
+transport boundary (`internal/upstream/connect.go` for an HTTP(S) CONNECT
+answered 407; `internal/upstream/socks5.go` for an RFC 1929 credential
+rejection, or a demand for credentials that were never sent). Nothing is ever
+promoted by error text — a dial error that happens to contain "407" classifies
+as a connection error, never proxy-auth (`internal/upstream/failure.go`).
+
+Any 407 arriving as a RESPONSE status is conservatively `client_error`: the
+wire cannot tell whether it came from the origin through an established
+CONNECT tunnel, or was relayed byte-for-byte by a plain-HTTP forward proxy,
+so ownership is not claimed. Consequences: surfaced to the client, NO
+fallback, no health mark.
+
+`proxy_auth_error` itself falls back to the next egress, marks health, and —
+uniquely — bypasses the per-egress retry matrix: one dial, then immediate
+fallback, because the proxy will refuse the same credentials identically on
+every retry. SOCKS5 detail: REP `0x02` ("connection not allowed by ruleset")
+is a plain connection error, not proxy-auth; only RFC 1929 rejections are.
+`socks5h` is rejected at config load by name — remote-DNS semantics would
+silently change which resolver sees upstream hostnames.
+
+### Streaming commitment
+
+Once the executor returns a live upstream response, the request is committed:
+the relay owns it and NO fallback ever happens — downstream writes happen
+only after `Execute` returns, so the guarantee is structural
+(`internal/upstream/fallback.go`). A mid-stream death — transport reset, or a
+stall past the 360s SSE stall timeout — aborts the downstream response; a
+Responses passthrough client still receives a parseable `response.failed`
+terminal plus `[DONE]` (`internal/router/stream.go`).
 
 ### Snapshot semantics (one request = one config generation)
 
 Every request captures ONE immutable `Runtime` from the store (first file
 load = generation 1, each hot-reload swap +1, no-config default = 0) and uses
-it for its whole lifetime — route match, egress resolution, and the pinned
-`*config.Egress` list the executor dials. A reload mid-request cannot change
-which egresses that request may fall back to: the swap stamps only the NEW
-snapshot. Log lines carry `generation=N`; the success log ends with
-`fallback=true` when an attempt actually fell back. Responses carry
-`X-OFP-Egress: <id>` naming the egress that served them (observability +
-the e2e suite's wire-level evidence).
+it for its whole lifetime — route match, egress resolution, the health
+policy, and the pinned `*config.Egress` list the executor dials. A reload
+mid-request cannot change which egresses that request may fall back to: the
+swap stamps only the NEW snapshot. Log lines carry `generation=N`; the
+success log ends with `fallback=true` when an attempt actually fell back.
+Responses carry `X-OFP-Egress: <id>` naming the egress that served them
+(observability + the e2e suite's wire-level evidence).
+
+Transports are cached per egress by transport signature, so a reload that
+keeps a proxy URL reuses the same immutable client while a URL swap simply
+adds a new entry (the old client lives until the in-flight requests holding
+it are done, then the once-per-generation prune drops it). Health STATE also
+survives swaps — it is keyed by id + signature — while the health POLICY each
+request applies is pinned to that request's snapshot.
 
 Defaults with a config file: health enabled (`failure_threshold` 3, `cooldown`
 30s), fallback `max_attempts` 3 — set `health.enabled: false` to disable
@@ -174,19 +312,19 @@ upstream and are translated transparently for chat clients.
 
 ## Layout
 
-| Package              | Ports                                                                                                                                                |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `internal/config`    | runtime constants/env, multi-egress YAML model, hot-reload store, interpolation, redaction                                                           |
-| `internal/routing`   | route planning: model/streaming/body gates, round-robin + smooth weighted rotation, attempt order                                                    |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown, survives config swaps                                                           |
-| `internal/identity`  | session/request-id generation, UA triple cache + GitHub sync, session resolution chain                                                               |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms                                                                                 |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                   |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                              |
-| `internal/upstream`  | HTTP client (retry, SSE line scan), per-egress transports (http/socks5/direct), executor transforms, headers, fallback executor, concurrency limiter |
-| `internal/caps`      | per-model input-modality resolution (vision/pdf/audio/video)                                                                                         |
-| `internal/router`    | endpoints, chatCore pipeline, routing + fallback orchestration, forced-SSE-to-JSON, bypass/test-connection/modality/tool-dedupe stages               |
-| `e2e/`               | black-box e2e suite (`-tags e2e`): compiled server subprocess + fake upstream; opt-in live suite                                                     |
+| Package              | Ports                                                                                                                                                                                         |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `internal/config`    | runtime constants/env, multi-egress YAML model, hot-reload store, interpolation, redaction                                                                                                    |
+| `internal/routing`   | route planning: model/streaming/body gates, round-robin + smooth weighted rotation, attempt order                                                                                             |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown, survives config swaps                                                                                                    |
+| `internal/identity`  | session/request-id generation, UA triple cache + GitHub sync, session resolution chain                                                                                                        |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms                                                                                                                          |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                            |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                       |
+| `internal/upstream`  | HTTP client (retry matrix, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), failure taxonomy, executor transforms, headers, fallback executor, concurrency limiter |
+| `internal/caps`      | per-model input-modality resolution (vision/pdf/audio/video)                                                                                                                                  |
+| `internal/router`    | endpoints, chatCore pipeline, routing + fallback orchestration, forced-SSE-to-JSON, bypass/test-connection/modality/tool-dedupe stages                                                        |
+| `e2e/`               | black-box e2e suite (`-tags e2e`): compiled server subprocess + fake upstream; opt-in live suite                                                                                              |
 
 ## Tests
 

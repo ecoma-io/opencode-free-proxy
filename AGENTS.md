@@ -48,24 +48,63 @@ directory as a candidate rule config, regardless of naming:
 Both were confirmed against semgrep 1.172.0 by running it, and both apply
 only to `languages: [yaml]` fixtures.
 
+## The multi-egress config: canonical example + parity test
+
+`example.config.yaml` (repo root) is the annotated schema, and
+`internal/config/example_test.go` loads it through the real loader
+(`config.LoadFile` — interpolate → parse → validate → resolve), so the
+example and the parser are locked together: change them together or CI fails.
+The semantics agents most often get wrong:
+
+1. The env interpolator scans the RAW file bytes — comments included — and
+   an unset `${VAR}` is a load error. The example therefore keeps placeholder
+   syntax out of comments, and carries no literal credential anywhere.
+2. Decisions run: route matching FIRST (`MatchRoute` — priority descending,
+   stable sort, file order breaks ties, first match serves), then hard
+   eligibility filters the matched route's egress list, then the scheduler
+   orders the INITIAL attempt only. `weight` feeds `weighted_round_robin`
+   head selection only — never eligibility; explicit `weight: 0` never heads
+   a weighted route while a positive-weight sibling is eligible and is
+   ignored under `round_robin`.
+3. Route `match.models` is AND (every pattern must match — disjoint globs
+   match nothing); egress `models` is OR (an allow-list).
+4. Body limits are three layers: the 8 MiB server cap in
+   `internal/router/handler.go` (rejects the request), route `match` body
+   bytes (route selection), egress `max_body_bytes` (eligibility filter).
+5. Health splits POLICY from STATE: policy (enabled/threshold/cooldown) is
+   pinned per request from its snapshot; state (streak + cooldown) is
+   process-wide keyed by egress id + transport signature (`type:url`). A
+   policy-only reload keeps history; a proxy URL swap starts a fresh
+   identity. Only connection errors, typed proxy-auth, timeouts, and 5xx
+   mark health; 429 and other 4xx never; success resets; a threshold
+   decrease never arms retroactively.
+6. Proxy-auth (407) is typed at the transport boundary only
+   (`internal/upstream/connect.go`, `socks5.go`). A 407 that arrives as a
+   response status is conservatively `client_error` — no fallback, no health
+   mark. Never classify by error text. Typed proxy-auth bypasses the
+   per-egress retry matrix: exactly one dial, then immediate fallback.
+7. Streaming commitment: once a live upstream response exists there is no
+   fallback, ever; a mid-stream death aborts the downstream response
+   (`internal/router/stream.go`).
+
 ## Layout
 
-| Package              | Role                                                                                                                |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                             |
-| `internal/config`    | every runtime constant + env vars (`PORT`, `OFP_API_KEY`, `OFP_UPSTREAM_BASE`)                                      |
-| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order    |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown, survives config swaps                          |
-| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                  |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                |
-| `internal/upstream`  | HTTP client (retry matrix, SSE line scan), executor transforms, header forging                                      |
-| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                        |
-| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain              |
-| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                  |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                             |
-| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                            |
-| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                |
+| Package              | Role                                                                                                                                                              |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                           |
+| `internal/config`    | every runtime constant + env vars (`PORT`, `OFP_API_KEY`, `OFP_UPSTREAM_BASE`, `OFP_CONFIG`); multi-egress YAML model, interpolation, redaction, hot-reload store |
+| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                  |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                       |
+| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration                                               |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                              |
+| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging      |
+| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                      |
+| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                            |
+| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                           |
+| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                          |
+| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                              |
 
 ## Porting discipline (the rules that keep parity)
 

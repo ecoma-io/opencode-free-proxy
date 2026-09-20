@@ -1,0 +1,196 @@
+# ---------------------------------------------------------------------------
+# opencode-free-proxy — annotated multi-egress routing config (OFP_CONFIG)
+# ---------------------------------------------------------------------------
+#
+# Start the server with OFP_CONFIG pointed at a file shaped like this one.
+# The file is re-read every OFP_CONFIG_POLL_MS (default 1000 ms); a poll
+# cycle hashes the bytes (SHA-256) and re-parses only on change. A file that
+# fails parse or validation keeps the LAST GOOD runtime, and an in-flight
+# request keeps the immutable snapshot it started on — a reload never touches
+# a request that has already begun. This exact file is loaded by
+# internal/config/example_test.go through the real loader, so it cannot
+# drift from the parser.
+#
+# CREDENTIALS — read before editing.
+#
+# Every secret in this file is a dollar-brace env reference, never a literal.
+# Interpolation runs over the RAW file bytes before YAML parsing — comments
+# included — and an UNSET variable is a load error naming the variable.
+# Therefore:
+#
+#   1. export all six before loading this file:
+#        OFP_EXAMPLE_HTTP_USER   OFP_EXAMPLE_HTTP_PASS    egress http-proxy
+#        OFP_EXAMPLE_HTTPS_USER  OFP_EXAMPLE_HTTPS_PASS   egress https-proxy
+#        OFP_EXAMPLE_SOCKS_USER  OFP_EXAMPLE_SOCKS_PASS  egress socks5-proxy
+#
+#   2. never write the placeholder syntax inside a comment (this file does
+#      not, for exactly that reason) — comments are interpolated too.
+#
+# Proxy credentials live in the proxy url userinfo (user:password@host:port).
+# They are stripped by config.RedactProxyURL everywhere a proxy URL can
+# reach a log or an error; the transport signature and health key keep them,
+# but both are map keys only and are never logged.
+#
+# FIELD REFERENCE (defaults come from internal/config/config.go)
+#
+# egress[]                                        at least one; unique id
+#   id               string, required, unique
+#   proxy            omit the whole key for the host's own network (direct)
+#     type           http | https | socks5. socks5h is REJECTED at load —
+#                    hostnames must resolve locally; remote-DNS semantics
+#                    are deliberately out of scope.
+#     url            scheme must equal type; host required; userinfo optional
+#   enabled          bool, default true (false = configured, never scheduled)
+#   weight           int, default 1, must be >= 0. Feeds
+#                    weighted_round_robin ONLY — under round_robin it is
+#                    ignored. It shapes which egress STARTS a request; it is
+#                    not an eligibility filter. 0 = never heads the attempt
+#                    list while any positive-weight sibling is eligible.
+#   max_concurrency  int, default 0 = unlimited. Caps in-flight
+#                    requests/streams; an egress at capacity is SKIPPED at
+#                    dial time — a skip is not a failure.
+#   models           []glob, default empty = every model (path.Match syntax,
+#                    matched against the suffix-stripped model id)
+#   streaming        bool, default true (false = streaming requests never
+#                    pick this egress)
+#   max_body_bytes   int, default 0 = unlimited. Eligibility gate: a larger
+#                    request never picks this egress (it is not a request
+#                    cap — the server-level 8 MiB cap is separate).
+#
+# routes[]                                        at least one; unique id
+#   id               string, required, unique
+#   priority         int, default 0. HIGHER wins: routes are tried in
+#                    priority order and the FIRST whose match holds serves
+#                    the request; equal priorities keep file order.
+#   match            AND of the set fields; empty = catch-all
+#     streaming      bool — the client asked for stream: true
+#     models         []glob — EVERY listed pattern must match the model id
+#                    (AND — unlike the per-egress allow-list above, which is
+#                    OR; two disjoint globs here would match nothing)
+#     min_body_bytes int — raw inbound body must be >= (0 = unset)
+#     max_body_bytes int — raw inbound body must be <= (0 = unset)
+#   egress           []id, required, non-empty, ids must exist. Order is the
+#                    FALLBACK order after the scheduler's head pick.
+#   strategy         round_robin (default) | weighted_round_robin
+#
+# fallback
+#   enabled          bool, default true
+#   max_attempts     int, default 3 — DISTINCT egresses one request may try,
+#                    including the first; 0 means default 3; negative is a
+#                    load error. The per-egress upstream retry matrix sits
+#                    unchanged INSIDE each attempt.
+#
+# health (policy — runtime state semantics live in the README)
+#   enabled            bool, default true with a config file. The built-in
+#                      no-config runtime runs with health OFF.
+#   failure_threshold  int, default 3 — consecutive failures before a
+#                      cooldown; explicit 0 = never cool down.
+#   cooldown           Go duration string ("30s", "1m30s"); default 30s; a
+#                      bare number is a load error; explicit 0s = no
+#                      exclusion window.
+# ---------------------------------------------------------------------------
+
+egress:
+  # Plain-HTTP forward proxy with credentials. Credentials come only from the
+  # environment (see CREDENTIALS above) — this file carries no literal secret.
+  - id: http-proxy
+    proxy:
+      type: http
+      url: "http://${OFP_EXAMPLE_HTTP_USER}:${OFP_EXAMPLE_HTTP_PASS}@http-proxy.example.net:8080"
+    enabled: true # default; spelled out for completeness
+    weight: 5 # used by weighted_round_robin routes only
+    max_concurrency: 8 # 8 in-flight requests/streams, then skips
+  # TLS-to-the-proxy endpoint (the CONNECT/auth hop itself rides TLS).
+  - id: https-proxy
+    proxy:
+      type: https
+      url: "https://${OFP_EXAMPLE_HTTPS_USER}:${OFP_EXAMPLE_HTTPS_PASS}@https-proxy.example.net:8443"
+    weight: 3
+    max_body_bytes: 4194304 # eligibility gate: bodies over 4 MiB never pick it
+  # SOCKS5 with RFC 1929 username/password auth. NOT socks5h: hostnames are
+  # resolved locally before the CONNECT, and a socks5h type or url scheme is
+  # rejected at load by name instead of being silently normalized.
+  - id: socks5-proxy
+    proxy:
+      type: socks5
+      url: "socks5://${OFP_EXAMPLE_SOCKS_USER}:${OFP_EXAMPLE_SOCKS_PASS}@socks-proxy.example.net:1080"
+    weight: 1
+    max_concurrency: 4
+    # Allow-list: ANY pattern matching admits the model (OR — route
+    # match.models below is the AND one). Empty = every model.
+    models: ["*-free", "big-pickle"]
+  # A credential-less LAN proxy: userinfo is optional. It also demonstrates
+  # the two "restricted standby" knobs: weight 0 (never heads a
+  # weighted_round_robin route while a positive-weight sibling is eligible)
+  # and streaming false (streaming requests never pick it).
+  - id: lan-proxy
+    proxy:
+      type: http
+      url: "http://10.10.0.9:3128"
+    weight: 0
+    streaming: false
+  # Direct egress: no proxy key at all — the host's own network, the
+  # pre-routing behavior. Transport signature "direct"; health state for it
+  # is keyed "direct" + that signature.
+  - id: direct
+
+routes:
+  # Priority 100 — highest, matched first. Streaming requests land here
+  # regardless of size or model, because this match sets only `streaming`.
+  # weighted_round_robin (nginx smooth WRR) spreads the START of requests
+  # across the three weighted egresses; lan-proxy (weight 0) is deliberately
+  # not in this route's list.
+  - id: streaming-requests
+    priority: 100
+    match:
+      streaming: true
+    egress: [http-proxy, https-proxy, socks5-proxy]
+    strategy: weighted_round_robin
+  # Large bodies: raw inbound size between 1 MiB and 8 MiB. The upper bound
+  # equals the server-level 8 MiB request cap (internal/router/handler.go) —
+  # the two limits are different layers: this one only picks the route, that
+  # one rejects the request before routing with a 400.
+  - id: large-bodies
+    priority: 90
+    match:
+      min_body_bytes: 1048576
+      max_body_bytes: 8388608
+    egress: [http-proxy, socks5-proxy, direct]
+    strategy: round_robin
+  # Free-tier model families — TWO routes at the same priority 80, because a
+  # route's model patterns are ANDed (a model would have to match every
+  # glob). "*-free" follows path.Match semantics; big-pickle is free without
+  # the suffix, so it needs its own route. A streaming free-model request
+  # still hits streaming-requests first (priority 100 beats 80), and the two
+  # routes here keep file order between themselves.
+  - id: free-suffix
+    priority: 80
+    match:
+      models: ["*-free"]
+    egress: [https-proxy, http-proxy, direct]
+    strategy: round_robin
+  - id: big-pickle
+    priority: 80
+    match:
+      models: ["big-pickle"]
+    egress: [https-proxy, http-proxy, direct]
+    strategy: round_robin
+  # Priority 0 catch-all: everything the routes above did not claim (here:
+  # non-streaming, small, non-free-model requests). Weighted too — this is
+  # where lan-proxy's weight 0 is exercised: it stays ELIGIBLE (its gate only
+  # excludes streaming requests) but never heads the rotation while a
+  # positive-weight sibling is eligible; it serves only via fallback after a
+  # sibling fails. Under round_robin its weight would be ignored instead.
+  - id: default
+    priority: 0
+    egress: [http-proxy, https-proxy, socks5-proxy, lan-proxy, direct]
+    strategy: weighted_round_robin
+
+fallback:
+  enabled: true # false pins every request to its single scheduled head
+  max_attempts: 3 # DISTINCT egresses per request, first one included
+
+health:
+  enabled: true
+  failure_threshold: 5 # 5 consecutive failures arm the cooldown
+  cooldown: 45s # then the egress is unschedulable for 45s
