@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.2.0...v0.3.0) (2026-09-20)
+
+
+### Features
+
+* accept socks5h (remote-resolve) SOCKS5 egress ([#16](https://github.com/ecoma-io/opencode-free-proxy/issues/16)) ([bf3b20a](https://github.com/ecoma-io/opencode-free-proxy/commit/bf3b20ab47a7b4fe2b969d923362dc461c422a4e)), closes [#8](https://github.com/ecoma-io/opencode-free-proxy/issues/8)
+
+
+### Bug Fixes
+
+* resolve open code-scanning alerts — explicit TLS 1.2 floor, overflow-free allocation hint ([#19](https://github.com/ecoma-io/opencode-free-proxy/issues/19)) ([480c70e](https://github.com/ecoma-io/opencode-free-proxy/commit/480c70e4bbb7b50c635bfa95d61bc9f70a179eb1))
+
 ## [0.2.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.1.0...v0.2.0) (2026-09-20)
 
 
