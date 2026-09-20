@@ -19,6 +19,10 @@ name: Analysis
 # has to be restated there.
 
 on:
+  # Same reason ci.yml declares merge_group: the merge queue on main requires
+  # analysis-gate on its speculative merge ref, and a workflow that does not
+  # run on merge_group leaves that check pending forever rather than failing.
+  merge_group:
   push:
     # `main` — the one development line — runs analysis on every push, for
     # the same reason `ci.yml` runs there: the merged tree is measured, and

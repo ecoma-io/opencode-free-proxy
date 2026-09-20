@@ -12,6 +12,12 @@ name: CI
 # the workflow-level one rather than merging with it.
 
 on:
+  # The merge queue on main builds a speculative merge ref and requires
+  # ci-gate on it. Without this trigger no run is ever created for that ref,
+  # so the required check never appears and every queued entry waits out the
+  # queue's check-response timeout unmerged — the same pending-forever state
+  # the unfiltered pull_request trigger below exists to avoid.
+  merge_group:
   pull_request:
   push:
     branches: [main]
