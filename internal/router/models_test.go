@@ -112,3 +112,23 @@ func TestHandleModelsFallsBackToStaticRegistry(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleModelsDrainGateAnswers503: a draining server refuses NEW
+// /v1/models requests with 503, the same contract relay() applies to
+// chat/responses — a shutting-down process must not start an upstream fetch
+// it may not finish.
+func TestHandleModelsDrainGateAnswers503(t *testing.T) {
+	s := NewServer(
+		&config.Config{Port: "0", UpstreamBase: "http://127.0.0.1:1"},
+		config.NewDefault(),
+		identity.NewUserAgentCache(),
+		upstream.NewClient(),
+		nil, nil,
+	)
+	s.Drain()
+	rec := httptest.NewRecorder()
+	s.HandleModels(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != 503 {
+		t.Fatalf("status = %d, want 503 (body=%s)", rec.Code, rec.Body.String())
+	}
+}

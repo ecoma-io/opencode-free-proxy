@@ -1,12 +1,12 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 
 	"opencode-free-proxy/internal/config"
 )
@@ -23,17 +23,33 @@ type modelsEntry struct {
 // minus known-dead ids. The JS route fetches a caller-supplied `url`; this
 // proxy's equivalent is the configured upstream base (OFP_UPSTREAM_BASE),
 // so the whole list endpoint is redirectable for tests/self-hosting. Falls
-// back to the static registry models when the upstream list is unreachable.
+// back to the static registry models when the upstream list is unreachable
+// (fail-open, unchanged).
+//
+// The fetch rides the SHARED direct client (s.Upstream) rather than a
+// per-request http.Client: one connection pool, one transport configuration
+// (its ResponseHeaderTimeout is the only upstream deadline). The total fetch
+// bound is restored with a context deadline (config.ModelsFetchTimeout).
 func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
+	// Drain gate, same contract as relay(): a shutting-down server refuses
+	// NEW work with 503 instead of starting an upstream fetch. The fail-open
+	// fallback below applies only to fetch problems while serving.
+	if s.Draining.Load() {
+		writeError(w, http.StatusServiceUnavailable, "Server is shutting down")
+		return
+	}
 	var entries []modelsEntry
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, s.Cfg.UpstreamBase+"/zen/v1/models", nil)
-	if err == nil {
-		req.Header.Set("Authorization", "Bearer "+config.PublicBearer)
-		if resp, err := client.Do(req); err == nil {
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-			_ = resp.Body.Close()
-			entries = parseUpstreamModels(raw)
+	if s.Upstream != nil && s.Upstream.HTTP != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), config.ModelsFetchTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.Cfg.UpstreamBase+"/zen/v1/models", nil)
+		if err == nil {
+			req.Header.Set("Authorization", "Bearer "+config.PublicBearer)
+			if resp, err := s.Upstream.HTTP.Do(req); err == nil {
+				raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+				_ = resp.Body.Close()
+				entries = parseUpstreamModels(raw)
+			}
 		}
 	}
 	if entries == nil {
