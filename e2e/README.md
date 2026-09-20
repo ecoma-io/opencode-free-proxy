@@ -60,6 +60,30 @@ even though `OFP_UPSTREAM_BASE` is a single value:
   finishes under grace; a stream that stalls past `OFP_SHUTDOWN_GRACE` is
   force-closed
 
+### Health policy pinning & proxy-auth boundaries (`egress_test.go`)
+
+The issue #6 hardening semantics, driven through the wire with per-egress
+local listeners and a real CONNECT proxy:
+
+- health policy is pinned per config generation: a failure observed by an
+  in-flight generation-1 request (health disabled) never marks the egress —
+  it stays eligible under generation 2 — while generation 2's own first
+  failure arms the cooldown (`TestReloadHealthPolicyPinnedPerGeneration`)
+- a REAL local HTTP forward proxy answering `CONNECT` with 407 against a REAL
+  local https upstream: exactly ONE CONNECT (proxy-auth bypasses the 502
+  retry matrix), executor falls back to the direct egress, which completes a
+  real TLS session — the subprocess trusts the fixture cert via
+  `SSL_CERT_FILE` (`TestConnect407ThroughRealForwardProxyFallsBack`)
+- a 407 arriving as a response status (http origin behind a forward proxy) is
+  a client-error verdict: the client gets the `[407]:` envelope, the other
+  egress sees zero requests, no retry, no health mark
+  (`TestHTTPOrigin407IsClientErrorNoFallback`)
+- health state is keyed by egress id + transport signature: swapping a dead
+  proxy URL for a working one serves from the replacement immediately (no
+  inherited cooldown, `TestTransportReplacementDoesNotInheritCooldown`), while
+  a policy-only reload (same proxy URL) keeps the armed cooldown
+  (`TestPolicyOnlyReloadKeepsHealthState`)
+
 ### Tool pipeline & client personas (`tools_test.go`)
 
 Cross-interface checks — clients with different tool shapes must all reach
