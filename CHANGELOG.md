@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.1.0...v0.2.0) (2026-09-20)
+
+
+### Features
+
+* production-hardening — health & scheduler state lifecycle, snapshot immutability ([#10](https://github.com/ecoma-io/opencode-free-proxy/issues/10)) ([246c833](https://github.com/ecoma-io/opencode-free-proxy/commit/246c833eedcdee5dbd8a507f568b214a62d3efa6))
+
+
+### Bug Fixes
+
+* **ci:** run the gates on merge_group so the merge queue can merge ([#14](https://github.com/ecoma-io/opencode-free-proxy/issues/14)) ([dec7acf](https://github.com/ecoma-io/opencode-free-proxy/commit/dec7acf1950808549e1152ea22bfe4926e6dd050)), closes [#13](https://github.com/ecoma-io/opencode-free-proxy/issues/13)
+
 ## 0.1.0 (2026-09-20)
 
 
