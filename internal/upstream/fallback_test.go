@@ -337,3 +337,61 @@ func TestExecuteContextCanceledShortCircuits(t *testing.T) {
 	}
 	_ = resp
 }
+
+// TestExecuteReleasesSlotOnFailure: a slot acquired for an attempt that
+// FAILS must be freed the moment the attempt ends — otherwise a capped
+// egress bricks itself after max_concurrency failures (issue #3 review).
+func TestExecuteReleasesSlotOnFailure(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 200})
+	defer f.Close()
+
+	p := AttemptPolicy{
+		FallbackEnabled: true,
+		MaxAttempts:     1, // terminal 502 on a
+		MaxConcurrency:  map[string]int{"a": 1},
+	}
+	resp, id, _, _, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a"), p)
+	if resp != nil || uerr == nil || id != "a" {
+		t.Fatalf("resp=%v id=%q uerr=%v, want terminal failure on a", resp, id, uerr)
+	}
+	if !f.slots.Acquire("a", 1) {
+		t.Fatal("a's slot must be released after its failed attempt")
+	}
+}
+
+// TestExecuteHoldsSlotUntilBodyClosed: a winning egress holds its slot while
+// the response body is open (the cap counts in-flight requests/streams) and
+// releases it exactly once on Close — the streaming relay closes the body
+// twice, so the release MUST be idempotent.
+func TestExecuteHoldsSlotUntilBodyClosed(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 200})
+	defer f.Close()
+
+	p := AttemptPolicy{
+		FallbackEnabled: true,
+		MaxAttempts:     3,
+		MaxConcurrency:  map[string]int{"a": 1},
+	}
+	resp, id, _, _, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), plan("r", "a"), p)
+	if uerr != nil || resp == nil || id != "a" {
+		t.Fatalf("uerr=%v id=%q, want success on a", uerr, id)
+	}
+	if f.slots.Acquire("a", 1) {
+		t.Fatal("a's slot must be held while the response body is open")
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil { // stream.go closes twice
+		t.Fatalf("second close: %v", err)
+	}
+	if !f.slots.Acquire("a", 1) {
+		t.Fatal("a's slot must be released once the body is closed")
+	}
+}

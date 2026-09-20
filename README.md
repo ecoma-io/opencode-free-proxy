@@ -36,35 +36,48 @@ keep the last good runtime and are logged.
 egress:
   - id: primary
     proxy: { type: http, url: "https://creds@proxy-a.example:8080" }
+    # max_concurrency: 4   # in-flight cap; 0 = unlimited (default)
+    # models: ["*-free"]   # glob allow-list; empty = every model
+    # streaming: true      # accepts streaming; default true
+    # max_body_bytes: 0    # inbound body bound; 0 = unlimited
+    # weight: 5            # share under weighted_round_robin
   - id: backup
     proxy: { type: socks5, url: "socks5://user:secret@proxy-b.example:1080" }
   - id: direct
+    enabled: true # false = configured but never scheduled
 routes:
   - id: default
     egress: [primary, backup, direct]
-    model: ["*-free", "big-pickle"] # empty = every model
-    streaming: true
-    max_body_bytes: 10485760
+    strategy: round_robin # or weighted_round_robin
+    match: # AND of the set conditions; empty = catch-all
+      # models: ["*-free", "big-pickle"]
+      # streaming: true
+      # min_body_bytes: 0
+      # max_body_bytes: 10485760
 fallback:
   enabled: true
-  max_attempts: 3
+  max_attempts: 3 # distinct egresses incl. the first; 0 = default 3
 health:
-  enabled: true
-  allowed_failures: 3
-  cooldown: 1m
+  enabled: true # default true with a config file
+  failure_threshold: 3 # consecutive failures before cooldown; 0 = never
+  cooldown: 1m # Go duration string ("30s", "1m")
 ```
 
-Routing is round-robin with smooth weighted rotation when routes or egresses
-declare weights (`routing.Weight`); the scheduler pins a deterministic order
-per route so one route's traffic never starves another. A route references
-egresses in fallback order — the planner rotates the head, the executor walks
-the rest. 429s fall back but never mark an egress unhealthy; 5xx/network
-errors count toward the health threshold and cool the egress for `cooldown`
-after `allowed_failures` consecutive failures; 4xx (other than 429) never
-fall back (the request is the problem, not the egress). Concurrency caps
-(`egress.concurrency`) skip an egress at capacity — a skip is not a failure.
-On total failure the client gets a 502 envelope. Unset `OFP_CONFIG` = the
-historical single direct egress, byte-for-byte the old behavior.
+Head selection is round-robin; a per-egress `weight` switches a route to
+smooth weighted rotation (`strategy: weighted_round_robin`). A route
+references egresses in fallback order — the planner rotates the head, the
+executor walks the rest. 429s fall back but never mark an egress unhealthy;
+5xx/network/connection errors count toward `failure_threshold` consecutive
+failures and cool the egress for `cooldown`; 4xx (other than 429) never fall
+back (the request is the problem, not the egress). Concurrency caps
+(`max_concurrency`) skip an egress at capacity — a skip is not a failure. On
+total failure the client gets a 502 envelope.
+
+Defaults with a config file: health enabled (`failure_threshold` 3, `cooldown`
+30s), fallback `max_attempts` 3 — set `health.enabled: false` to disable
+gating. Unset `OFP_CONFIG` = the historical single direct egress,
+byte-for-byte the old behavior: health gating is off there, so a config-less
+deployment cannot acquire a failure-threshold outage.
 
 ## Endpoints
 

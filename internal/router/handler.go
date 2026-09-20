@@ -234,8 +234,8 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	if s.Health != nil {
 		s.Health.Configure(
 			rt.Health.Enabled == nil || *rt.Health.Enabled,
-			rt.Health.FailureThreshold,
-			time.Duration(rt.Health.Cooldown),
+			rt.HealthThreshold(),
+			rt.HealthCooldown(),
 		)
 	}
 	profile := routing.Profile{

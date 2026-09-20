@@ -2,9 +2,11 @@ package upstream
 
 import "sync"
 
-// Limiter is the per-egress concurrency gate. Acquire/Release pair in the
-// executor at dial time; Peek is the scheduler's soft check — a slot may be
-// taken between planning and dialing, so the executor re-checks with
+// Limiter is the per-egress concurrency gate. Acquire happens in the
+// executor at dial time; Release pairs with it either on attempt failure or
+// when the winning response body closes — the cap counts in-flight
+// requests/streams, not dials. Peek is the scheduler's soft check: a slot
+// may be taken between planning and dialing, so the executor re-checks with
 // Acquire and SKIPS the egress without marking it failed (skip ≠ failure).
 // Keyed by egress id, so it survives config swaps.
 type Limiter struct {

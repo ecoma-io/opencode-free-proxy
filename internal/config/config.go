@@ -173,7 +173,7 @@ type Config struct {
 	ConfigPoll time.Duration
 }
 
-// DefaultShutdownGrace is used when OFP_SHUTDOWN_GRACE is unset.
+// DefaultShutdownGrace is used when OFP_SHUTDOWN_GRACE is unset (ms).
 const DefaultShutdownGrace = 30 * time.Second
 
 // DefaultConfigPoll is the hot-reload poll interval (the rotation-proxy
@@ -187,21 +187,13 @@ func FromEnv() *Config {
 		UpstreamBase:   envOr("OFP_UPSTREAM_BASE", UpstreamBase),
 		UASyncInterval: envMs("OFP_UA_SYNC_INTERVAL", UASyncInterval),
 		ConfigPath:     os.Getenv("OFP_CONFIG"),
-		ShutdownGrace:  envDur("OFP_SHUTDOWN_GRACE", DefaultShutdownGrace),
-		ConfigPoll:     envMs("OFP_CONFIG_POLL_MS", DefaultConfigPoll),
+		// OFP_SHUTDOWN_GRACE is milliseconds like every other ms sibling
+		// (OFP_CONFIG_POLL_MS, OFP_UA_SYNC_INTERVAL). A "30s" duration string
+		// would be silently dropped by envDur's ParseDuration; envMs matches
+		// the documented contract.
+		ShutdownGrace: envMs("OFP_SHUTDOWN_GRACE", DefaultShutdownGrace),
+		ConfigPoll:    envMs("OFP_CONFIG_POLL_MS", DefaultConfigPoll),
 	}
-}
-
-// envDur parses a Go duration string ("30s"); invalid or empty falls back.
-func envDur(key string, def time.Duration) time.Duration {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return def
-	}
-	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
-		return d
-	}
-	return def
 }
 
 func envOr(key, def string) string {

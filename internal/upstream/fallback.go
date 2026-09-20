@@ -2,7 +2,9 @@ package upstream
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"sync"
 
 	"opencode-free-proxy/internal/health"
 	"opencode-free-proxy/internal/routing"
@@ -47,6 +49,23 @@ type AttemptPolicy struct {
 //   - No fallback after any downstream write — guaranteed structurally:
 //     downstream writes happen only after this returns a response.
 //   - A slot that fills between plan and dial is SKIPPED, never a failure.
+//   - A slot acquired for an attempt is released exactly once: immediately
+//     when the attempt fails, or when the success response body is closed
+//     (the cap counts in-flight requests/streams, so a winning egress holds
+//     its slot until the body is consumed — both relay paths close it).
+//
+// slotReleaseBody closes the underlying body and frees the slot exactly
+// once (sync.Once — the streaming relay closes the body twice).
+type slotReleaseBody struct {
+	io.ReadCloser
+	once sync.Once
+	free func()
+}
+
+func (b *slotReleaseBody) Close() error {
+	b.once.Do(b.free)
+	return b.ReadCloser.Close()
+}
 func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy) (*http.Response, string, int, Class, *UpstreamError) {
 	budget := policy.MaxAttempts
 	if !policy.FallbackEnabled || budget < 1 {
@@ -71,6 +90,9 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 		resp, uerr, class := client.DoClassified(ctx, url, buildHeaders, bodyJSON)
 		lastClass = class
 		if uerr != nil {
+			if x.slots != nil {
+				x.slots.Release(id)
+			}
 			if class == ClassContextCanceled {
 				return nil, id, attempts, class, uerr
 			}
@@ -84,6 +106,9 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 		}
 		if x.health != nil {
 			x.health.Observe(id, true)
+		}
+		if x.slots != nil {
+			resp.Body = &slotReleaseBody{ReadCloser: resp.Body, free: func() { x.slots.Release(id) }}
 		}
 		return resp, id, attempts, class, uerr
 	}

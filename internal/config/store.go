@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"log"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +32,10 @@ type Store struct {
 	initHash string
 	stopCh   chan struct{}
 	done     chan struct{}
+	// stopOnce guards close(stopCh): two concurrent Stops must not
+	// double-close (the second blocks on once.Do until the first's
+	// close + <-done completes — correct serialization, no panic).
+	stopOnce sync.Once
 }
 
 // NewStore loads the config file at path and starts the poller. interval 0
@@ -73,18 +78,17 @@ func NewDefault() *Store {
 // Get returns the current immutable snapshot.
 func (s *Store) Get() *Runtime { return s.cur.Load() }
 
-// Stop halts the poller and waits for it to exit. Idempotent.
+// Stop halts the poller and waits for it to exit. Safe to call any number of
+// times and from concurrent goroutines. Stores without a poller (NewDefault;
+// NewStore with interval 0) have no ticker to stop and return immediately.
 func (s *Store) Stop() {
-	if s.stopCh == nil {
+	if s.stopCh == nil || s.interval <= 0 {
 		return
 	}
-	select {
-	case <-s.done:
-		return
-	default:
-	}
-	close(s.stopCh)
-	<-s.done
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		<-s.done
+	})
 }
 
 // LoadFile reads, interpolates, parses, and resolves the config at path.

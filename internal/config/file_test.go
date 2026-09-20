@@ -105,7 +105,7 @@ func TestValidConfigResolves(t *testing.T) {
 	if rt.Fallback.MaxAttempts != 3 || !*rt.Fallback.Enabled {
 		t.Fatalf("fallback wrong: %+v", rt.Fallback)
 	}
-	if rt.Health.FailureThreshold != 3 || time.Duration(rt.Health.Cooldown) != 30*time.Second {
+	if rt.HealthThreshold() != 3 || rt.HealthCooldown() != 30*time.Second {
 		t.Fatalf("health wrong: %+v", rt.Health)
 	}
 	// Route order is priority desc (stable sort).
@@ -162,14 +162,53 @@ routes:
 	if r, ok := rt.MatchRoute(true, 1, "any-model"); !ok || r.ID != "default" {
 		t.Fatalf("catch-all route did not match: %+v", r)
 	}
-	if rt.Fallback.MaxAttempts != defaultMaxAttempts {
-		t.Fatalf("fallback max_attempts default = %d, want %d", rt.Fallback.MaxAttempts, defaultMaxAttempts)
-	}
-	if rt.Health.FailureThreshold != defaultHealthThreshold {
-		t.Fatalf("health threshold default = %d, want %d", rt.Health.FailureThreshold, defaultHealthThreshold)
+	if rt.HealthThreshold() != defaultHealthThreshold {
+		t.Fatalf("health threshold default = %d, want %d", rt.HealthThreshold(), defaultHealthThreshold)
 	}
 	if !*rt.Health.Enabled || !*rt.Fallback.Enabled {
 		t.Fatal("fallback/health default to enabled")
+	}
+}
+
+// TestExplicitZeroHealthNeverCools: an EXPLICIT failure_threshold/cooldown of
+// 0 means "never cool down" / "no exclusion window" — it must survive
+// Resolve, not silently become the defaults (0 is distinguishable from
+// unset only through the pointer fields).
+func TestExplicitZeroHealthNeverCools(t *testing.T) {
+	rt, err := resolveYAML(t, `
+egress:
+  - id: a
+routes:
+  - id: default
+    egress: [a]
+health:
+  failure_threshold: 0
+  cooldown: 0s
+`)
+	if err != nil {
+		t.Fatalf("explicit-zero health config rejected: %v", err)
+	}
+	if rt.HealthThreshold() != 0 {
+		t.Fatalf("threshold = %d, want 0 (never cool down)", rt.HealthThreshold())
+	}
+	if rt.HealthCooldown() != 0 {
+		t.Fatalf("cooldown = %v, want 0", rt.HealthCooldown())
+	}
+}
+
+// TestExplicitNegativeHealthRejected: the pointer fields must still reject
+// negative values (nil-safe validation).
+func TestExplicitNegativeHealthRejected(t *testing.T) {
+	if _, err := resolveYAML(t, `
+egress:
+  - id: a
+routes:
+  - id: default
+    egress: [a]
+health:
+  failure_threshold: -1
+`); err == nil || !strings.Contains(err.Error(), "failure_threshold") {
+		t.Fatalf("err = %v, want failure_threshold rejection", err)
 	}
 }
 

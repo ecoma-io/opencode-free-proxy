@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"time"
 
 	"opencode-free-proxy/internal/config"
 )
@@ -36,6 +37,23 @@ func (d *socks5Dialer) DialContext(ctx context.Context, _ string, addr string) (
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
 	}
+	// Bound the WHOLE handshake: the net.Dialer timeout covers only the TCP
+	// connect, and a proxy that accepts then never answers would otherwise
+	// strand the dial goroutine past any caller deadline (the HTTPS
+	// transport's ResponseHeaderTimeout never starts — Client.Do has not
+	// returned yet). Reads/watch below have no ctx of their own, hence the
+	// watcher: ctx cancellation mid-handshake closes the conn, aborting the
+	// in-flight ReadFull. The deadline clears once the tunnel is established.
+	_ = conn.SetDeadline(time.Now().Add(config.ConnectTimeout))
+	handshakeDone := make(chan struct{})
+	defer close(handshakeDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-handshakeDone:
+		}
+	}()
 	if err := d.negotiate(ctx, conn); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -44,6 +62,7 @@ func (d *socks5Dialer) DialContext(ctx context.Context, _ string, addr string) (
 		_ = conn.Close()
 		return nil, err
 	}
+	_ = conn.SetDeadline(time.Time{}) // caller owns the conn from here
 	return conn, nil
 }
 

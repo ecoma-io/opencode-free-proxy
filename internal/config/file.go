@@ -128,11 +128,14 @@ type FallbackPolicy struct {
 
 // HealthPolicy governs the runtime health registry (never part of the
 // immutable config snapshot's decisions — it is runtime state keyed by
-// egress id, tuned by these fields).
+// egress id, tuned by these fields). Threshold/cooldown are pointers so an
+// explicit 0 is distinguishable from "unset": 0 means "never cool down"
+// (respectively "no exclusion window"), whereas an omitted field takes
+// defaultHealthThreshold/defaultHealthCooldown at Resolve.
 type HealthPolicy struct {
-	Enabled          *bool    `yaml:"enabled,omitempty"`
-	FailureThreshold int      `yaml:"failure_threshold,omitempty"`
-	Cooldown         Duration `yaml:"cooldown,omitempty"`
+	Enabled          *bool     `yaml:"enabled,omitempty"`
+	FailureThreshold *int      `yaml:"failure_threshold,omitempty"`
+	Cooldown         *Duration `yaml:"cooldown,omitempty"`
 }
 
 // File is the OFP_CONFIG YAML document.
@@ -329,13 +332,30 @@ func (f *File) Validate() error {
 	if f.Fallback.MaxAttempts < 0 {
 		return fmt.Errorf("fallback: max_attempts must be >= 0 (0 = default 3)")
 	}
-	if f.Health.FailureThreshold < 0 {
+	if f.Health.FailureThreshold != nil && *f.Health.FailureThreshold < 0 {
 		return fmt.Errorf("health: failure_threshold must be >= 0 (0 = never cool down)")
 	}
-	if f.Health.Cooldown < 0 {
+	if f.Health.Cooldown != nil && *f.Health.Cooldown < 0 {
 		return fmt.Errorf("health: cooldown must be >= 0")
 	}
 	return nil
+}
+
+// HealthThreshold returns the effective failure threshold (default applied
+// when the field is unset; explicit 0 survives as "never cool down").
+func (rt *Runtime) HealthThreshold() int {
+	if rt.Health.FailureThreshold == nil {
+		return defaultHealthThreshold
+	}
+	return *rt.Health.FailureThreshold
+}
+
+// HealthCooldown is the effective cooldown, mirroring HealthThreshold.
+func (rt *Runtime) HealthCooldown() time.Duration {
+	if rt.Health.Cooldown == nil {
+		return defaultHealthCooldown
+	}
+	return time.Duration(*rt.Health.Cooldown)
 }
 
 // validateProxy checks the proxy type/scheme pair. socks5h is rejected BY
@@ -447,36 +467,40 @@ func (f *File) Resolve() (*Runtime, error) {
 		rt.Fallback.MaxAttempts = f.Fallback.MaxAttempts
 	}
 	rt.Health = HealthPolicy{
-		Enabled:          new(f.Health.Enabled == nil || *f.Health.Enabled),
-		FailureThreshold: defaultHealthThreshold,
-		Cooldown:         Duration(defaultHealthCooldown),
+		Enabled: new(f.Health.Enabled == nil || *f.Health.Enabled),
 	}
-	if f.Health.FailureThreshold > 0 {
-		rt.Health.FailureThreshold = f.Health.FailureThreshold
+	if f.Health.FailureThreshold != nil {
+		v := *f.Health.FailureThreshold
+		rt.Health.FailureThreshold = &v
 	}
-	if f.Health.Cooldown > 0 {
-		rt.Health.Cooldown = f.Health.Cooldown
+	if f.Health.Cooldown != nil {
+		c := *f.Health.Cooldown
+		rt.Health.Cooldown = &c
 	}
 	return rt, nil
 }
 
 // DefaultRuntime is the no-config snapshot: one implicit direct egress, a
 // catch-all route, fallback capped at the single attempt. Requests behave
-// byte-identically to the pre-routing proxy.
+// byte-identically to the pre-routing proxy — in particular health gating
+// is DISABLED here: the old proxy had no failure-threshold outage, and a
+// config-less deployment must not acquire one after 3 connection errors.
+// File-driven configs opt into health by default (Resolve), which is the
+// multi-egress feature's intent.
 func DefaultRuntime() *Runtime {
 	return &Runtime{
 		File: File{
 			Egress:   []Egress{{ID: "direct", Weight: new(defaultWeight)}},
 			Routes:   []Route{{ID: "default", Egress: []string{"direct"}, Strategy: defaultStrategy}},
 			Fallback: FallbackPolicy{Enabled: new(true), MaxAttempts: 1},
-			Health:   HealthPolicy{Enabled: new(true), FailureThreshold: defaultHealthThreshold, Cooldown: Duration(defaultHealthCooldown)},
+			Health:   HealthPolicy{Enabled: new(false)},
 		},
 		byID: map[string]*Egress{"direct": {ID: "direct", Weight: new(defaultWeight)}},
 		routes: []Route{
 			{ID: "default", Egress: []string{"direct"}, Strategy: defaultStrategy},
 		},
 		Fallback: FallbackPolicy{Enabled: new(true), MaxAttempts: 1},
-		Health:   HealthPolicy{Enabled: new(true), FailureThreshold: defaultHealthThreshold, Cooldown: Duration(defaultHealthCooldown)},
+		Health:   HealthPolicy{Enabled: new(false)},
 		Direct:   true,
 	}
 }

@@ -265,3 +265,52 @@ func TestDefaultStoreNoPoller(t *testing.T) {
 		t.Fatal("default runtime wrong")
 	}
 }
+
+// TestStoreNoPollerStopReturns: a NewStore with interval 0 never starts the
+// poller, so its done channel never closes — Stop must return immediately
+// instead of blocking forever (issue #3 review).
+func TestStoreNoPollerStopReturns(t *testing.T) {
+	dir := t.TempDir()
+	p := writeConfig(t, dir, "cfg.yaml", `
+egress: [{id: a}]
+routes: [{id: r, egress: [a]}]
+`)
+	s, err := NewStore(p, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		s.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop on a poller-less store must return promptly")
+	}
+}
+
+// TestStoreConcurrentStopNoPanic: concurrent Stops must not double-close
+// stopCh (sync.Once serializes; the waiters block on the winner's close).
+func TestStoreConcurrentStopNoPanic(t *testing.T) {
+	dir := t.TempDir()
+	p := writeConfig(t, dir, "cfg.yaml", `
+egress: [{id: a}]
+routes: [{id: r, egress: [a]}]
+`)
+	s, err := NewStore(p, pollInterval, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.Stop()
+		}()
+	}
+	wg.Wait()
+	s.Stop() // must still be safe after the concurrent batch
+}

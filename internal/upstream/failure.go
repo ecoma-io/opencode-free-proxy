@@ -95,7 +95,11 @@ func (e *proxyAuthError) Error() string { return e.msg }
 
 // classifyNetErr maps a transport error to its class. A canceled context
 // wins over everything (the request is gone); proxy-auth markers beat
-// generic timeouts; timeouts beat connection errors (net.Error.Timeout).
+// generic timeouts; timeouts beat connection errors (net.Error.Timeout). The
+// 407 check carries BOTH the numeric code and the canonical reason phrase:
+// Go stdlib proxy errors embed the status line ("407 Proxy Authentication
+// Required" — net/http transport), but the phrase wording is not a stable
+// API contract, so the numeric marker is the durable half of the match.
 func classifyNetErr(ctx context.Context, err error) Class {
 	if ctx.Err() != nil {
 		return ClassContextCanceled
@@ -104,7 +108,7 @@ func classifyNetErr(ctx context.Context, err error) Class {
 	if errors.As(err, &pae) {
 		return ClassProxyAuthError
 	}
-	if strings.Contains(err.Error(), "Proxy Authentication Required") {
+	if strings.Contains(err.Error(), "407") || strings.Contains(err.Error(), "Proxy Authentication Required") {
 		return ClassProxyAuthError
 	}
 	var ne net.Error
