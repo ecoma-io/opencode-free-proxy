@@ -5,9 +5,21 @@
 # /healthz on $PORT).
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY . .
 ARG VERSION=0.1.0-dev
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
+# Dependency layer before source: it only re-runs when go.mod/go.sum change.
+# The module cache (/go/pkg/mod) and compile cache (/root/.cache/go-build)
+# are BuildKit cache mounts, not layers — they persist across builds, so a
+# source-only edit reuses both the downloaded modules and the already
+# compiled packages. Cache-mount contents never enter an image layer, so
+# the scratch runtime stage below is unchanged.
+COPY go.mod go.sum ./
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
+    --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false \
     -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/opencode-free-proxy ./cmd/server
 
