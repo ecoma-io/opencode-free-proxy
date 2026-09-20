@@ -213,3 +213,36 @@ func envMs(key string, def time.Duration) time.Duration {
 	}
 	return def
 }
+
+// Hardening bounds for the forced SSE→JSON conversion and the /v1/models
+// fetch. These are Go-side defensive bounds with no JS counterpart — Node's
+// undici streams are backpressured and cancellable, so the JS handlers read
+// upstream bodies unbounded (sseToJsonHandler.js:306
+// `await providerResponse.text()`); this process must not.
+const (
+	// MaxForcedSSEBytes caps how many upstream SSE bytes the forced
+	// SSE→JSON aggregation will buffer for one request (the non-streaming
+	// client path). Sized generously above any real conversation
+	// aggregation — a full agentic turn is a few hundred KB of SSE even
+	// with heavy tool-call arguments — while a hostile or broken upstream
+	// can no longer grow the buffer without limit. Exceeding it answers the
+	// client 502 exactly like any other forced-conversion failure.
+	MaxForcedSSEBytes = 64 << 20
+
+	// MaxResponsesOutputIndex is the highest `output_index` the Responses
+	// SSE→JSON aggregation accepts for an output item
+	// (streamToJsonConverter.js:29 stores it, :89-93 fills placeholders
+	// densely up to the max index). Real Responses streams carry a few
+	// dozen items at most; an index beyond this bound is hostile or broken,
+	// and honoring it would make the dense placeholder fill allocate
+	// super-linearly. Events beyond the bound are dropped (the rest of the
+	// response still aggregates; see internal/relay/nonstream.go).
+	MaxResponsesOutputIndex = 4096
+
+	// ModelsFetchTimeout bounds the whole /v1/models upstream fetch (the
+	// static-registry fallback keeps the endpoint fail-open). It was a
+	// 10 s client timeout before the handler started reusing the shared
+	// direct client, whose transports carry only a response-HEADER
+	// deadline (ConnectTimeout) — this restores a total bound.
+	ModelsFetchTimeout = 10 * time.Second
+)
