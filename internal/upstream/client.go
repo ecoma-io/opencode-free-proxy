@@ -19,8 +19,30 @@ import (
 	"opencode-free-proxy/internal/jsonx"
 )
 
+// maxErrorBodyBytes caps how much of a terminal error response is read for
+// the client-facing message (parseUpstreamError) and how much of a rejected
+// response is drained before a retry (drainAndClose). Go-side transport
+// hygiene, NOT an open-sse constant — JS reads error bodies unbounded
+// (utils/error.js:61 `await response.text()`); the cap exists because Go owns
+// the process memory the JS runtime would happily commit to a hostile
+// upstream. It lives here rather than in internal/config for the same reason
+// as connect.go's maxConnectHeaderBytes.
+const maxErrorBodyBytes = 1 << 20
+
 // Client performs the retrying upstream call (executors/base.js execute, the
 // single-URL shape this proxy uses).
+//
+// Redirects: HTTP is left with CheckRedirect unset, so http.Client follows up
+// to 10 redirects — faithful parity with the JS source, which passes no
+// `redirect:` option anywhere in the executor path (base.js:144-149 sends
+// only method/headers/body/signal through proxyFetch.js, which forwards the
+// options object untouched to native fetch — utils/proxyFetch.js:203-257 —
+// whose default is `redirect: "follow"`; the single `redirect: "manual"` in
+// open-sse is the image fetch, translator/concerns/image.js:97-98, a
+// different boundary). Accepted consequence: a 307/308 re-POSTs the body —
+// including `Authorization: Bearer public` and the x-opencode-* headers — to
+// the redirect target, exactly as the JS router would (pinned by
+// TestRedirectFollowedLikeJSFetch).
 type Client struct {
 	// HTTP is the main transport: direct for unproxied and socks5 egresses,
 	// Go's absolute-form proxy path for HTTP origins behind an HTTP(S)
@@ -121,6 +143,15 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 			}
 			if !c.tryRetry(ctx, &used, config.RetryRules[502]) {
+				// Surfacing the raw transport text is PARITY, topology
+				// exposure included: base.js:179 rethrows the raw fetch
+				// error, chatCore.js:373-375 hands it to formatProviderError,
+				// and utils/error.js:139-147 deliberately renders
+				// `[502]: ${error.message}${cause}` with the comment "Expose
+				// low-level cause (e.g. UND_ERR_SOCKET, ECONNRESET, ETIMEDOUT)
+				// for diagnosing fetch failures" — so the JS client envelope
+				// carries the dial address exactly as this message carries the
+				// (credential-redacted) egress host:port. Accepted parity.
 				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 			}
 			continue
@@ -134,9 +165,17 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 			}
 		}
 		// Non-retryable (or retries exhausted): parse the final response the
-		// way parseUpstreamError does.
+		// way parseUpstreamError does. The read is CAPPED — a deliberate
+		// divergence from JS (utils/error.js:61 `await response.text()` is
+		// unbounded): a hostile upstream/proxy streaming an endless 4xx body
+		// must not grow this process without limit before the text becomes the
+		// client-facing envelope. Semantics are unchanged for any body under
+		// the cap (every real upstream error body is); an over-cap body
+		// surfaces truncated, and since the truncation is no longer valid JSON
+		// parseUpstreamError falls back to the raw capped text — the envelope
+		// stays bounded by construction. Same bound as drainAndClose.
 		if resp.StatusCode >= 400 {
-			raw, _ := io.ReadAll(resp.Body)
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 			_ = resp.Body.Close()
 			return nil, parseUpstreamError(resp.StatusCode, raw), classifyStatusFor(resp.StatusCode)
 		}
@@ -145,9 +184,11 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 }
 
 // drainAndClose reads the rest of a rejected response so the connection can
-// be reused, then closes it.
+// be reused, then closes it. Bounded by maxErrorBodyBytes like the terminal
+// read: a hostile upstream must not be able to pin this goroutine's memory
+// past the drain either.
 func drainAndClose(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyBytes))
 	_ = resp.Body.Close()
 }
 
@@ -253,6 +294,13 @@ func parseUpstreamError(status int, body []byte) *UpstreamError {
 }
 
 // BuildErrorBody ports buildErrorBody: the OpenAI-compatible error envelope.
+// Statuses MISSING from config.ErrorTypes — 407-as-response-status, 426, 418,
+// … — are PARITY with the JS table (config/errorConfig.js ERROR_TYPES has no
+// rows for them either): error.js:10-13 falls back to
+// `{type:"server_error",code:"internal_server_error"}` for >= 500 and
+// `{type:"invalid_request_error",code:""}` otherwise. That is how a 407 that
+// arrives as a response status surfaces typed invalid_request_error with an
+// empty code — deliberate, verified parity, not an omission.
 func BuildErrorBody(statusCode int, message string) map[string]any {
 	info, known := config.ErrorTypes[statusCode]
 	if !known {
