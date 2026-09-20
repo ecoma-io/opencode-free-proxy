@@ -108,13 +108,15 @@ func (e *proxyAuthError) Error() string { return e.msg }
 // generic timeouts; timeouts beat connection errors (net.Error.Timeout).
 //
 // There is deliberately NO error-text probing — not even the canonical
-// "Proxy Authentication Required" reason phrase. Go's stdlib CONNECT (used
-// only by transports this package no longer builds for proxied https) strips
-// the numeric code and keeps only the phrase, but any transport error may
-// carry arbitrary text (an IPv6 literal with a :407 octet, a port, a
-// hostname) that a substring probe would misclassify. Ownership of a 407 is
-// decided where the proxy protocol is spoken — the typed boundary in
-// connect.go/socks5.go — never by inspecting the message (issue #6).
+// "Proxy Authentication Required" reason phrase. (Go's own proxy support,
+// still used for plain-http origins, strips the numeric code of a refused
+// CONNECT and keeps only the phrase — but this package no longer lets
+// stdlib speak CONNECT at all: proxied https rides the typed boundary in
+// connect.go.) Beyond that, any transport error may carry arbitrary text
+// (an IPv6 literal with a :407 octet, a port, a hostname) that a substring
+// probe would misclassify. Ownership of a 407 is decided where the proxy
+// protocol is spoken — the typed boundary in connect.go/socks5.go — never
+// by inspecting the message (issue #6).
 func classifyNetErrFor(ctx context.Context, err error) Class {
 	if ctx.Err() != nil {
 		return ClassContextCanceled
