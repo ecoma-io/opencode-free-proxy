@@ -129,6 +129,15 @@ The semantics agents most often get wrong:
    non-iterable `choices` chunk drops, shared retry budget across statuses).
 6. **Fail-open vs fail-closed is part of the contract** (UA cache warm probe,
    models fallback to the static registry, 429 never retried). Keep it.
+7. **Process-wide state has a lifecycle, not just a shape** (README "Process
+   wide state lifecycles"): health state is reclaimed once per generation and
+   never under a live request's pin (`health.Registry.Pin` at snapshot pin
+   time); scheduler rotation migrates by fingerprint (preserve on equivalent
+   reload, deterministic reset on change, prune on removal); the transport
+   cache is a lookup, not an ownership registry — eviction never revokes a
+   request's held `*Client` nor closes its active connection. When adding a
+   fourth piece of process-wide state, give it the same three answers:
+   what survives a reload, what resets, who still needs it.
 
 ## Environment
 

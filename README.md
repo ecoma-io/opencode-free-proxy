@@ -263,10 +263,38 @@ Responses carry `X-OFP-Egress: <id>` naming the egress that served them
 
 Transports are cached per egress by transport signature, so a reload that
 keeps a proxy URL reuses the same immutable client while a URL swap simply
-adds a new entry (the old client lives until the in-flight requests holding
-it are done, then the once-per-generation prune drops it). Health STATE also
-survives swaps — it is keyed by id + signature — while the health POLICY each
-request applies is pinned to that request's snapshot.
+adds a new entry. Health STATE also survives swaps — it is keyed by
+id + signature — while the health POLICY each request applies is pinned to
+that request's snapshot.
+
+### Process-wide state lifecycles (health, rotation, transports)
+
+Three pieces of process-wide state meet every reload, each with its own
+migration rule — never reset-everything:
+
+- **Health state** (`internal/health`) — keyed by egress id + transport
+  signature. A policy-only reload names the same identities, so failure
+  history continues across the swap. A proxy swap starts a fresh identity;
+  the abandoned one is reclaimed by the once-per-generation maintenance
+  (`onGeneration`), but never while an in-flight request still pins it:
+  every request pins its matched route's identities at snapshot time and
+  releases them when the request ends, so state a request is mid-way through
+  adjudicating can never vanish under it. Reclaim is deterministic (one pass
+  per generation) — never a timer.
+- **Scheduler rotation** (`internal/routing`) — per-route round-robin cursor
+  and smooth-WRR current-weights are fingerprinted by route id + strategy +
+  ordered egress membership + effective weights (weights only matter under
+  `weighted_round_robin`). A reload with the same fingerprint keeps rotation
+  continuity; any fingerprint change resets that route's rotation
+  deterministically (this is what keeps the weight-0-never-heads invariant
+  true across reloads); a removed route's state is pruned in the same
+  once-per-generation pass.
+- **Transports** (`internal/router`) — cached by signature. Cache membership
+  is NOT request ownership: a request owns the `*Client` it resolved by
+  reference, so eviction cannot fail or destabilize it. Eviction closes the
+  old transport's idle connections immediately (deterministic, observable)
+  and the stale snapshot self-heals by rebuilding the client on its next
+  dial. An active connection is never closed by the prune.
 
 Defaults with a config file: health enabled (`failure_threshold` 3, `cooldown`
 30s), fallback `max_attempts` 3 — set `health.enabled: false` to disable
