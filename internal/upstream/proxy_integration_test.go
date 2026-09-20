@@ -349,6 +349,16 @@ type socks5Fake struct {
 	method  byte // greet reply: 0x00 no-auth, 0x02 auth, 0xff none
 	authRep byte // RFC 1929 status reply when auth was negotiated
 	rep     byte // CONNECT reply (0x00 success, 0x02 not-allowed, ...)
+	// gotConnect records the CONNECT request exactly as it hit the wire
+	// (atyp + address bytes + port) — the local-DNS/atyp assertions read it.
+	gotConnect atomic.Pointer[socks5ConnectRecord]
+}
+
+// socks5ConnectRecord is the recorded CONNECT wire shape.
+type socks5ConnectRecord struct {
+	atyp  byte
+	addrs []byte
+	port  int
 }
 
 func newSocks5Fake(t *testing.T, method, authRep, rep byte) *socks5Fake {
@@ -445,6 +455,11 @@ func (f *socks5Fake) handle(conn net.Conn) error {
 	if _, err := io.ReadFull(conn, port); err != nil {
 		return err
 	}
+	f.gotConnect.CompareAndSwap(nil, &socks5ConnectRecord{
+		atyp:  req[3],
+		addrs: append([]byte(nil), addr...),
+		port:  int(port[0])<<8 | int(port[1]),
+	})
 
 	// 0.0.0.0:0 bind address
 	if _, err := conn.Write([]byte{0x05, f.rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {

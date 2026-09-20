@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -157,6 +158,164 @@ func TestExecuteBudgetExactPostCounts(t *testing.T) {
 	}
 	if got := f.rec.total(); got != 5 {
 		t.Fatalf("total POSTs = %d, want 5", got)
+	}
+}
+
+// TestExecute503ExhaustsMatrixThenFallsBack: the executor-level twin of the
+// client-level 503 row — the FULL 503 matrix (1 initial + 3 retries) runs
+// INSIDE the attempt before the executor moves to the next egress, which pays
+// exactly one POST.
+func TestExecute503ExhaustsMatrixThenFallsBack(t *testing.T) {
+	f := newHandlerFixture(t, map[string]http.HandlerFunc{
+		"a": statusHandler(http.StatusServiceUnavailable), // 503 × forever
+		"b": statusHandler(http.StatusOK),
+	})
+	defer f.Close()
+
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr=%v resp=%v, want success on b", uerr, resp)
+	}
+	_ = resp.Body.Close()
+	if id != "b" || attempts != 2 || class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d class=%s, want b/2/success", id, attempts, class)
+	}
+	if got := f.rec.count("a"); got != 1+config.RetryRules[503].Attempts {
+		t.Fatalf("a POSTs = %d, want %d (full 503 matrix before fallback)", got, 1+config.RetryRules[503].Attempts)
+	}
+	if got := f.rec.count("b"); got != 1 {
+		t.Fatalf("b POSTs = %d, want 1", got)
+	}
+}
+
+// TestExecute504ExhaustsMatrixThenFallsBack: same shape for 504 — its matrix
+// is smaller (1 initial + 2 retries) and must be exhausted INSIDE the attempt
+// before fallback.
+func TestExecute504ExhaustsMatrixThenFallsBack(t *testing.T) {
+	f := newHandlerFixture(t, map[string]http.HandlerFunc{
+		"a": statusHandler(http.StatusGatewayTimeout), // 504 × forever
+		"b": statusHandler(http.StatusOK),
+	})
+	defer f.Close()
+
+	resp, id, attempts, class, uerr := f.exec.Execute(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
+	if uerr != nil || resp == nil {
+		t.Fatalf("uerr=%v resp=%v, want success on b", uerr, resp)
+	}
+	_ = resp.Body.Close()
+	if id != "b" || attempts != 2 || class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d class=%s, want b/2/success", id, attempts, class)
+	}
+	if got := f.rec.count("a"); got != 1+config.RetryRules[504].Attempts {
+		t.Fatalf("a POSTs = %d, want %d (full 504 matrix before fallback)", got, 1+config.RetryRules[504].Attempts)
+	}
+	if got := f.rec.count("b"); got != 1 {
+		t.Fatalf("b POSTs = %d, want 1", got)
+	}
+}
+
+// TestExecuteClientErrorNeverFallsBack: 400/404 are verdicts about the
+// REQUEST (ClassClientError — FallbackAllowed false). One egress, one POST,
+// and the healthy fallback target is never dialed: another egress would
+// repeat the rejection verbatim.
+func TestExecuteClientErrorNeverFallsBack(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
+		f := newHandlerFixture(t, map[string]http.HandlerFunc{
+			"a": statusHandler(status),
+			"b": statusHandler(http.StatusOK),
+		})
+
+		resp, id, attempts, class, uerr := f.exec.Execute(
+			context.Background(), f.servers["a"].URL,
+			func() map[string]string { return map[string]string{} },
+			[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
+		f.Close()
+		if resp != nil || uerr == nil {
+			t.Fatalf("%d: resp=%v uerr=%v, want the terminal client-error verdict", status, resp, uerr)
+		}
+		if uerr.Status != status {
+			t.Fatalf("%d: surfaced status = %d", status, uerr.Status)
+		}
+		if class != ClassClientError {
+			t.Fatalf("%d: class = %s, want ClassClientError", status, class)
+		}
+		if attempts != 1 || id != "a" {
+			t.Fatalf("%d: attempts=%d id=%q, want exactly one attempt on a", status, attempts, id)
+		}
+		if got := f.rec.count("b"); got != 0 {
+			t.Fatalf("%d: b was dialed %d times — a client-error verdict must never fall back", status, got)
+		}
+	}
+}
+
+// TestExecuteContextCancelDuringRetrySleepStopsDialing: the request ctx dies
+// inside the client's retry sleep (the gap between attempt 1's verdict and
+// attempt 2). The next attempt must fail WITHOUT touching the wire (the
+// transport checks the dead ctx before dialing), classify as
+// ClassContextCanceled, and the executor must not fall back — there is
+// nobody left to deliver a response to.
+func TestExecuteContextCancelDuringRetrySleepStopsDialing(t *testing.T) {
+	f := newHandlerFixture(t, map[string]http.HandlerFunc{
+		"a": statusHandler(http.StatusBadGateway),
+		"b": statusHandler(http.StatusOK),
+	})
+	defer f.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var dials atomic.Int64
+	addrA := f.servers["a"].Listener.Addr().String()
+	a := NewClient()
+	a.Sleep = func(time.Duration) { cancel() } // the ctx dies mid-retry-gap
+	a.HTTP.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			dials.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, addrA)
+		},
+	}
+	addrB := f.servers["b"].Listener.Addr().String()
+	b := NewClient()
+	b.Sleep = func(time.Duration) {}
+	b.HTTP.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			dials.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, addrB)
+		},
+	}
+	clients := map[string]*Client{"a": a, "b": b}
+	exec := NewExecutor(func(e *config.Egress) (*Client, bool) {
+		c, ok := clients[e.ID]
+		return c, ok
+	}, f.health, f.slots)
+
+	resp, id, attempts, class, uerr := exec.Execute(
+		ctx, f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
+	if resp != nil {
+		t.Fatal("a canceled request must not return a response")
+	}
+	if class != ClassContextCanceled {
+		t.Fatalf("class = %s, want ClassContextCanceled", class)
+	}
+	if attempts != 1 || id != "a" {
+		t.Fatalf("attempts=%d id=%q, want the single pre-cancel attempt on a", attempts, id)
+	}
+	if uerr == nil || !strings.Contains(uerr.Message, "context canceled") {
+		t.Fatalf("uerr = %+v, want the canceled-context error", uerr)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("dials = %d, want 1 — the post-cancel attempt must never reach the wire", got)
+	}
+	if got := f.rec.count("b"); got != 0 {
+		t.Fatalf("b POSTs = %d — a canceled request must not fall back", got)
 	}
 }
 
