@@ -77,6 +77,28 @@ func TestModelAllowed(t *testing.T) {
 	}
 }
 
+// TestModelAllowedBracketAndEscape: the model gates run the FULL path.Match
+// syntax, not a star-only subset — [..] classes match one listed byte, "\"
+// escapes a metacharacter into a literal, "?" matches one byte. Pinned in
+// both directions so the doc comment cannot drift from the matcher again.
+func TestModelAllowedBracketAndEscape(t *testing.T) {
+	if !ModelAllowed([]string{"muse-[abc]-free"}, "muse-b-free") {
+		t.Fatal("character class must match a listed member")
+	}
+	if ModelAllowed([]string{"muse-[abc]-free"}, "muse-d-free") {
+		t.Fatal("character class must not match an unlisted member")
+	}
+	if !ModelAllowed([]string{`muse-\*-free`}, "muse-*-free") {
+		t.Fatal("escaped * must match a literal *")
+	}
+	if ModelAllowed([]string{`muse-\*-free`}, "muse-x-free") {
+		t.Fatal("escaped * must not act as a wildcard")
+	}
+	if !ModelAllowed([]string{"muse-?-free"}, "muse-1-free") {
+		t.Fatal("? must match exactly one character")
+	}
+}
+
 func TestPlanEmptyHeads(t *testing.T) {
 	rt := config.DefaultRuntime()
 	p := NewScheduler().Plan(rt, route("r", config.StrategyRoundRobin), nil)
@@ -283,5 +305,83 @@ func TestPlanWeightedRRZeroWeightNeverScheduled(t *testing.T) {
 		if p.Attempts[0] != "b" {
 			t.Fatalf("round %d: head = %q, want b (weight-0 a must never be scheduled)", i, p.Attempts[0])
 		}
+	}
+}
+
+// TestPlanWeightedRRZeroWeightNeverHeadsAcrossEligibilityFlap: the head-set
+// flap repro of the weight-0 invariant violation. Eligibility (health
+// cooldown, slots, model gate, streaming) changes the head set WITHOUT a
+// reload, so the fingerprint — and with it the current_weight reset — never
+// fires, and smooth-WRR's sum-zero property only holds over one FIXED head
+// set. Route [b w0, a w1, c w1] with b first (the strict `>` tie-break lets
+// an earlier candidate win a tie, which is exactly how b won): phase 1 has b
+// cooling, so heads [a c] for one round drive current_weight to {a:-1,c:1};
+// phase 2 has b back and c gone, heads [b a]. With b inside the selection
+// pool b polls 0 > -1 and a then ties it at 0 (not >) — weight-0 b heads
+// while a is eligible. The exclusion of weight-0 members from selection
+// keeps a the head regardless of any stale totals.
+func TestPlanWeightedRRZeroWeightNeverHeadsAcrossEligibilityFlap(t *testing.T) {
+	rt := wrrRuntime([]string{"b", "a", "c"}, egress("b", 0), egress("a", 1), egress("c", 1))
+	r := route("r", config.StrategyWeightedRR, "b", "a", "c")
+	s := NewScheduler()
+	if h := s.Plan(rt, r, []string{"a", "c"}).Attempts[0]; h != "a" {
+		t.Fatalf("phase 1 head = %q, want a (cw now {a:-1, c:1})", h)
+	}
+	p := s.Plan(rt, r, []string{"b", "a"})
+	if p.Attempts[0] != "a" {
+		t.Fatalf("phase 2 head = %q, want a (weight-0 b must never head while a is eligible)", p.Attempts[0])
+	}
+	if p.Attempts[1] != "b" {
+		t.Fatalf("phase 2 attempts = %v, want [a b] — b keeps its fallback-tail place", p.Attempts)
+	}
+	// And once c returns the rotation continues without b ever heading.
+	for i, want := range []string{"c", "a", "c", "a"} {
+		if h := s.Plan(rt, r, []string{"b", "a", "c"}).Attempts[0]; h != want {
+			t.Fatalf("round %d after full head set returns: head = %q, want %q", i, h, want)
+		}
+	}
+}
+
+// TestPlanWeightedRRZeroWeightInFallbackTail: a weight-0 egress stays in the
+// plan's fallback tail at its head-order position and never takes index 0 —
+// and the tail order is deterministic: head, then the remaining heads in
+// route order. Weights a=0, b=2, c=1 give the smooth cycle b c b.
+func TestPlanWeightedRRZeroWeightInFallbackTail(t *testing.T) {
+	rt := weightedRuntime(egress("a", 0), egress("b", 2), egress("c", 1))
+	r := route("r", config.StrategyWeightedRR, "a", "b", "c")
+	s := NewScheduler()
+	want := [][3]string{
+		{"b", "a", "c"},
+		{"c", "a", "b"},
+		{"b", "a", "c"},
+	}
+	for i, w := range want {
+		p := s.Plan(rt, r, []string{"a", "b", "c"})
+		for j := range w {
+			if p.Attempts[j] != w[j] {
+				t.Fatalf("round %d: attempts = %v, want %v", i, p.Attempts, w)
+			}
+		}
+	}
+}
+
+// TestPlanWeightedRRAllZeroHeadsYieldEmptyPlan: config validation rejects a
+// WRR route with no positive-weight member ("needs at least one egress with
+// weight > 0"); the runtime analogue — every positive-weight member
+// temporarily ineligible, only weight-0 survivors left in the head set —
+// answers the same way. No schedulable head exists, so Plan yields an empty
+// plan (the executor's synthetic 502 envelope, the same verdict an empty
+// head set produces) and, like the empty-head-set path, touches no rotation
+// state.
+func TestPlanWeightedRRAllZeroHeadsYieldEmptyPlan(t *testing.T) {
+	rt := wrrRuntime([]string{"a", "b"}, egress("a", 1), egress("b", 0))
+	r := route("r", config.StrategyWeightedRR, "a", "b")
+	s := NewScheduler()
+	p := s.Plan(rt, r, []string{"b"}) // a cooling: only weight-0 b eligible
+	if len(p.Attempts) != 0 || len(p.Egresses) != 0 {
+		t.Fatalf("all-weight-0 head set must yield an empty plan, got %+v", p)
+	}
+	if len(s.state) != 0 {
+		t.Fatalf("an unservable plan must touch no rotation state, store holds %d routes", len(s.state))
 	}
 }

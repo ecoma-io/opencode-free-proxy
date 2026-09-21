@@ -342,8 +342,12 @@ func matchHolds(m Match, streaming bool, bodyBytes int64, model string) bool {
 }
 
 // globMatch reports whether the model id matches one glob pattern. Exact ids
-// match themselves; "*" is the only wildcard (path.Match semantics, no
-// expression language).
+// match themselves; otherwise the full path.Match syntax applies — "*"
+// (any run of non-separator bytes), "?" (one non-separator byte), "[...]"
+// character classes and "\" escapes. Behavior is intentionally the whole
+// path.Match, not a star-only subset: the pattern is compiled by the same
+// standard library call here and at every other model gate, so all of them
+// agree on what a pattern means.
 func globMatch(pattern, model string) bool {
 	if pattern == model {
 		return true

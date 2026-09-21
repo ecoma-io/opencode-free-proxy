@@ -238,6 +238,67 @@ func TestSchedulerStateResetsWhenWeightChanges(t *testing.T) {
 	}
 }
 
+// TestSchedulerStaleSnapshotDoesNotClobberNewerState: a request holds its
+// arrival snapshot for its whole lifetime, so it can reach Plan AFTER newer
+// traffic already stored a newer generation's rotation state. The stale
+// write used to key the OLD fingerprint under the route id, so the next
+// current-generation plan saw a mismatch and reset — a spurious rotation
+// restart mid-cycle. Shapes: gen 1 [a w1, c w3], gen 2 flips to [a w3,
+// c w1] (fingerprint change → reset, then the 3:1 cycle a a c a), and the
+// stale gen-1 plan lands after gen 2's second plan. Without the guard that
+// write stores fingerprint(gen 1) and the next gen-2 plan restarts the
+// cycle on a; with it the stale request answers from fresh throwaway state
+// (its own deterministic first pick) and gen 2 continues on c.
+func TestSchedulerStaleSnapshotDoesNotClobberNewerState(t *testing.T) {
+	r := route("r", config.StrategyWeightedRR, "a", "c")
+	rt1 := lifecycleRuntime(t, 1, config.File{
+		Egress: []config.Egress{egress("a", 1), egress("c", 3)},
+		Routes: []config.Route{r},
+	})
+	rt2 := lifecycleRuntime(t, 2, config.File{
+		Egress: []config.Egress{egress("a", 3), egress("c", 1)},
+		Routes: []config.Route{r},
+	})
+	s := NewScheduler()
+	heads := []string{"a", "c"}
+	if h := headOf(s, rt1, r, heads); h != "c" { // gen-1 state {a:1, c:-1}
+		t.Fatalf("gen-1 warm-up head = %q, want c", h)
+	}
+	if h := headOf(s, rt2, r, heads); h != "a" { // reset, cycle position 1
+		t.Fatalf("gen-2 plan 1 head = %q, want a", h)
+	}
+	if h := headOf(s, rt2, r, heads); h != "a" { // cycle position 2 (cw {a:-2, c:2})
+		t.Fatalf("gen-2 plan 2 head = %q, want a", h)
+	}
+	// The stale gen-1 request, planning after gen-2 traffic.
+	stale := s.Plan(rt1, r, heads)
+	if stale.Attempts[0] != "c" {
+		t.Fatalf("stale plan head = %q, want c (deterministic first pick for its own shape)", stale.Attempts[0])
+	}
+	if st, ok := s.state[r.ID]; !ok || st.fingerprint != schedulerFingerprint(r, rt2) {
+		t.Fatalf("stale plan clobbered the newer generation's rotation state: %+v", s.state[r.ID])
+	}
+	if h := headOf(s, rt2, r, heads); h != "c" { // cycle position 3, not a restart
+		t.Fatalf("gen-2 head after the stale plan = %q, want c (a stored old fingerprint would reset and restart on a)", h)
+	}
+
+	// The guard refuses REPLACEMENT, never participation: gen 3 is a
+	// policy-only reload of gen 2's shape (same fingerprint), and a gen-2
+	// request planning after gen-3 traffic still advances the shared
+	// rotation — same shape, same meaning, any generation.
+	rt3 := lifecycleRuntime(t, 3, config.File{
+		Egress:   []config.Egress{egress("a", 3), egress("c", 1)},
+		Routes:   []config.Route{r},
+		Fallback: config.FallbackPolicy{MaxAttempts: 5},
+	})
+	if h := headOf(s, rt3, r, heads); h != "a" { // cycle position 4
+		t.Fatalf("gen-3 head = %q, want a", h)
+	}
+	if h := headOf(s, rt2, r, heads); h != "a" { // cycle position 1 of the next round
+		t.Fatalf("gen-2 head after gen-3 traffic = %q, want a (a same-shape request participates, it is not fenced off)", h)
+	}
+}
+
 // TestSchedulerStateDoesNotLeakAcrossRemovedRoute: once-per-generation
 // pruning (wired into Server.onGeneration) drops a removed route's state, so
 // re-adding a route with the SAME id later starts fresh — a resurrected
