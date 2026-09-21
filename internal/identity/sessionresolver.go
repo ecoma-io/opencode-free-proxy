@@ -2,7 +2,7 @@
 // the conversation-stable session id chain the opencode executor falls back
 // to when the client sends no x-opencode-session header:
 //
-//	client headers/body → accumulated-assistant-text hash → per-connection id
+//	client headers/body → accumulated-assistant-text hash → runtime-store id
 //
 // The stores keep ids stable across requests so upstream prompt caching keeps
 // hitting; entries expire after the TTL.
@@ -87,23 +87,29 @@ var connectionStore = newStore(maxSessions)
 var assistantStore = newStore(maxAssistantSessions)
 
 func init() {
-	// Periodic TTL eviction, mirroring the cleanup interval.
+	// Periodic TTL eviction, mirroring the cleanup interval
+	// (sessionManager.js:19-26).
 	go func() {
 		ticker := time.NewTicker(SessionCleanupEvery)
 		defer ticker.Stop()
 		for range ticker.C {
-			cutoff := time.Now().Add(-SessionTTL)
-			for _, s := range []*store{connectionStore, assistantStore} {
-				s.mu.Lock()
-				for k, e := range s.entries {
-					if e.lastUsed.Before(cutoff) {
-						delete(s.entries, k)
-					}
-				}
-				s.mu.Unlock()
-			}
+			evictExpired(time.Now().Add(-SessionTTL))
 		}
 	}()
+}
+
+// evictExpired is the janitor body shared by the ticker loop and tests:
+// entries whose lastUsed predates cutoff are reclaimed from both stores.
+func evictExpired(cutoff time.Time) {
+	for _, s := range []*store{connectionStore, assistantStore} {
+		s.mu.Lock()
+		for k, e := range s.entries {
+			if e.lastUsed.Before(cutoff) {
+				delete(s.entries, k)
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 // normalizeSessionID trims and length-caps a candidate (normalizeSessionId).
@@ -130,7 +136,11 @@ func extractClaudeCodeSession(body map[string]any) string {
 		return ""
 	}
 	if m := claudeCodeSessionRe.FindStringSubmatch(userID); m != nil {
-		return normalizeSessionID(m[1])
+		// JS returns m[1] raw (sessionManager.js:115) — no trim, no length
+		// cap; the [a-f0-9-]+ capture cannot carry whitespace, and a
+		// >256-char capture is unreachable for the uuid-shaped ids Claude
+		// Code sends.
+		return m[1]
 	}
 	if strings.HasPrefix(userID, "{") {
 		var parsed map[string]any
@@ -230,8 +240,16 @@ func accumulateAssistantText(body map[string]any) string {
 				if c == nil {
 					continue
 				}
-				b.WriteString(jsonx.AsStr(c["text"]))
-				b.WriteString(jsonx.AsStr(c["output"]))
+				// JS is first-truthy-wins: `text += c?.text || c?.output || ""`
+				// (sessionManager.js:175) — a part carrying both fields
+				// contributes only its text. A truthy NON-string value (never a
+				// real content part) contributes "" rather than its JS String()
+				// coercion.
+				if jsonx.Truthy(c["text"]) {
+					b.WriteString(jsonx.AsStr(c["text"]))
+				} else if jsonx.Truthy(c["output"]) {
+					b.WriteString(jsonx.AsStr(c["output"]))
+				}
 			}
 		}
 		if b.Len() >= assistantCapLen {
@@ -267,9 +285,9 @@ func itoa64(n int64) string {
 	return string(buf[i:])
 }
 
-// ResolveSessionID ports resolveSessionId({headers, body, connectionId,
-// scope:"opencode"}): client session → assistant-text hash → per-connection
-// stable id (fresh per call when connectionId is empty).
+// ResolveSessionID ports the executor's resolveSessionId call
+// (executors/opencode.js:146-151): client session → accumulated-assistant-text
+// hash → stable terminal fallback.
 func ResolveSessionID(body map[string]any, headers map[string]string) string {
 	return ResolveSessionIDScoped(body, headers, "")
 }
@@ -283,8 +301,28 @@ func ResolveSessionIDScoped(body map[string]any, headers map[string]string, conn
 		key := sha16("opencode:" + connectionID + ":" + text[:min(len(text), assistantCapLen)])
 		return assistantStore.getOrCreate(key, generateBinaryStyleID)
 	}
-	if connectionID == "" {
-		return generateBinaryStyleID()
-	}
+	// Terminal fallback — deriveSessionId (sessionManager.js:45-66): a STABLE
+	// id from the runtime store. In JS the opencode executor always passes a
+	// non-empty connectionId — opencode is a noAuth free provider
+	// (providers/registry/opencode.js:13-14), so the router injects a virtual
+	// "noauth" connection (src/sse/services/auth.js:46-82, id at :67) and
+	// stamps it onto the credentials (auth.js:230), which resolveOpencodeSession
+	// forwards (executors/opencode.js:149) — so deriveSessionId's
+	// !connectionId fresh-per-call branch (sessionManager.js:46-48) is dead on
+	// this path. The Go executor has no connection identity and calls with
+	// connectionID == ""; a fresh id per request there churned the upstream
+	// session/prompt-cache affinity for headerless first-turn clients, so the
+	// empty scope is keyed in the SAME store instead — one stable id per
+	// process, exactly the property JS guarantees. (Keying the empty scope as
+	// "opencode:" rather than forwarding JS's literal "noauth" only relabels
+	// the internal store key; the id space is identical.)
+	//
+	// Store lifecycle (AGENTS.md): survives config hot-reloads — it is
+	// process-wide identity, not policy; resets only via the TTL janitor (an
+	// entry idle > SessionTTL is reclaimed and the next request derives a
+	// fresh stable id — sessionManager.js:19-26) or a process restart; who
+	// still needs it — every headerless request below the assistant-text
+	// minimum shares the entry, but no request pins it: each request
+	// re-resolves, so janitor eviction mid-flight is safe.
 	return connectionStore.getOrCreate("opencode:"+connectionID, generateBinaryStyleID)
 }

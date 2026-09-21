@@ -440,6 +440,33 @@ func TestFetchLatestReleaseFailureModes(t *testing.T) {
 	}
 }
 
+// The typed probe errors render human-readable statuses/messages (fail-open
+// logging surfaces Error()).
+func TestProbeErrorMessages(t *testing.T) {
+	if got := (&statusError{code: http.StatusServiceUnavailable}).Error(); got != http.StatusText(http.StatusServiceUnavailable) {
+		t.Errorf("statusError(503).Error() = %q, want %q", got, http.StatusText(http.StatusServiceUnavailable))
+	}
+	// fetchRaw returns a typed statusError for any non-200 raw fetch.
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusForbidden, "denied"), nil
+	})}
+	_, err := fetchRaw(client, "2.0.1", config.RootPackageJSONPath)
+	var se *statusError
+	if !errors.As(err, &se) {
+		t.Fatalf("fetchRaw(403) err = %v, want a *statusError", err)
+	}
+	if got := err.Error(); got != http.StatusText(http.StatusForbidden) {
+		t.Errorf("fetchRaw(403).Error() = %q, want %q", got, http.StatusText(http.StatusForbidden))
+	}
+	// The oversize bound carries a descriptive errString.
+	if got := errString("boom").Error(); got != "boom" {
+		t.Errorf("errString.Error() = %q, want %q", got, "boom")
+	}
+	if got := errNoSemver.Error(); got != "github release tag carried no semver" {
+		t.Errorf("errNoSemver.Error() = %q, want the fixed message", got)
+	}
+}
+
 // Get before any warm returns the pinned fallback (cold cache).
 func TestUserAgentCacheColdGet(t *testing.T) {
 	if got := NewUserAgentCache().Get(); got != FallbackUA() {

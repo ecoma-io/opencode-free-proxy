@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractClientSessionIDPriority(t *testing.T) {
@@ -27,6 +28,22 @@ func TestExtractClientSessionIDPriority(t *testing.T) {
 			note: "claude metadata.user_id JSON session_id",
 			body: map[string]any{"metadata": map[string]any{"user_id": `{"session_id":"json-sid"}`}},
 			want: "claude:json-sid",
+		},
+		{
+			// JS returns m[1] raw (sessionManager.js:115) — no 256 cap on the
+			// regex capture (only the JSON branch normalizes, :117).
+			note: "claude _session_ capture passes through raw, uncapped",
+			body: map[string]any{"metadata": map[string]any{
+				"user_id": "acct:_session_" + strings.Repeat("ab", 150),
+			}},
+			want: "claude:" + strings.Repeat("ab", 150),
+		},
+		{
+			// JS: normalizeSessionId(String(sid)) — numbers coerce
+			// (sessionManager.js:133).
+			note: "antigravity numeric sessionId is String()-coerced",
+			body: map[string]any{"request": map[string]any{"sessionId": 42}},
+			want: "antigravity:42",
 		},
 		{
 			note:    "claude header fallback",
@@ -200,17 +217,22 @@ func TestResolveSessionIDAssistantTextChain(t *testing.T) {
 	}
 }
 
-// Text below the 50-char minimum never hits the assistant chain: without a
-// connection scope every call is fresh (deriveSessionId("")), with one it is
-// stable per connection.
+// Text below the 50-char minimum never hits the assistant chain and falls to
+// the runtime-store terminal fallback (deriveSessionId, sessionManager.js:45-66)
+// — STABLE per scope. The executor-facing empty scope is stable too: JS's
+// opencode call site always carries the router's non-empty "noauth"
+// connectionId (src/sse/services/auth.js:46-82,230 → executors/opencode.js:149),
+// so deriveSessionId's !connectionId fresh-per-call branch is dead on this
+// path and a fresh id per request would churn upstream session/prompt-cache
+// affinity for headerless first-turn clients.
 func TestResolveSessionIDFallbackChain(t *testing.T) {
 	short := map[string]any{
 		"messages": []any{map[string]any{"role": "assistant", "content": strings.Repeat("a", 49)}},
 	}
 	a := ResolveSessionID(short, nil)
 	b := ResolveSessionID(short, nil)
-	if a == b {
-		t.Errorf("no connection scope must generate a fresh id per call, got %q twice", a)
+	if a != b {
+		t.Errorf("empty scope must reuse one stable process id, got %q then %q", a, b)
 	}
 	if a == "" {
 		t.Error("fallback must still produce an id")
@@ -223,6 +245,69 @@ func TestResolveSessionIDFallbackChain(t *testing.T) {
 	}
 	if c3 := ResolveSessionIDScoped(short, nil, "conn-2"); c3 == c1 {
 		t.Error("different connections must get different fallback ids")
+	}
+	if c3 := ResolveSessionIDScoped(short, nil, "conn-2"); c3 == a {
+		t.Error("the empty scope and named connections must not share a fallback id")
+	}
+}
+
+// The store caps itself at max: the oldest-lastUsed entry is evicted so the
+// newest key still resolves (sessionManager.js:57-61 MAX_SESSIONS eviction).
+func TestStoreGetOrCreateEvictsAtCap(t *testing.T) {
+	s := newStore(2)
+	s.getOrCreate("k1", func() string { return "id-1" })
+	s.getOrCreate("k2", func() string { return "id-2" })
+	// k1 is now the oldest → the third insertion evicts it, not k2.
+	if got := s.getOrCreate("k3", func() string { return "id-3" }); got != "id-3" {
+		t.Fatalf("insertion at cap = %q, want the generated id", got)
+	}
+	s.mu.Lock()
+	_, hasK1 := s.entries["k1"]
+	_, hasK2 := s.entries["k2"]
+	size := len(s.entries)
+	s.mu.Unlock()
+	if hasK1 {
+		t.Error("oldest entry k1 must be evicted at cap")
+	}
+	if !hasK2 {
+		t.Error("younger entry k2 must survive the eviction")
+	}
+	if size != 2 {
+		t.Errorf("store size = %d, want capped at 2", size)
+	}
+	// A re-get of the evicted key regenerates (and returns) a fresh id.
+	if got := s.getOrCreate("k1", func() string { return "id-1b" }); got != "id-1b" {
+		t.Errorf("re-get after eviction = %q, want a regenerated id", got)
+	}
+}
+
+// The janitor body reclaims entries idle past the TTL from both stores
+// (sessionManager.js:19-26); a reclaimed terminal-fallback entry is simply
+// re-derived on the next request — the documented reset path.
+func TestEvictExpired(t *testing.T) {
+	now := time.Now()
+	connectionStore.mu.Lock()
+	connectionStore.entries["opencode:janitor-stale"] = storeEntry{id: "old", lastUsed: now.Add(-SessionTTL - time.Minute)}
+	connectionStore.entries["opencode:janitor-live"] = storeEntry{id: "live", lastUsed: now}
+	connectionStore.mu.Unlock()
+	assistantStore.mu.Lock()
+	assistantStore.entries["opencode::janitor-stale"] = storeEntry{id: "old", lastUsed: now.Add(-SessionTTL - time.Minute)}
+	assistantStore.mu.Unlock()
+
+	evictExpired(now.Add(-SessionTTL))
+
+	connectionStore.mu.Lock()
+	_, staleConn := connectionStore.entries["opencode:janitor-stale"]
+	liveID, liveConn := connectionStore.entries["opencode:janitor-live"]
+	connectionStore.mu.Unlock()
+	assistantStore.mu.Lock()
+	_, staleAssist := assistantStore.entries["opencode::janitor-stale"]
+	assistantStore.mu.Unlock()
+	if staleConn || staleAssist {
+		t.Error("entries idle past the TTL must be reclaimed from both stores")
+	}
+	if !liveConn || liveID.id != "live" {
+		t.Error("entries used within the TTL must survive")
 	}
 }
 
@@ -265,6 +350,18 @@ func TestAccumulateAssistantText(t *testing.T) {
 
 	if got := accumulateAssistantText(map[string]any{}); got != "" {
 		t.Errorf("no messages → empty text, got %q", got)
+	}
+
+	// JS `c?.text || c?.output || ""` is first-truthy-wins
+	// (sessionManager.js:175): a part with both fields contributes only its
+	// text; an empty text defers to output; falsy both → nothing.
+	both := map[string]any{"messages": []any{map[string]any{"role": "assistant", "content": []any{
+		map[string]any{"text": "TEXT", "output": "OUTPUT"},
+		map[string]any{"text": "", "output": "OUT2"},
+		map[string]any{"text": "", "output": ""},
+	}}}}
+	if got := accumulateAssistantText(both); got != "TEXTOUT2" {
+		t.Errorf("first-truthy-wins accumulation = %q, want %q", got, "TEXTOUT2")
 	}
 }
 
