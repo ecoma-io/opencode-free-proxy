@@ -84,16 +84,24 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // (translator/formats.js detectFormatByEndpoint: /v1/responses is always
 // responses, /v1/chat/completions is openai — even with an input[] body).
 func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat relay.Format) {
-	// Inbound auth against the CURRENT snapshot's named keys — the first
-	// gate, before the method check and the body read (the 401 path never
-	// touches a lock, a health state, or an upstream). authName feeds the
-	// completion log lines (api_key_name); it is captured here, at ARRIVAL:
-	// a reload that deletes the key between this check and the relay's own
-	// snapshot can only widen admission to the NEXT generation for a request
-	// that was already authenticated — never the reverse, and never a 401
-	// for a valid key.
+	// ONE immutable snapshot for the WHOLE request, captured at ARRIVAL: the
+	// single store read this handler ever makes. Everything downstream — the
+	// auth gate below, route matching, the health policy, egress resolution,
+	// upstream.base, the fallback policy and the completion log's
+	// generation=N — reads THIS rt, so a hot reload landing mid-request can
+	// never split a request across two generations (issue #24): a request
+	// admitted under generation N is served, dialed, retried and logged
+	// entirely under N, and the swap to N+1 affects only requests that have
+	// not arrived yet. Auth deliberately runs against the SAME snapshot (no
+	// second read at the routing block below): a reload that rotates the keys
+	// can neither revoke an in-flight request's admission nor widen it —
+	// admission and everything after it are one generation's decision.
+	rt := s.runtime()
+	// The auth gate is first, before the method check and the body read (the
+	// 401 path never touches clientMu, a health state, or an upstream).
+	// authName feeds the completion log lines (api_key_name).
 	authName := ""
-	if rt := s.runtime(); rt.AuthEnabled() {
+	if rt.AuthEnabled() {
 		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		var ok bool
 		authName, ok = rt.LookupAPIKey(auth)
@@ -237,26 +245,31 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		}
 	}
 
-	// ---- routing: pin ONE immutable snapshot for the whole request, resolve
-	// its health policy next to it, filter to the eligible head set and let
-	// the scheduler order it. Every downstream decision — route, egress
-	// transports, fallback budget, concurrency caps, health eligibility AND
-	// the policy health is judged under — comes from this rt; nothing after
-	// this point re-reads the store, so a hot reload affects only requests
-	// that have not started yet. Routing (start selection), fallback (attempt
-	// loop) and health (temporary eligibility) stay three separate decisions.
+	// ---- routing: resolve the health policy of the ARRIVAL snapshot (rt,
+	// captured at the top of relay — the only store read this handler makes),
+	// match its route, filter to the eligible head set and let the scheduler
+	// order it. Every downstream decision — route, egress transports,
+	// fallback budget, concurrency caps, health eligibility AND the policy
+	// health is judged under — comes from that same rt, so routing (start
+	// selection), fallback (attempt loop) and health (temporary eligibility)
+	// stay three separate decisions over one generation.
 	//
-	// The snapshot-get → route-match → health-pin sequence runs under
-	// clientMu — the SAME mutex onGeneration holds for its CAS + prune +
-	// health Reclaim (server.go) — so a newer generation's Reclaim can never
-	// run inside the window between this request's snapshot and its Pin: a
-	// reclaim either completed before this request took clientMu (then the
-	// swap that fed it is already visible and the Get below returns the NEWER
-	// snapshot, whose identities are the ones being pinned) or it is still
-	// pending and will observe this request's pins and spare them. Without the
-	// mutex a stale-snapshot request could pin AFTER a reclaim wiped its
-	// identity's state and then adjudicate against wiped history, breaking the
-	// pinned-identity contract in internal/health.
+	// Route-match → health-pin runs under clientMu — the SAME mutex
+	// onGeneration holds for its CAS + prune + health Reclaim (server.go) —
+	// so a pin and a reclaim can never interleave: either this request's pin
+	// lands first (the swap's Reclaim, still waiting on clientMu, then
+	// observes the pins and spares the identities) or the reclaim has already
+	// run before the request takes clientMu. That second ordering is the one
+	// consequence of binding the request to its ARRIVAL snapshot (issue #24):
+	// an identity the newer generation dropped can be reclaimed before this
+	// older-generation request pins it, and the request then plans against
+	// reset (healthy) state for it. Health is the advisory eligibility layer —
+	// the route set, egress transports, fallback budget and auth all remain
+	// the arrival generation's — so the effect is bounded: one in-flight
+	// request may dial a cooling egress that the NEW config no longer
+	// references, exactly as any stale-snapshot request may. Observe
+	// re-registers state on the reclaimed identity, and the pin taken here
+	// shields it from every later reclaim until release.
 	//
 	// Lock order is clientMu → health.Registry.mu on every path (Reclaim and
 	// Pin here, Healthy in routeHeads without clientMu, Observe from the
@@ -267,7 +280,6 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// AFTER onGeneration, so a request pays the once-per-generation
 	// maintenance before it consults eligibility.
 	s.clientMu.Lock()
-	rt := s.runtime()
 	hp := health.PolicyFromSnapshot(rt)
 	profile := routing.Profile{
 		Model:     cleanModel,
