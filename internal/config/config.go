@@ -180,7 +180,8 @@ const IdleConnTimeout = 4 * time.Second
 
 // Server defaults.
 const (
-	DefaultPort = "8090"
+	DefaultPort     = "8090"
+	DefaultLogLevel = "info"
 )
 
 // Client-facing OpenAI-compatible error typing (config/errorConfig.js).

@@ -207,6 +207,7 @@ type UserAgentConfig struct {
 
 // File is the OCFP_CONFIG YAML document.
 type File struct {
+	LogLevel  string          `yaml:"log-level,omitempty"`
 	Egress    []Egress        `yaml:"egress"`
 	Routes    []Route         `yaml:"routes"`
 	Fallback  FallbackPolicy  `yaml:"fallback,omitempty"`
@@ -246,9 +247,11 @@ type Runtime struct {
 	// Hot reload stamps only the NEW snapshot; an in-flight request keeps
 	// the generation it started with.
 	Generation uint64
-	// Service settings resolved from the File's upstream/user_agent
-	// sections (or DefaultRuntime's built-ins; see UpstreamBase const and
-	// UASyncInterval const). Unexported and read only through accessors.
+	// Service settings resolved from the File's log-level/upstream/user_agent
+	// sections (or DefaultRuntime's built-ins; see DefaultLogLevel,
+	// UpstreamBase, and UASyncInterval). Unexported and read only through
+	// accessors.
+	logLevel       string
 	upstreamBase   string
 	uaSyncInterval time.Duration
 }
@@ -549,11 +552,20 @@ func (f *File) Validate() error {
 			return fmt.Errorf("upstream: base url must not carry a query or fragment")
 		}
 	}
+	switch f.LogLevel {
+	case "", "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("log-level must be one of debug, info, warn, error, got %q", f.LogLevel)
+	}
 	if f.UserAgent.SyncInterval != nil && *f.UserAgent.SyncInterval < 0 {
 		return fmt.Errorf("user_agent: sync_interval must be >= 0 (0 = disabled)")
 	}
 	return nil
 }
+
+// LogLevel returns the effective process log level. It lives in the config
+// document but is read by the bootstrap and reload wiring, not request paths.
+func (rt *Runtime) LogLevel() string { return rt.logLevel }
 
 // UpstreamBase returns the effective upstream base URL — the OCFP_CONFIG
 // upstream.base, or the built-in default. Trailing slashes are normalized at
@@ -747,6 +759,10 @@ func (f *File) Resolve() (*Runtime, error) {
 	// input's): the request path reads them via value-returning accessors, and
 	// the deep copy of cp.Fallback/cp.Health keeps the exported File half
 	// independent of the input too.
+	rt.logLevel = DefaultLogLevel
+	if f.LogLevel != "" {
+		rt.logLevel = f.LogLevel
+	}
 	rt.upstreamBase = UpstreamBase
 	if f.Upstream.Base != "" {
 		rt.upstreamBase = strings.TrimRight(f.Upstream.Base, "/")
@@ -773,6 +789,7 @@ func DefaultRuntime() *Runtime {
 			Routes:   []Route{{ID: "default", Egress: []string{"direct"}, Strategy: defaultStrategy}},
 			Fallback: FallbackPolicy{Enabled: new(true), MaxAttempts: 1},
 			Health:   HealthPolicy{Enabled: new(false)},
+			LogLevel: DefaultLogLevel,
 		},
 		byID: map[string]*Egress{"direct": {ID: "direct", Weight: new(defaultWeight)}},
 		routes: []Route{
@@ -781,7 +798,8 @@ func DefaultRuntime() *Runtime {
 		Fallback: FallbackPolicy{Enabled: new(true), MaxAttempts: 1},
 		Health:   HealthPolicy{Enabled: new(false)},
 		Direct:   true,
-		// Service built-ins (see UpstreamBase/UASyncInterval consts):
+		// Service built-ins (see DefaultLogLevel/UpstreamBase/UASyncInterval consts):
+		logLevel:       DefaultLogLevel,
 		upstreamBase:   UpstreamBase,
 		uaSyncInterval: UASyncInterval,
 	}

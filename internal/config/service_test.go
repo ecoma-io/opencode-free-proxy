@@ -37,6 +37,30 @@ func TestRuntimeServiceFieldsResolve(t *testing.T) {
 	}
 }
 
+func TestLogLevelResolution(t *testing.T) {
+	base := "egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n"
+	for _, level := range []string{"debug", "info", "warn", "error"} {
+		rt, err := resolveYAML(t, "log-level: "+level+"\n"+base)
+		if err != nil {
+			t.Fatalf("log-level %q rejected: %v", level, err)
+		}
+		if got := rt.LogLevel(); got != level {
+			t.Fatalf("LogLevel() = %q, want %q", got, level)
+		}
+	}
+	rt, err := resolveYAML(t, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.LogLevel(); got != DefaultLogLevel {
+		t.Fatalf("omitted LogLevel() = %q, want %q", got, DefaultLogLevel)
+	}
+	if _, err := resolveYAML(t, "log-level: trace\n"+base); err == nil ||
+		!strings.Contains(err.Error(), "log-level must be one of debug, info, warn, error, got \"trace\"") {
+		t.Fatalf("invalid log-level error = %v", err)
+	}
+}
+
 func TestUpstreamBaseDefaultsTrailingSlashTrimmed(t *testing.T) {
 	// Omitted upstream.base → the compiled-in default.
 	rt, err := resolveYAML(t, "egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n")
