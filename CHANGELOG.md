@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.6.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.5.0...v0.6.0) (2026-09-21)
+
+
+### Features
+
+* **config:** hot-reloadable log-level via zerolog ([#44](https://github.com/ecoma-io/opencode-free-proxy/issues/44)) ([c7bcfd1](https://github.com/ecoma-io/opencode-free-proxy/commit/c7bcfd1335bd736c229f83cbb9ac4ae516665464))
+
+
+### Bug Fixes
+
+* **cmd:** bound inbound listener with ReadHeaderTimeout and IdleTimeout ([#36](https://github.com/ecoma-io/opencode-free-proxy/issues/36)) ([44a3e93](https://github.com/ecoma-io/opencode-free-proxy/commit/44a3e93555284d94b65bb84ca2cb692abce36b4d))
+* **identity:** stable terminal session fallback, client-tool-keyed session translation ([#37](https://github.com/ecoma-io/opencode-free-proxy/issues/37)) ([4436380](https://github.com/ecoma-io/opencode-free-proxy/commit/443638039590d6754e0fd68fa064945796fe230d))
+* **jsonx:** full-string JS Number coercion and direct jsonx tests ([#35](https://github.com/ecoma-io/opencode-free-proxy/issues/35)) ([0c4c264](https://github.com/ecoma-io/opencode-free-proxy/commit/0c4c264de2a8bf8143a6c283e9ce45a7cf18b784))
+* **relay:** js-semantics parity across relay, cloak and usage ([#42](https://github.com/ecoma-io/opencode-free-proxy/issues/42)) ([d994faa](https://github.com/ecoma-io/opencode-free-proxy/commit/d994faa72e0b20667ca9c877fcce903680058f6b))
+* **router:** match js for cors wildcard, models empty list, non-sse guard ([#39](https://github.com/ecoma-io/opencode-free-proxy/issues/39)) ([e96bc03](https://github.com/ecoma-io/opencode-free-proxy/commit/e96bc03a30d7aad011d293f307768fe3568f788a))
+* **routing:** weight-0 egress could head wrr route after eligibility flap ([#38](https://github.com/ecoma-io/opencode-free-proxy/issues/38)) ([01e7a12](https://github.com/ecoma-io/opencode-free-proxy/commit/01e7a1295dfbfb7b6688bda6078b67a1a6c7aae7))
+* **translate:** js-semantics parity for gates, raw values and key coercion ([#41](https://github.com/ecoma-io/opencode-free-proxy/issues/41)) ([aa8dcfb](https://github.com/ecoma-io/opencode-free-proxy/commit/aa8dcfbdca9973fe9b3980b32dfe79543a446622))
+* **upstream:** close egress and transport-boundary audit gaps ([#40](https://github.com/ecoma-io/opencode-free-proxy/issues/40)) ([9575e59](https://github.com/ecoma-io/opencode-free-proxy/commit/9575e59159773ab4df0d979ece4fe4a303603596))
+
+
+### Documentation
+
+* correct config mount reload guidance, stop grace, env placeholders ([#33](https://github.com/ecoma-io/opencode-free-proxy/issues/33)) ([e4eab42](https://github.com/ecoma-io/opencode-free-proxy/commit/e4eab429ac10ad20e212dc11a0e9ddba311ad819))
+* correct doc references, env table, and e2e coverage notes ([#34](https://github.com/ecoma-io/opencode-free-proxy/issues/34)) ([a642ab8](https://github.com/ecoma-io/opencode-free-proxy/commit/a642ab8ea9a5f051c8dfbe7558c39afa82be3680))
+* correct mount/reload guidance, stop grace, env placeholders ([e4eab42](https://github.com/ecoma-io/opencode-free-proxy/commit/e4eab429ac10ad20e212dc11a0e9ddba311ad819))
+
 ## [0.5.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.4.0...v0.5.0) (2026-09-21)
 
 
