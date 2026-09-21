@@ -8,3 +8,7 @@ Dockerfile
 .dockerignore
 .gitignore
 *.md
+
+# Operator-owned, secret-bearing: never part of the build context.
+.env
+config.yaml

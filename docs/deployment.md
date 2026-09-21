@@ -49,15 +49,19 @@ bind mount on purpose: editing the file on the host hot-reloads in place.
 `OCFP_CONFIG` names the document path **inside the container**; the file it
 points at must be mounted (read-only is fine — the proxy never writes it).
 Secrets enter through `${VAR}` interpolation, resolved from the container's
-environment at load time, so the mounted file itself carries no credentials —
-forward each referenced variable through `compose.yaml`'s `environment` when
-you add one:
+environment at load time, so the mounted file itself carries no credentials.
+`compose.yaml` passes a present `.env` straight into the container
+(`env_file`, optional) — copy `.env.example` from the repo root to `.env`
+(gitignored) and set each variable your `config.yaml` references there; an
+unset `${VAR}` is a load error:
 
 ```yaml
 # compose.yaml (excerpt)
+env_file:
+  - path: .env
+    required: false
 environment:
-  OCFP_CONFIG: /etc/ofp/config.yaml
-  # OCFP_PROXY_PASSWORD: ${OCFP_PROXY_PASSWORD} # forward vars your config.yaml references
+  OCFP_CONFIG: /etc/ofp/config.yaml # pinned: environment overrides env_file
 volumes:
   - ./config.yaml:/etc/ofp/config.yaml:ro
 ```
@@ -76,7 +80,12 @@ keeps the last good runtime — see
 | `OCFP_SHUTDOWN_GRACE` | `55000`              | Drain window before force-close (ms)                                |
 
 No other process env vars exist; every service setting (upstream base, UA
-sync cadence, routing) lives in the config document.
+sync cadence, routing) lives in the config document. `.env.example` (repo
+root) is the template for the whole environment — copy it to `.env`
+(gitignored); compose feeds that file both to its own `${...}` substitution
+and, via `env_file`, into the container. Under compose the listen port
+stays `8090` behind the `HOST_PORT` mapping — change `HOST_PORT`, not
+`OCFP_PORT`.
 
 ## Health / readiness
 
