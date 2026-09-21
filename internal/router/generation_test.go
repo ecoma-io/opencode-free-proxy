@@ -129,10 +129,15 @@ func TestAuthBindingSurvivesMidRequestReload(t *testing.T) {
 	payload := `{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":true}`
 
 	// The request is admitted by generation 1 (Bearer sk-1) and parks at the
-	// gated upstream.
-	done := make(chan *httptest.ResponseRecorder, 1)
+	// gated upstream. The response travels through a variable + closed
+	// channel, not a channel send: if postJSON ever t.Fatal-exits this
+	// goroutine (runtime.Goexit), the deferred close still releases the
+	// waiter below instead of leaving it blocked forever.
+	var res *httptest.ResponseRecorder
+	done := make(chan struct{})
 	go func() {
-		done <- postJSON(t, mux, "/v1/chat/completions", payload, map[string]string{"Authorization": "Bearer sk-1"})
+		defer close(done)
+		res = postJSON(t, mux, "/v1/chat/completions", payload, map[string]string{"Authorization": "Bearer sk-1"})
 	}()
 	waitArrived(t, arrived)
 
@@ -142,7 +147,10 @@ func TestAuthBindingSurvivesMidRequestReload(t *testing.T) {
 	waitGeneration(t, store, 2)
 
 	release()
-	res := <-done
+	<-done
+	if res == nil {
+		t.Fatal("request goroutine ended without a response — see the failure it recorded above")
+	}
 	if res.Code != http.StatusOK {
 		t.Fatalf("in-flight request status = %d, want 200 (admission must survive the key revocation; body=%s)", res.Code, res.Body.String())
 	}
@@ -192,6 +200,7 @@ func TestUpstreamBaseBindingSurvivesMidRequestReload(t *testing.T) {
 	release := gateRelease(t, gate)
 	recB := &upstreamRecorder{}
 	upB := newScriptedUpstream(t, recB, http.StatusOK, "text/event-stream", chatStreamSSE)
+	defer upB.Close()
 
 	// Auth off; the upstream base IS the generation marker here.
 	gen1 := fmt.Sprintf(`upstream:
@@ -211,8 +220,14 @@ routes:
 	mux, store := genRouter(t, dir, gen1, nil)
 
 	payload := `{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":true}`
-	done := make(chan *httptest.ResponseRecorder, 1)
-	go func() { done <- postJSON(t, mux, "/v1/chat/completions", payload, nil) }()
+	// Same variable + closed-channel pattern as the auth-binding test: the
+	// waiter below survives even if postJSON t.Fatal-exits the goroutine.
+	var res *httptest.ResponseRecorder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		res = postJSON(t, mux, "/v1/chat/completions", payload, nil)
+	}()
 	waitArrived(t, arrived)
 
 	// Swap the base to upB while the request is parked at upA.
@@ -220,7 +235,10 @@ routes:
 	waitGeneration(t, store, 2)
 
 	release()
-	res := <-done
+	<-done
+	if res == nil {
+		t.Fatal("request goroutine ended without a response — see the failure it recorded above")
+	}
 	if res.Code != http.StatusOK {
 		t.Fatalf("in-flight request status = %d, want 200 (body=%s)", res.Code, res.Body.String())
 	}
