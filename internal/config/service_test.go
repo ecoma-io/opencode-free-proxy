@@ -7,6 +7,7 @@ package config
 // snapshot exactly like egresses and routes.
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -198,6 +199,94 @@ func TestUASyncIntervalResolution(t *testing.T) {
 	}
 	if _, err := resolveYAML(t, "user_agent:\n  sync_interval: -5\n"+base); err == nil {
 		t.Fatal("negative sync_interval accepted, want rejection")
+	}
+}
+
+func TestStoreReloadSwapsServiceFields(t *testing.T) {
+	// The service fields ride the same immutable per-generation snapshot as
+	// egresses and routes: the live store swaps to the new values, and a
+	// snapshot captured BEFORE the reload keeps the old ones (a request never
+	// observes a mixed generation).
+	dir := t.TempDir()
+	gen1 := "upstream:\n  base: \"https://gen1.example\"\n" +
+		"auth:\n  keys:\n    - {name: prod, key: sk-old}\n" +
+		"user_agent:\n  sync_interval: 120\n" +
+		"egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n"
+	gen2 := "upstream:\n  base: \"https://gen2.example\"\n" +
+		"auth:\n  keys:\n    - {name: backup, key: sk-new}\n" +
+		"user_agent:\n  sync_interval: 0\n" +
+		"egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n"
+	p := writeConfig(t, dir, "cfg.yaml", gen1)
+	store, err := NewStore(p, pollInterval, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Stop)
+
+	before := store.Get()
+	if got := before.UpstreamBase(); got != "https://gen1.example" {
+		t.Fatalf("gen1 UpstreamBase() = %q", got)
+	}
+	if name, ok := before.LookupAPIKey("sk-old"); !ok || name != "prod" {
+		t.Fatalf("gen1 LookupAPIKey(sk-old) = %q,%v, want prod,true", name, ok)
+	}
+	if got := before.UASyncInterval(); got != 120*time.Second {
+		t.Fatalf("gen1 UASyncInterval() = %v, want 120s", got)
+	}
+
+	if err := os.WriteFile(p, []byte(gen2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for store.Get().Generation < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	after := store.Get()
+	if after.Generation != 2 {
+		t.Fatalf("generation = %d, want 2", after.Generation)
+	}
+	if got := after.UpstreamBase(); got != "https://gen2.example" {
+		t.Fatalf("gen2 UpstreamBase() = %q, want https://gen2.example", got)
+	}
+	if name, ok := after.LookupAPIKey("sk-new"); !ok || name != "backup" {
+		t.Fatalf("gen2 LookupAPIKey(sk-new) = %q,%v, want backup,true", name, ok)
+	}
+	if _, ok := after.LookupAPIKey("sk-old"); ok {
+		t.Fatal("gen2 still admits the revoked key")
+	}
+	if got := after.UASyncInterval(); got != 0 {
+		t.Fatalf("gen2 UASyncInterval() = %v, want 0 (disabled)", got)
+	}
+	// The pre-reload capture is untouched — the snapshot immutability
+	// contract covers the service fields too.
+	if got := before.UpstreamBase(); got != "https://gen1.example" {
+		t.Fatalf("pre-reload snapshot mutated: UpstreamBase() = %q", got)
+	}
+	if _, ok := before.LookupAPIKey("sk-new"); ok {
+		t.Fatal("pre-reload snapshot sees the post-reload key")
+	}
+	if got := before.UASyncInterval(); got != 120*time.Second {
+		t.Fatalf("pre-reload snapshot mutated: UASyncInterval() = %v", got)
+	}
+}
+
+func TestAuthValidationErrorNeverEchoesSecret(t *testing.T) {
+	// The duplicate-key-value error names the two entries by NAME (bounded);
+	// the secret value itself must never appear in a load error — those are
+	// logged verbatim at startup and on a rejected reload.
+	_, err := resolveYAML(t, "auth:\n  keys:\n    - {name: alpha, key: sk-live-secret}\n"+
+		"    - {name: beta, key: sk-live-secret}\n"+
+		"egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n")
+	if err == nil {
+		t.Fatal("duplicate key value accepted, want rejection")
+	}
+	if strings.Contains(err.Error(), "sk-live-secret") {
+		t.Fatalf("load error echoes the secret value: %q", err.Error())
+	}
+	for _, want := range []string{"auth.keys", "alpha", "beta", "duplicate"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("load error %q does not mention %q", err, want)
+		}
 	}
 }
 
