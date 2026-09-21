@@ -58,7 +58,7 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	raw, err := readBoundedSSE(r.Context(), resp.Body, config.MaxForcedSSEBytes, config.StreamStall)
 	if err != nil {
 		if errors.Is(err, errForcedSSEStall) || errors.Is(err, errForcedSSETooLarge) {
-			s.logf("forced SSE→JSON aborted: %v", err)
+			s.log.Warn().Err(err).Msg("forced SSE→JSON aborted")
 		}
 		writeError(w, http.StatusBadGateway, "Failed to convert streaming response to JSON")
 		return

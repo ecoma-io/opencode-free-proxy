@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -18,8 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/identity"
+	"opencode-free-proxy/internal/logging"
 	"opencode-free-proxy/internal/router"
 	"opencode-free-proxy/internal/upstream"
 )
@@ -27,17 +29,23 @@ import (
 // version is stamped at build time (Dockerfile: -ldflags "-X main.version=…").
 var version = "dev"
 
+// fatalLog reports failures before a loaded runtime can establish the process
+// level. It shares stdout with the runtime JSON logger for Docker's log driver.
+var fatalLog = logging.New(os.Stdout)
+
 func main() {
 	// Subcommand dispatch: the runtime image is `scratch` — no shell, no curl —
 	// so the Docker HEALTHCHECK runs the entrypoint binary itself against its
 	// own /healthz. Anything else (or no args) serves.
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		if err := runHealthcheck(); err != nil {
-			log.Fatalf("healthcheck failed: %v", err)
+			fatalLog.Error().Err(err).Msg("healthcheck failed")
+			os.Exit(1)
 		}
 		return
 	}
 
+	log := logging.New(os.Stdout)
 	cfg := config.FromEnv()
 	uaCache := identity.NewUserAgentCache()
 
@@ -52,17 +60,23 @@ func main() {
 	// the pre-routing proxy.
 	var store *config.Store
 	if cfg.ConfigPath != "" {
-		st, err := config.NewStore(cfg.ConfigPath, cfg.ConfigPoll, log.Printf)
+		st, err := config.NewStore(cfg.ConfigPath, cfg.ConfigPoll, log)
 		if err != nil {
-			log.Fatalf("config: %v", err)
+			fatalLog.Error().Err(err).Msg("config load failed")
+			os.Exit(1)
 		}
 		store = st
-		log.Printf("config: loaded %s (poll %v)", cfg.ConfigPath, cfg.ConfigPoll)
 	} else {
 		store = config.NewDefault()
 	}
+	// Bootstrap installs the first level; Store.tick is the only subsequent
+	// writer, so all emitted events read one globally consistent level.
+	zerolog.SetGlobalLevel(config.ParseZerologLevel(store.Get().LogLevel()))
+	if cfg.ConfigPath != "" {
+		log.Info().Str("path", cfg.ConfigPath).Str("poll", cfg.ConfigPoll.String()).Msg("config loaded")
+	}
 
-	server := router.NewServer(store, uaCache, direct, log.Printf, time.Sleep)
+	server := router.NewServer(store, uaCache, direct, log, time.Sleep)
 
 	// Sync the compound UA triple (opencode version, ai-sdk provider-utils,
 	// bun) from GitHub: one forced warm at startup, then a background ticker
@@ -72,7 +86,7 @@ func main() {
 	// compiled-in default triple (fail-open).
 	go func() {
 		ua := uaCache.Warm(direct.HTTP, true)
-		log.Printf("opencode UA cache warm: %s", ua)
+		log.Debug().Str("user_agent", ua).Msg("opencode UA cache warm")
 	}()
 	// The UA sync cadence is read LIVE from the current store snapshot on
 	// every cycle (user_agent.sync_interval may be changed by a reload); the
@@ -97,9 +111,10 @@ func main() {
 	conns := newConnTracker()
 	srv := &http.Server{Addr: addr, Handler: mux, ConnState: conns.connState}
 	go func() {
-		log.Printf("opencode-free-proxy %s listening on %s (upstream %s)", version, addr, store.Get().UpstreamBase())
+		log.Info().Str("version", version).Str("addr", addr).Str("upstream", store.Get().UpstreamBase()).Msg("opencode-free-proxy listening")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("server exited: %v", err)
+			log.Error().Err(err).Msg("server exited")
+			os.Exit(1)
 		}
 	}()
 
@@ -119,7 +134,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	<-ctx.Done()
 	stop()
-	log.Printf("shutdown: draining (grace %v)…", cfg.ShutdownGrace)
+	log.Info().Str("grace", cfg.ShutdownGrace.String()).Msg("shutdown: draining")
 	server.Drain()
 	store.Stop()
 	uaStop()
@@ -128,9 +143,10 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(graceCtx); err != nil {
 		closed := conns.forceCloseAll()
-		log.Printf("shutdown: grace %v elapsed, force-closed %d connection(s): %v", cfg.ShutdownGrace, closed, err)
+		log.Warn().Str("grace", cfg.ShutdownGrace.String()).Int("force_closed", closed).Err(err).
+			Msg("shutdown: grace elapsed, force-closed connections")
 	}
-	log.Printf("shutdown complete")
+	log.Info().Msg("shutdown complete")
 }
 
 // connTracker records the server's live client connections through

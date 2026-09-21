@@ -3,13 +3,15 @@ package config
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"log"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog"
 	"gopkg.in/yaml.v3"
+
+	"opencode-free-proxy/internal/logging"
 )
 
 // Store owns the immutable runtime configuration snapshot and its hot-reload
@@ -32,7 +34,7 @@ type Store struct {
 	path     string
 	interval time.Duration
 	cur      atomic.Pointer[Runtime]
-	logf     func(format string, args ...any)
+	log      zerolog.Logger
 	// gen stamps Runtime.Generation on every successful load; it is the
 	// store-side monotonic config version (first load 1, each swap +1) so
 	// logs and tests can name a request's exact snapshot. Generation 0 is
@@ -53,10 +55,8 @@ type Store struct {
 // NewStore loads the config file at path and starts the poller. interval 0
 // disables polling (single load). A load failure is fatal here — at startup
 // there is no valid previous snapshot to fall back on.
-func NewStore(path string, interval time.Duration, logf func(string, ...any)) (*Store, error) {
-	if logf == nil {
-		logf = log.Printf
-	}
+func NewStore(path string, interval time.Duration, logger any) (*Store, error) {
+	log := logging.Resolve(logger)
 	// One read for both the snapshot and the poller's compare seed: the hash
 	// is stamped from the same bytes that were parsed (readStamped + LoadBytes,
 	// never LoadFile's own read).
@@ -71,7 +71,7 @@ func NewStore(path string, interval time.Duration, logf func(string, ...any)) (*
 	s := &Store{
 		path:     path,
 		interval: interval,
-		logf:     logf,
+		log:      log,
 		stopCh:   make(chan struct{}),
 		done:     make(chan struct{}),
 		initHash: sum,
@@ -172,10 +172,26 @@ func (s *Store) poll() {
 // it together, so a swap can never pair one generation's content with
 // another's stamp. A write landing after the read is simply picked up by the
 // next tick.
+// ParseZerologLevel maps the config document's validated level to zerolog.
+// Trace and fatal are deliberately not config values, matching the sibling
+// gateway's process-wide logging contract.
+func ParseZerologLevel(level string) zerolog.Level {
+	switch level {
+	case "debug":
+		return zerolog.DebugLevel
+	case "warn":
+		return zerolog.WarnLevel
+	case "error":
+		return zerolog.ErrorLevel
+	default:
+		return zerolog.InfoLevel
+	}
+}
+
 func (s *Store) tick(lastHash *string) {
 	raw, hash, err := readStamped(s.path)
 	if err != nil {
-		s.logf("config reload: read failed, keeping previous config: %v", err)
+		s.log.Warn().Err(err).Msg("config reload: read failed, keeping previous config")
 		return
 	}
 	if hash == *lastHash {
@@ -183,12 +199,16 @@ func (s *Store) tick(lastHash *string) {
 	}
 	rt, err := LoadBytes(raw)
 	if err != nil {
-		s.logf("config reload: rejected, keeping previous config: %v", err)
+		s.log.Warn().Err(err).Msg("config reload: rejected, keeping previous config")
 		return
 	}
 	*lastHash = hash
 	rt.Generation = s.gen.Add(1)
 	s.cur.Store(rt)
-	s.logf("config reload: swapped to new config (generation %d, %d egresses, %d routes)",
-		rt.Generation, len(rt.File.Egress), len(rt.File.Routes))
+	// The poll goroutine is the sole runtime writer of zerolog's global level.
+	// Every event consults it when emitted, so this takes effect atomically.
+	zerolog.SetGlobalLevel(ParseZerologLevel(rt.LogLevel()))
+	s.log.Info().Uint64("generation", rt.Generation).Int("egresses", len(rt.File.Egress)).Int("routes", len(rt.File.Routes)).
+		Msgf("config reload: swapped to new config (generation %d, %d egresses, %d routes)",
+			rt.Generation, len(rt.File.Egress), len(rt.File.Routes))
 }

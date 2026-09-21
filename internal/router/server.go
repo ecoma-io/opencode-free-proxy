@@ -3,14 +3,16 @@ package router
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/health"
 	"opencode-free-proxy/internal/identity"
+	"opencode-free-proxy/internal/logging"
 	"opencode-free-proxy/internal/routing"
 	"opencode-free-proxy/internal/upstream"
 )
@@ -39,16 +41,13 @@ type Server struct {
 	// (onGeneration, once per generation, monotonic — a request holding a
 	// STALE snapshot never prunes against its older keep-set).
 	prunedGen atomic.Uint64
-	logf      func(format string, args ...any)
+	log       zerolog.Logger
 }
 
 // NewServer wires the multi-egress machinery. store may be a live poller
-// (OCFP_CONFIG set) or the default direct runtime; logf nil → log.Printf;
-// sleep nil → time.Sleep (tests pass a no-op to keep retry matrices fast).
-func NewServer(store *config.Store, ua *identity.UserAgentCache, direct *upstream.Client, logf func(string, ...any), sleep func(time.Duration)) *Server {
-	if logf == nil {
-		logf = log.Printf
-	}
+// (OCFP_CONFIG set) or the default direct runtime. sleep nil → time.Sleep
+// (tests pass a no-op to keep retry matrices fast).
+func NewServer(store *config.Store, ua *identity.UserAgentCache, direct *upstream.Client, logger any, sleep func(time.Duration)) *Server {
 	if sleep == nil {
 		sleep = time.Sleep
 	}
@@ -61,7 +60,7 @@ func NewServer(store *config.Store, ua *identity.UserAgentCache, direct *upstrea
 		UA:        ua,
 		sleep:     sleep,
 		clients:   map[string]*upstream.Client{},
-		logf:      logf,
+		log:       logging.Resolve(logger),
 	}
 	s.Exec = upstream.NewExecutor(s.clientForEgress, s.Health, s.Slots)
 	return s
@@ -101,7 +100,7 @@ func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
 	}
 	c, err := upstream.NewClientFor(e.Proxy)
 	if err != nil {
-		s.logf("egress %q: %v", e.ID, err)
+		s.log.Warn().Str("egress", e.ID).Err(err).Msg("egress transport setup failed")
 		return nil, false
 	}
 	c.Sleep = s.sleep

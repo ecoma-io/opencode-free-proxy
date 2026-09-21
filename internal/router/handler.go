@@ -341,10 +341,17 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	start := time.Now()
 	resp, egID, attempts, class, uerr := s.Exec.Execute(reqCtx, url, buildHeaders, bodyJSON, plan, policy)
 	latency := time.Since(start)
-	// Completion log line: same facts per status.
+	// Completion is one event per request at Info: the black-box e2e suite
+	// and the snapshot tests assert the outcome facts (generation, egress,
+	// attempts, fallback) on the default info level, so Debug would hide
+	// the very line the contract is observed through.
 	logLine := func(status int) {
-		s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
-			reqID, rt.Generation, plan.RouteID, egID, attempts, class, status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
+		s.log.Info().Str("request_id", reqID).Uint64("generation", rt.Generation).
+			Str("route", plan.RouteID).Str("egress", egID).Int("attempts", attempts).
+			Str("class", class.String()).Int("status", status).Int64("latency_ms", latency.Milliseconds()).
+			Str("model", cleanModel).Str("endpoint", profile.Endpoint).Bool("fallback", attempts > 1).
+			Msgf("request completed generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
+				rt.Generation, plan.RouteID, egID, attempts, class, status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 	}
 	if uerr != nil {
 		cancelUpstream()

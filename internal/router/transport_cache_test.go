@@ -19,15 +19,16 @@ import (
 	"time"
 
 	"opencode-free-proxy/internal/config"
+	"opencode-free-proxy/internal/logging"
 	"opencode-free-proxy/internal/upstream"
 )
 
-// cacheServer is a bare Server with logf wired to the test.
+// cacheServer is a bare Server with a logger wired to the test.
 func cacheServer(t *testing.T) *Server {
 	t.Helper()
 	return &Server{
 		clients: map[string]*upstream.Client{},
-		logf:    func(format string, args ...any) { t.Logf(format, args...) },
+		log:     logging.FromLegacy(func(format string, args ...any) { t.Logf(format, args...) }),
 	}
 }
 
