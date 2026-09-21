@@ -786,3 +786,101 @@ func TestScanLinesDeliversJSON(t *testing.T) {
 		t.Fatalf("data line malformed: %q", got[0])
 	}
 }
+
+// trickleReader delivers its payload five bytes at a time on a delay — an
+// upstream slowly assembling ONE long event with no newline until it is
+// done, then a clean EOF.
+type trickleReader struct {
+	data  []byte
+	off   int
+	pause time.Duration
+}
+
+func (r *trickleReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	time.Sleep(r.pause)
+	end := r.off + 5
+	if end > len(r.data) {
+		end = len(r.data)
+	}
+	n := copy(p, r.data[r.off:end])
+	r.off += n
+	return n, nil
+}
+
+// TestScanLinesTrickleIsNotStall: the stall watchdog must reset on ANY read
+// progress, not only complete lines (streamHandler.js:179,185-186 "Any
+// upstream chunk resets the timer"; :229-239 armStall per chunk). Eleven
+// bytes at 20 ms apart under a 50 ms stall carry NO newline until the final
+// byte, so a per-LINE reset stalls this body at 50 ms while the trickling
+// upstream is still live — the exact false stall the JS watchdog was changed
+// to avoid ("measuring stall on the transform output caused false stalls").
+func TestScanLinesTrickleIsNotStall(t *testing.T) {
+	tr := &trickleReader{data: []byte("data: hello"), pause: 20 * time.Millisecond}
+	var got []string
+	var tail string
+	err := ScanLines(context.Background(), tr, 50*time.Millisecond, func(line string) error {
+		got = append(got, line)
+		return nil
+	}, func(line string) error {
+		tail = line
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ScanLines: %v — a trickling body is live traffic, not a stall", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("fn lines = %q; the trickle never terminated, it is one segment for onTail", got)
+	}
+	if tail != "data: hello" {
+		t.Fatalf("tail = %q, want the whole trickled segment", tail)
+	}
+}
+
+// errAfterReader returns its data once, then a non-EOF error — a transport
+// death mid-body.
+type errAfterReader struct {
+	data []byte
+	off  int
+	err  error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if r.off < len(r.data) {
+		n := copy(p, r.data[r.off:])
+		r.off += n
+		return n, nil
+	}
+	return 0, r.err
+}
+
+// TestScanLinesMidLineErrorDropsResidual: an errored stream never flushes
+// in JS (streamHandler.js:161-163 controller.error; stream.js:515-530
+// forward of the residual buffer lives in flush(), which runs only on a
+// clean end), so a partial segment followed by a non-EOF read error must be
+// DROPPED — not delivered as a complete line (the old behavior), not
+// tailed. The error itself is the whole story.
+func TestScanLinesMidLineErrorDropsResidual(t *testing.T) {
+	boom := errors.New("connection reset")
+	r := &errAfterReader{data: []byte("l1\ndata: partial"), err: boom}
+	var got []string
+	tailCalled := false
+	err := ScanLines(context.Background(), r, time.Second, func(line string) error {
+		got = append(got, line)
+		return nil
+	}, func(string) error {
+		tailCalled = true
+		return nil
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("ScanLines error = %v, want the read error", err)
+	}
+	if len(got) != 1 || got[0] != "l1" {
+		t.Fatalf("fn lines = %q, want only the complete line [l1] — the partial segment is not a line", got)
+	}
+	if tailCalled {
+		t.Fatal("onTail ran for a mid-line transport error — an errored stream never flushes (stream.js:515-530 is clean-end only)")
+	}
+}

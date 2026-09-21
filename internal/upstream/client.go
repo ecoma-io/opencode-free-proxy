@@ -4,7 +4,6 @@
 package upstream
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -545,45 +544,81 @@ func BuildErrorBody(statusCode int, message string) map[string]any {
 }
 
 // ScanLines consumes an SSE body line by line, delivering each line without
-// its trailing newline (stream.js buffer.split("\n") semantics — a \r from
-// CRLF upstreams survives, exactly as in JS). An unterminated final segment
-// (upstream closed mid-line) is delivered through onTail instead of fn: JS
-// passthrough forwards that residual buffer raw in its flush (only the
-// "data:"-prefix fix), while translate mode re-parses it — the relays decide.
-// The stall deadline resets on every line read (STREAM_STALL_TIMEOUT_MS).
-// When fn returns an error or the stall fires, the caller must cancel ctx (or
-// close the body) to unblock the reader goroutine.
+// its trailing newline (stream.js:243-247 buffer.split("\n") semantics — a
+// \r from CRLF upstreams survives, exactly as in JS). An unterminated final
+// segment at a CLEAN EOF is delivered through onTail instead of fn:
+// stream.js:515-530 forwards the residual buffer only in flush(), and a
+// transform's flush runs only when the stream ends cleanly — an ERRORED
+// stream never flushes (streamHandler.js:161-163 controller.error), so a
+// partial segment followed by a non-EOF read error is DROPPED: fn gets
+// nothing, onTail gets nothing, the error itself is the whole story. The
+// stall deadline resets on ANY read progress, not only complete lines
+// (streamHandler.js:179,185-186 "Any upstream chunk resets the timer";
+// :229-239 armStall per chunk): a slow event trickled across many chunks
+// with no newline for stretches past the stall window is live traffic, and
+// JS does not call it a stall. When fn returns an error or the stall fires,
+// the caller must cancel ctx (or close the body) to unblock the reader
+// goroutine.
 func ScanLines(ctx context.Context, body io.Reader, stall time.Duration, fn func(line string) error, onTail func(line string) error) error {
 	lines := make(chan string, 64)
 	tails := make(chan string, 1)
 	readErr := make(chan error, 1)
+	// progress pings on every read that returned BYTES — complete line or
+	// not — so the consumer can reset the stall deadline per chunk like
+	// streamHandler.js does. Cap 1 with a non-blocking send: pings coalesce,
+	// and coalescing can never under-reset the timer (one observed ping
+	// between two timer fires is a full reset).
+	progress := make(chan struct{}, 1)
 	go func() {
 		defer close(lines)
 		defer close(tails)
-		reader := bufio.NewReaderSize(body, 64*1024)
+		buf := make([]byte, 32*1024)
+		// pending is the unterminated segment so far. It grows without
+		// bound for a line that never ends — deliberate parity:
+		// stream.js:243-247 `buffer += text` is unbounded the same way
+		// (SSE carries no line-length cap anywhere in the JS router), and
+		// an injected cap would fabricate line splits upstream never sent.
+		var pending []byte
 		for {
-			line, err := reader.ReadString('\n')
-			if err == io.EOF && line != "" {
-				// Unterminated final segment — not a complete line.
+			n, err := body.Read(buf)
+			if n > 0 {
+				pending = append(pending, buf[:n]...)
 				select {
-				case tails <- line:
-				case <-ctx.Done():
+				case progress <- struct{}{}:
+				default:
 				}
-				return
-			}
-			if line != "" {
-				select {
-				case lines <- line:
-				case <-ctx.Done():
-					return
+				for {
+					i := bytes.IndexByte(pending, '\n')
+					if i < 0 {
+						break
+					}
+					line := string(pending[:i+1]) // copy: pending reuses its array
+					pending = pending[i+1:]
+					select {
+					case lines <- line:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 			if err != nil {
-				if err != io.EOF {
-					select {
-					case readErr <- err:
-					default:
+				if err == io.EOF {
+					// Clean end: the residual is the unterminated final
+					// segment, delivered through onTail exactly like
+					// stream.js:515-530 flush() forwards it.
+					if len(pending) > 0 {
+						select {
+						case tails <- string(pending):
+						case <-ctx.Done():
+						}
 					}
+					return
+				}
+				// Non-EOF error: no line, no tail — the errored stream never
+				// flushes in JS, so the partial segment dies with it.
+				select {
+				case readErr <- err:
+				default:
 				}
 				return
 			}
@@ -591,15 +626,29 @@ func ScanLines(ctx context.Context, body io.Reader, stall time.Duration, fn func
 	}()
 	timer := time.NewTimer(stall)
 	defer timer.Stop()
+	reset := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(stall)
+	}
 	for {
 		select {
 		case line, ok := <-lines:
 			if !ok {
 				// All complete lines delivered; the residual tail (if any)
 				// goes through onTail, then a pending read error surfaces.
+				// The ok check matters: tails is CLOSED by the reader
+				// goroutine, and a receive from a closed empty channel
+				// succeeds with the zero value — without it onTail ran with
+				// "" on EVERY clean end (and, before finding 7, on every
+				// errored end too).
 				select {
-				case tail := <-tails:
-					if onTail != nil {
+				case tail, ok := <-tails:
+					if ok && onTail != nil {
 						if err := onTail(tail); err != nil {
 							return err
 						}
@@ -613,16 +662,14 @@ func ScanLines(ctx context.Context, body io.Reader, stall time.Duration, fn func
 					return nil
 				}
 			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(stall)
+			reset()
 			if err := fn(strings.TrimRight(line, "\n")); err != nil {
 				return err
 			}
+		case <-progress:
+			// The watchdog tracks raw upstream chunks, not parsed lines
+			// (streamHandler.js:179,185-186): reset on byte progress alone.
+			reset()
 		case <-timer.C:
 			return fmt.Errorf("stream stalled: no SSE data for %s", stall)
 		case <-ctx.Done():
