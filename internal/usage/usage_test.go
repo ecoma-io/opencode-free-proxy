@@ -10,10 +10,11 @@ import (
 	"testing"
 )
 
-// estimateBody is deliberately HTML-escape-free: json.Marshal escapes <, >, &
-// (growing the byte count) while JS JSON.stringify does not, so the /4
-// arithmetic is only comparable to the JS engine for such bodies.
-var estimateBody = map[string]any{"model": "m"} // {"model":"m"} -> 13 bytes
+// estimateBody stays HTML-escape-free for byte-clarity ({"model":"m"} -> 13
+// units); since EstimateInput now serializes with SetEscapeHTML(false) and
+// counts UTF-16 units exactly like JSON.stringify(body).length, HTML-bearing
+// bodies are comparable too (see TestEstimateInputUtf16UnitsAndHTMLEscapes).
+var estimateBody = map[string]any{"model": "m"} // {"model":"m"} -> 13 units
 
 func bodyBytes(t *testing.T, body any) int {
 	t.Helper()
