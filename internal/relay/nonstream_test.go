@@ -141,9 +141,9 @@ func TestParseSSEToOpenAIResponse(t *testing.T) {
 		if !ok {
 			t.Fatal("expected a result")
 		}
-		// Parity note: JS falls back to `chatcmpl-${Date.now()}` too, so the
-		// shape matches; only the created fallback diverges (JS leaves the
-		// upstream-created 0 in place rather than substituting now()).
+		// Parity note: JS falls back identically — `first.id || chatcmpl-…`
+		// and `first.created || Math.floor(Date.now()/1000)`
+		// (sseToJsonHandler.js:170-173); a falsy created substitutes now().
 		if id, _ := result["id"].(string); !regexp.MustCompile(`^chatcmpl-\d+$`).MatchString(id) {
 			t.Fatalf("id = %v, want chatcmpl-<millis>", result["id"])
 		}

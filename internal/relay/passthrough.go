@@ -69,26 +69,43 @@ func (r *PassthroughRelay) buildClientUsage(u map[string]any) map[string]any {
 }
 
 // convertUsageForFormat renames canonical usage into the target family's
-// field names (usageTracking.js convertUsageForFormat, chat+responses only).
+// field names (usageTracking.js convertUsageForFormat, 158-190 — the chat
+// family is identity, only the Responses branch renames). Every read below is
+// JS-faithful:
+//   - the source fields go through NULLISH chains (`input_tokens ??
+//     prompt_tokens`, 178-180): a PRESENT 0 beats a populated sibling, and
+//     only then does `num()` coerce through Number — numeric strings ("7")
+//     and booleans included;
+//   - `num(v) ?? 0` (159): non-finite coercions land on 0;
+//   - `if (cached)` / `if (reasoning)` (183-186) are TRUTHINESS gates — a
+//     NEGATIVE count is kept, 0/NaN/undefined skip the details object;
+//   - `if (usage.estimated) converted.estimated = true` (185/189): the marker
+//     is gated on truthiness but always written as the literal true.
 func convertUsageForFormat(u map[string]any, format Format) map[string]any {
 	if u == nil {
 		return u
 	}
 	if format == FormatResponses {
 		converted := map[string]any{
-			"input_tokens":  pickNum(u, "input_tokens", "prompt_tokens"),
-			"output_tokens": pickNum(u, "output_tokens", "completion_tokens"),
+			"input_tokens":  jsNumOr0(jsNullish(u["input_tokens"], u["prompt_tokens"])),
+			"output_tokens": jsNumOr0(jsNullish(u["output_tokens"], u["completion_tokens"])),
 		}
-		if cached := numOr(jsonx.Get(u["input_tokens_details"], "cached_tokens"),
-			u["cached_tokens"], jsonx.Get(u["prompt_tokens_details"], "cached_tokens")); cached > 0 {
+		if cached, ok := usage.NumOK(jsNullish(
+			jsonx.Get(u["input_tokens_details"], "cached_tokens"),
+			u["cached_tokens"],
+			jsonx.Get(u["prompt_tokens_details"], "cached_tokens"),
+		)); ok && cached != 0 {
 			converted["input_tokens_details"] = jsonx.ObjOf("cached_tokens", cached)
 		}
-		if reasoning := numOr(jsonx.Get(u["output_tokens_details"], "reasoning_tokens"),
-			u["reasoning_tokens"]); reasoning > 0 {
+		if reasoning, ok := usage.NumOK(jsNullish(
+			jsonx.Get(u["output_tokens_details"], "reasoning_tokens"),
+			u["reasoning_tokens"],
+			u["thoughtsTokenCount"],
+		)); ok && reasoning != 0 {
 			converted["output_tokens_details"] = jsonx.ObjOf("reasoning_tokens", reasoning)
 		}
-		if _, has := u["estimated"]; has {
-			converted["estimated"] = u["estimated"]
+		if jsTruthy(u["estimated"]) {
+			converted["estimated"] = true
 		}
 		return converted
 	}
@@ -121,6 +138,9 @@ func filterUsageForFormat(u map[string]any, format Format) map[string]any {
 	return out
 }
 
+// numOr mirrors JS `a || b || 0` over all-numeric chains — the first truthy
+// (non-zero) float64 wins, else the literal 0 (sseToJsonHandler.js:103-107
+// and the responses→chat usage folds, where every operand is a token count).
 func numOr(values ...any) float64 {
 	for _, v := range values {
 		switch n := v.(type) {
@@ -128,15 +148,6 @@ func numOr(values ...any) float64 {
 			if n != 0 {
 				return n
 			}
-		}
-	}
-	return 0
-}
-
-func pickNum(u map[string]any, keys ...string) float64 {
-	for _, k := range keys {
-		if n, is := u[k].(float64); is {
-			return n
 		}
 	}
 	return 0
@@ -183,6 +194,35 @@ func (r *PassthroughRelay) ProcessLine(line string) error {
 
 	output := ""
 	injected := false
+
+	// stream.js:288-309 iterate parsed.choices with for..of, reading a property
+	// of EVERY element (`choice.content_filter_results`,
+	// `choice.delta?.tool_calls`): a truthy choices that is neither an array
+	// nor a string ({} / 5 / true) throws TypeError on the iteration itself,
+	// and a NULL ELEMENT throws on the property read — the catch at
+	// stream.js:364-369 silently drops the WHOLE chunk either way. Both throws
+	// happen BEFORE the terminal-event probe at stream.js:332, so neither may
+	// set terminalSeen (a hostile `choices:[null]` terminal-looking chunk must
+	// not suppress the failed-stream synthesis). Strings ARE iterable and
+	// per-character iteration mutates nothing; scalars box harmlessly
+	// (property reads on primitives yield undefined) — both stay in play. A
+	// falsy choices (null/0/""/false) never reaches the loops at all
+	// (stream.js:288 `parsed?.choices`).
+	if choicesValue, has := parsed["choices"]; has && jsTruthy(choicesValue) {
+		switch cv := choicesValue.(type) {
+		case []any:
+			for _, el := range cv {
+				if el == nil {
+					return nil // stream.js:288-294 — property read on null throws
+				}
+			}
+		case string:
+			// iterable; the loops below iterate per character and mutate nothing
+		default:
+			return nil // non-iterable — for..of throws (stream.js:289/303)
+		}
+	}
+
 	// stream.js:332: passthrough never captures an `event:` line
 	// (currentOpenAIResponsesEvent stays null), so terminality comes from the
 	// chunk.type fallback in getOpenAIResponsesEventName. The same signal feeds
@@ -217,21 +257,7 @@ func (r *PassthroughRelay) ProcessLine(line string) error {
 		delete(parsed, "prompt_filter_results")
 		fieldsInjected = true
 	}
-	// stream.js:288-309 iterates parsed.choices with for..of: a present,
-	// truthy choices that is neither an array nor a string ({} / 5 / true)
-	// throws TypeError, caught at stream.js:364 → continue — the WHOLE chunk
-	// is dropped (no seam, no emit). Strings ARE iterable: the per-character
-	// iteration mutates nothing, so a `"choices": "abc"` chunk stays in play
-	// (the loops below then skip it exactly like JS's no-op iteration). A
-	// falsy choices (null/0/""/false) never reaches the loops at all
-	// (stream.js:288 `parsed?.choices`).
-	if choicesValue, has := parsed["choices"]; has && jsTruthy(choicesValue) {
-		_, isArray := choicesValue.([]any)
-		_, isString := choicesValue.(string)
-		if !isArray && !isString {
-			return nil
-		}
-	}
+	// Azure content_filter_results strip (stream.js:288-294).
 	for _, choice := range jsonx.AsArr(parsed["choices"]) {
 		c := jsonx.AsObj(choice)
 		if c == nil {
@@ -271,7 +297,9 @@ func (r *PassthroughRelay) ProcessLine(line string) error {
 	if len(choices) > 0 {
 		choice0, _ = choices[0].(map[string]any)
 	}
-	isFinishChunk := jsonx.AsStr(jsonx.Get(choice0, "finish_reason")) != ""
+	// stream.js:334 `parsed.choices?.[0]?.finish_reason` — TRUTHINESS, not a
+	// string check: `finish_reason: true / 1 / []` marks the finish chunk too.
+	isFinishChunk := jsTruthy(jsonx.Get(choice0, "finish_reason"))
 	u, hasUsageObj := parsed["usage"].(map[string]any)
 	carriesUsage := hasUsageObj && usage.HasValid(u)
 
@@ -427,12 +455,15 @@ func (r *PassthroughRelay) finalize() {
 	r.FinalThinking = r.thinking.String()
 }
 
-// mergeTracked: real usage replaces an estimate instead of max-merging into it.
+// mergeTracked: real usage replaces an estimate instead of max-merging into it
+// (stream.js:168-169 `prev?.estimated ? next : mergeUsage(prev, next)` — the
+// marker check is JS TRUTHINESS, so any truthy estimated value marks the
+// estimate, not just the literal true).
 func (r *PassthroughRelay) mergeTracked(prev, next map[string]any) map[string]any {
 	if next == nil {
 		return prev
 	}
-	if prev != nil && prev["estimated"] == true {
+	if prev != nil && jsTruthy(prev["estimated"]) {
 		return next
 	}
 	return usage.Merge(prev, next)

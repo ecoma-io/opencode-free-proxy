@@ -77,8 +77,11 @@ func firstChoice(item map[string]any) map[string]any {
 
 // applyUsageSeam ports the translate-mode usage seam onto a client-bound item.
 func (r *TranslateRelay) applyUsageSeam(item map[string]any) map[string]any {
+	// stream.js:185 — `item.type === "message_delta"` is a strict equality,
+	// but `item.choices?.[0]?.finish_reason` is TRUTHINESS: a boolean/numeric
+	// finish_reason marks the finish item too.
 	isFinishChunk := jsonx.AsStr(item["type"]) == "message_delta" ||
-		jsonx.AsStr(jsonx.Get(firstChoice(item), "finish_reason")) != ""
+		jsTruthy(jsonx.Get(firstChoice(item), "finish_reason"))
 	u, hasU := item["usage"].(map[string]any)
 	respUsage, hasRU := jsonx.Get(item["response"], "usage").(map[string]any)
 	carriesUsage := (hasU && usage.HasValid(u)) || (hasRU && usage.HasValid(respUsage))
@@ -239,11 +242,14 @@ func (r *TranslateRelay) finalize() {
 	r.FinalThinking = r.thinking.String()
 }
 
+// mergeTracked: stream.js:168-169 `prev?.estimated ? next : mergeUsage(prev,
+// next)` — the estimate marker check is JS TRUTHINESS, not a literal-true
+// comparison.
 func (r *TranslateRelay) mergeTracked(prev, next map[string]any) map[string]any {
 	if next == nil {
 		return prev
 	}
-	if prev != nil && prev["estimated"] == true {
+	if prev != nil && jsTruthy(prev["estimated"]) {
 		return next
 	}
 	return usage.Merge(prev, next)

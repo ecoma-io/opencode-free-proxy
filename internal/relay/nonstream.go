@@ -10,6 +10,7 @@ import (
 	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/jsonx"
 	"opencode-free-proxy/internal/translate"
+	"opencode-free-proxy/internal/usage"
 )
 
 // ParseSSEToOpenAIResponse folds a raw Chat Completions SSE body into one
@@ -61,13 +62,19 @@ func ParseSSEToOpenAIResponse(rawSSE string, fallbackModel string) (result map[s
 
 	// sseToJsonHandler.js:133: `first = chunks[0]` — whatever it is. A scalar
 	// first chunk reads as undefined fields, so id/created/model all fall back
-	// (sseToJsonHandler.js:170-173) even when a later object carries them.
+	// (sseToJsonHandler.js:170-173) even when a later object carries them. (A
+	// JSON-null first chunk would THROW at `first.id` in JS and surface as the
+	// caller's 502 envelope — Go has no exception to propagate, so it degrades
+	// to the same undefined-field fallbacks as a scalar; documented
+	// divergence.)
 	first, _ := chunks[0].(map[string]any)
 	var contentParts, reasoningParts []string
 	toolCallMap := map[int]map[string]any{}
 	var toolIndexes []int
-	finishReason := "stop"
-	var usageObj map[string]any
+	// sseToJsonHandler.js:140/141: finish_reason keeps its RAW value (any
+	// truthy type) and usage may be ANY typeof-"object" — arrays included.
+	finishReason := any("stop")
+	var usageObj any
 
 	for _, raw := range chunks {
 		chunk, isObj := raw.(map[string]any)
@@ -84,11 +91,19 @@ func ParseSSEToOpenAIResponse(rawSSE string, fallbackModel string) (result map[s
 		if r, is := jsonx.Get(delta, "reasoning_content").(string); is && r != "" {
 			reasoningParts = append(reasoningParts, r)
 		}
-		if fr := jsonx.AsStr(jsonx.Get(choice, "finish_reason")); fr != "" {
+		// sseToJsonHandler.js:141 `if (choice?.finish_reason)` — truthiness,
+		// and the RAW value is assigned (a boolean/numeric finish survives).
+		if fr := jsonx.Get(choice, "finish_reason"); jsTruthy(fr) {
 			finishReason = fr
 		}
-		if u, is := chunk["usage"].(map[string]any); is {
-			usageObj = u
+		// sseToJsonHandler.js:142 `chunk?.usage && typeof chunk.usage ===
+		// "object"` — typeof [] is "object", so an ARRAY usage is captured
+		// too (and forwarded verbatim at 176).
+		if u := chunk["usage"]; jsTruthy(u) {
+			switch u.(type) {
+			case map[string]any, []any:
+				usageObj = u
+			}
 		}
 		for _, tcRaw := range jsonx.AsArr(jsonx.Get(delta, "tool_calls")) {
 			tc := jsonx.AsObj(tcRaw)
@@ -109,14 +124,19 @@ func ParseSSEToOpenAIResponse(rawSSE string, fallbackModel string) (result map[s
 				toolIndexes = append(toolIndexes, idx)
 			}
 			fn := jsonx.AsObj(existing["function"])
-			if id := jsonx.AsStr(tc["id"]); id != "" {
+			// sseToJsonHandler.js:151-156 — all three accumulation gates are
+			// TRUTHINESS over the RAW value (`if (tc.id)`, `if (tc.function?.
+			// name)`), and `+=` concatenates with String() coercion, so a
+			// numeric name/arguments fragment joins as its JS string
+			// rendering.
+			if id := tc["id"]; jsTruthy(id) {
 				existing["id"] = id
 			}
-			if n := jsonx.AsStr(jsonx.Get(tc["function"], "name")); n != "" {
-				fn["name"] = jsonx.AsStr(fn["name"]) + n
+			if n := jsonx.Get(tc["function"], "name"); jsTruthy(n) {
+				fn["name"] = usage.JSStr(fn["name"]) + usage.JSStr(n)
 			}
-			if a := jsonx.AsStr(jsonx.Get(tc["function"], "arguments")); a != "" {
-				fn["arguments"] = jsonx.AsStr(fn["arguments"]) + a
+			if a := jsonx.Get(tc["function"], "arguments"); jsTruthy(a) {
+				fn["arguments"] = usage.JSStr(fn["arguments"]) + usage.JSStr(a)
 			}
 		}
 	}
@@ -142,21 +162,24 @@ func ParseSSEToOpenAIResponse(rawSSE string, fallbackModel string) (result map[s
 		message["tool_calls"] = calls
 	}
 
-	id := jsonx.AsStr(first["id"])
-	if id == "" {
+	// sseToJsonHandler.js:170-173 — `first.id || …` / `first.created || …` /
+	// `first.model || fallbackModel || "unknown"` are TRUTHINESS checks over
+	// the RAW values: a numeric id or a string created survives as-is, and
+	// only falsy values fall through (a created of 0 IS falsy and hits the
+	// now() fallback).
+	id := first["id"]
+	if !jsTruthy(id) {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixMilli())
 	}
-	created := jsonx.AsF64(first["created"])
-	if created == 0 {
+	created := first["created"]
+	if !jsTruthy(created) {
 		created = float64(time.Now().UnixMilli() / 1000)
 	}
-	model := jsonx.AsStr(first["model"])
-	if model == "" {
+	model := first["model"]
+	if !jsTruthy(model) {
 		model = fallbackModel
 	}
-	if model == "" {
-		// JS: `first.model || fallbackModel || "unknown"`
-		// (sseToJsonHandler.js:173).
+	if !jsTruthy(model) {
 		model = "unknown"
 	}
 	result = jsonx.ObjOf(
@@ -182,10 +205,13 @@ func firstOf(v any) any {
 	return nil
 }
 
-// responsesAggState accumulates convertResponsesStreamToJson.
+// responsesAggState accumulates convertResponsesStreamToJson. responseID and
+// created are `any`: streamToJsonConverter.js:26-27 assigns them through
+// TRUTHY `||` fallbacks that keep the RAW value (a numeric response id or a
+// string created_at survives as-is).
 type responsesAggState struct {
-	responseID string
-	created    float64
+	responseID any
+	created    any
 	status     string
 	usage      map[string]any
 	items      map[int]map[string]any
@@ -196,7 +222,7 @@ type responsesAggState struct {
 func ConvertResponsesStreamToJson(rawSSE string) map[string]any {
 	now := time.Now()
 	st := &responsesAggState{
-		created: float64(now.UnixMilli() / 1000),
+		created: float64(now.UnixMilli() / 1000), // initState: Math.floor(Date.now()/1000)
 		status:  "in_progress",
 		usage:   map[string]any{"input_tokens": 0.0, "output_tokens": 0.0, "total_tokens": 0.0},
 		items:   map[int]map[string]any{},
@@ -228,8 +254,11 @@ func ConvertResponsesStreamToJson(rawSSE string) map[string]any {
 		}
 	}
 
+	// streamToJsonConverter.js:95 `state.responseId || resp_…` — TRUTHINESS:
+	// a truthy non-string id (set raw at line 26) forwards as-is, and only
+	// the never-set/empty case synthesizes.
 	id := st.responseID
-	if id == "" {
+	if !jsTruthy(id) {
 		// JS: `resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 		// (streamToJsonConverter.js:96) — always a 6-char base36 fragment.
 		// Left-pad the nanotime fragment so short values still fill 6 chars
@@ -237,7 +266,7 @@ func ConvertResponsesStreamToJson(rawSSE string) map[string]any {
 		id = fmt.Sprintf("resp_%d_%06s", now.UnixMilli(), formatInt36(now.UnixNano()%2176782336))
 	}
 	status := st.status
-	if status == "" {
+	if !jsTruthy(status) {
 		status = "completed"
 	}
 	return jsonx.ObjOf(
@@ -270,10 +299,14 @@ func processAggMessage(msg string, st *responsesAggState) {
 
 	switch eventType {
 	case "response.created":
-		if id := jsonx.AsStr(jsonx.Get(parsed["response"], "id")); id != "" {
+		// streamToJsonConverter.js:26-27 — `parsed.response?.id ||
+		// state.responseId`: TRUTHINESS over the RAW value (only a falsy read
+		// keeps the previous state), so a numeric id or string created_at
+		// survives as-is.
+		if id := jsonx.Get(parsed["response"], "id"); jsTruthy(id) {
 			st.responseID = id
 		}
-		if created := jsonx.AsF64(jsonx.Get(parsed["response"], "created_at")); created != 0 {
+		if created := jsonx.Get(parsed["response"], "created_at"); jsTruthy(created) {
 			st.created = created
 		}
 	case "response.output_item.done":
@@ -305,11 +338,14 @@ func processAggMessage(msg string, st *responsesAggState) {
 		}
 	case "response.completed", "response.done":
 		st.status = "completed"
-		respUsage := jsonx.AsObj(jsonx.Get(parsed["response"], "usage"))
-		if respUsage != nil {
-			st.usage["input_tokens"] = jsonx.AsF64(respUsage["input_tokens"])
-			st.usage["output_tokens"] = jsonx.AsF64(respUsage["output_tokens"])
-			st.usage["total_tokens"] = jsonx.AsF64(respUsage["total_tokens"])
+		// streamToJsonConverter.js:29-36 — `if (parsed.response?.usage)` is
+		// TRUTHINESS (an array passes typeof-free truthiness too, and its
+		// element reads are undefined → 0), and each counter keeps its RAW
+		// truthy value through `parsed.response.usage.X || 0`.
+		if respUsage := jsonx.Get(parsed["response"], "usage"); jsTruthy(respUsage) {
+			st.usage["input_tokens"] = jsOr(jsonx.Get(respUsage, "input_tokens"), 0.0)
+			st.usage["output_tokens"] = jsOr(jsonx.Get(respUsage, "output_tokens"), 0.0)
+			st.usage["total_tokens"] = jsOr(jsonx.Get(respUsage, "total_tokens"), 0.0)
 		}
 	case "response.failed":
 		st.status = "failed"
@@ -370,31 +406,41 @@ func ChatCompletionToResponses(responseBody map[string]any, customToolNames map[
 		if fn == nil {
 			fn = jsonx.ObjOf()
 		}
-		name := jsonx.AsStr(fn["name"])
-		custom := customToolNames != nil && customToolNames[name]
+		// sseToJsonHandler.js:78-90 — the id/call_id/name fields go through
+		// `|| ""` chains that keep the RAW truthy value (a numeric call_id
+		// survives as a number); only `id` is stringified, by the template
+		// literal. The custom-tool lookup (`customToolNames?.has(fn.name)`)
+		// compares the raw name against a set that only ever holds non-empty
+		// strings, so the string view is equivalent there.
+		custom := customToolNames != nil && customToolNames[jsonx.AsStr(fn["name"])]
 		prefix := "fc"
+		if custom {
+			prefix = "ctc"
+		}
+		idSuffix := ""
+		if jsTruthy(tc["id"]) {
+			idSuffix = usage.JSStr(tc["id"])
+		}
+		var callID any = ""
+		if jsTruthy(tc["id"]) {
+			callID = tc["id"]
+		}
+		var name any = ""
+		if jsTruthy(fn["name"]) {
+			name = fn["name"]
+		}
 		item := jsonx.ObjOf(
 			"type", translate.ItemFunctionCall,
-			"id", prefix+"_"+jsonx.AsStr(tc["id"]),
-			"call_id", jsonx.AsStr(tc["id"]),
+			"id", prefix+"_"+idSuffix,
+			"call_id", callID,
 			"name", name,
 		)
-		args, argsIsStr := fn["arguments"].(string)
 		if custom {
 			item["type"] = translate.ItemCustomToolCall
-			item["id"] = "ctc_" + jsonx.AsStr(tc["id"])
-			item["input"] = extractCustomToolInput(args)
+			item["id"] = "ctc_" + idSuffix
+			item["input"] = extractCustomToolInput(fn["arguments"])
 		} else {
-			// JS: typeof fn.arguments === "string" ? fn.arguments : stringify(fn.arguments || {})
-			if !argsIsStr {
-				if fn["arguments"] == nil {
-					args = "{}"
-				} else {
-					b, _ := json.Marshal(fn["arguments"])
-					args = string(b)
-				}
-			}
-			item["arguments"] = args
+			item["arguments"] = jsStringifyArguments(fn["arguments"])
 		}
 		output = append(output, item)
 	}
@@ -403,14 +449,24 @@ func ChatCompletionToResponses(responseBody map[string]any, customToolNames map[
 	if usageObj == nil {
 		usageObj = jsonx.ObjOf()
 	}
-	id := "resp_" + jsonx.AsStr(responseBody["id"])
-	id = strings.Replace(id, "resp_chatcmpl-", "resp_", 1)
-	created := jsonx.AsF64(responseBody["created"])
-	if created == 0 {
+	// sseToJsonHandler.js:94-97 — the id template stringifies the truthy raw
+	// id, and the ^-anchored `resp_chatcmpl-` collapse replaces only at the
+	// start of the concatenated string. created/model keep their RAW truthy
+	// values through `|| fallback`.
+	rawID := ""
+	if jsTruthy(responseBody["id"]) {
+		rawID = usage.JSStr(responseBody["id"])
+	}
+	id := "resp_" + rawID
+	if strings.HasPrefix(id, "resp_chatcmpl-") {
+		id = "resp_" + strings.TrimPrefix(id, "resp_chatcmpl-")
+	}
+	created := responseBody["created"]
+	if !jsTruthy(created) {
 		created = float64(time.Now().UnixMilli() / 1000)
 	}
-	model := jsonx.AsStr(responseBody["model"])
-	if model == "" {
+	model := responseBody["model"]
+	if !jsTruthy(model) {
 		model = "unknown"
 	}
 	return jsonx.ObjOf(
@@ -431,17 +487,39 @@ func ChatCompletionToResponses(responseBody map[string]any, customToolNames map[
 	)
 }
 
-// extractCustomToolInput unwraps {"input":"..."} freeform payloads.
-func extractCustomToolInput(argumentsValue any) string {
-	argumentsText, isStr := argumentsValue.(string)
-	if !isStr {
-		if argumentsValue == nil {
-			argumentsText = "{}"
-		} else {
-			b, _ := json.Marshal(argumentsValue)
-			argumentsText = string(b)
-		}
+// jsStringifyArguments is sseToJsonHandler.js:88's
+// `typeof v === "string" ? v : JSON.stringify(v || {})` (and the identical
+// responses-branch site at 268): a string passes through, every FALSY value
+// (0, false, null, "") stringifies the empty object, and any other truthy
+// value JSON-serializes.
+func jsStringifyArguments(v any) string {
+	if s, is := v.(string); is {
+		return s
 	}
+	if !jsTruthy(v) {
+		return "{}"
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+// jsKeyStr renders `m[key]` as it would appear inside a JS template literal:
+// an ABSENT key stringifies to "undefined", a JSON null to "null" (both
+// distinct from ""), everything else through String() coercion
+// (sseToJsonHandler.js:263's `call_${item.name}_…`).
+func jsKeyStr(m map[string]any, key string) string {
+	v, has := m[key]
+	if !has {
+		return "undefined"
+	}
+	return usage.JSStr(v)
+}
+
+// extractCustomToolInput unwraps {"input":"..."} freeform payloads
+// (sseToJsonHandler.js:45-52 — the arguments text resolves through the same
+// `typeof === "string" ? … : JSON.stringify(v || {})` rule).
+func extractCustomToolInput(argumentsValue any) string {
+	argumentsText := jsStringifyArguments(argumentsValue)
 	var parsed any
 	if json.Unmarshal([]byte(argumentsText), &parsed) == nil {
 		if o, isObj := parsed.(map[string]any); isObj {
@@ -520,27 +598,27 @@ func BuildChatFromResponses(jsonResponse map[string]any, model string, synthesiz
 		if o == nil || jsonx.AsStr(o["type"]) != "function_call" {
 			continue
 		}
+		// sseToJsonHandler.js:263-270 — `item.call_id || call_…` keeps the
+		// RAW truthy value (a numeric call id survives); the synthesized id
+		// template stringifies item.name, where an ABSENT name renders as
+		// "undefined" (jsKeyStr). The function name forwards RAW — an absent
+		// name key drops in JS, a null stays null — and arguments follow the
+		// shared stringify rule (0/false → "{}").
 		idx := len(toolCalls)
-		id := jsonx.AsStr(o["call_id"])
-		if id == "" {
-			id = fmt.Sprintf("call_%s_%d_%d", jsonx.AsStr(o["name"]), time.Now().UnixMilli(), idx)
-		}
-		// JS: typeof arguments === "string" ? arguments : stringify(arguments || {})
-		var args string
-		if s, is := o["arguments"].(string); is {
-			args = s
-		} else if o["arguments"] == nil {
-			args = "{}"
+		var id any
+		if v := o["call_id"]; jsTruthy(v) {
+			id = v
 		} else {
-			b, _ := json.Marshal(o["arguments"])
-			args = string(b)
+			id = fmt.Sprintf("call_%s_%d_%d", jsKeyStr(o, "name"), time.Now().UnixMilli(), idx)
+		}
+		fnObj := jsonx.ObjOf("arguments", jsStringifyArguments(o["arguments"]))
+		if v, has := o["name"]; has {
+			fnObj["name"] = v
 		}
 		toolCalls = append(toolCalls, jsonx.ObjOf(
 			"id", id,
 			"type", "function",
-			"function", jsonx.ObjOf(
-				"name", jsonx.AsStr(o["name"]),
-				"arguments", args)))
+			"function", fnObj))
 	}
 	hasToolCalls := len(toolCalls) > 0
 
@@ -556,27 +634,31 @@ func BuildChatFromResponses(jsonResponse map[string]any, model string, synthesiz
 		message["tool_calls"] = toolCalls
 	}
 
+	// sseToJsonHandler.js:283-288 — the status compares are STRICT equality
+	// (strings), but the finish reason keeps the RAW truthy status through
+	// `jsonResponse.status || "stop"`, and id/created/model keep their RAW
+	// truthy values through the same `||` chains.
 	status := jsonx.AsStr(jsonResponse["status"])
 	responseDone := status == "completed" || status == "done"
-	finishReason := status
+	finishReason := any("stop")
 	if hasToolCalls {
 		finishReason = "tool_calls"
-	} else if responseDone {
-		finishReason = "stop"
-	} else if finishReason == "" {
-		finishReason = "stop"
+	} else if !responseDone {
+		if s := jsonResponse["status"]; jsTruthy(s) {
+			finishReason = s
+		}
 	}
 
-	id := jsonx.AsStr(jsonResponse["id"])
-	if id == "" {
+	id := jsonResponse["id"]
+	if !jsTruthy(id) {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixMilli())
 	}
-	created := jsonx.AsF64(jsonResponse["created_at"])
-	if created == 0 {
+	created := jsonResponse["created_at"]
+	if !jsTruthy(created) {
 		created = float64(time.Now().UnixMilli() / 1000)
 	}
-	respModel := jsonx.AsStr(jsonResponse["model"])
-	if respModel == "" {
+	respModel := jsonResponse["model"]
+	if !jsTruthy(respModel) {
 		respModel = model
 	}
 

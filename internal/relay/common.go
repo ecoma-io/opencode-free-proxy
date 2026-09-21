@@ -146,17 +146,58 @@ func hasValuableContent(chunk map[string]any) bool {
 	return usage.HasValid(u)
 }
 
-// accumulate counts content/reasoning lengths for the usage estimate.
+// jsNullish mirrors JS `a ?? b ?? c` over already-read values: only an absent
+// key (nil in Go) or a JSON null falls through — a present 0, "" or false
+// wins (usageTracking.js:178-183, convertUsageForFormat's nullish chains).
+func jsNullish(vals ...any) any {
+	for _, v := range vals {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
+}
+
+// jsOr mirrors JS `a || b`: the first truthy value wins, else the LAST
+// operand's value — even when it is falsy (`x || 0` is 0). Used where the
+// surviving RAW value (any type) is assigned, not just its numeric view
+// (streamToJsonConverter.js:30-36).
+func jsOr(vals ...any) any {
+	for _, v := range vals {
+		if jsTruthy(v) {
+			return v
+		}
+	}
+	if len(vals) > 0 {
+		return vals[len(vals)-1]
+	}
+	return nil
+}
+
+// jsNumOr0 is convertUsageForFormat's `num(v) ?? 0`
+// (usageTracking.js:159, 178-180): Number(v), falling to 0 whenever the
+// coercion is not finite (num yields undefined there).
+func jsNumOr0(v any) float64 {
+	f, ok := usage.NumOK(v)
+	if !ok {
+		return 0
+	}
+	return f
+}
+
+// accumulate counts content/reasoning lengths for the usage estimate. JS adds
+// `content.length` (stream.js:315-325) — UTF-16 CODE UNITS, not bytes, so
+// multibyte content counts 2-3 units per rune and an emoji counts 2.
 func accumulate(totalLen *int, content, thinking *strings.Builder, delta map[string]any) {
 	if delta == nil {
 		return
 	}
 	if c, is := delta["content"].(string); is && c != "" {
-		*totalLen += len(c)
+		*totalLen += usage.UTF16Len(c)
 		content.WriteString(c)
 	}
 	if r, is := delta["reasoning_content"].(string); is && r != "" {
-		*totalLen += len(r)
+		*totalLen += usage.UTF16Len(r)
 		thinking.WriteString(r)
 	}
 }
