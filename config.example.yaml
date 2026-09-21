@@ -107,6 +107,14 @@
 #                      disabled; negative is a load error. The request hot
 #                      path never triggers a fetch (fail-open contract).
 #                      Converted to a duration in Resolve only.
+#
+# log-level            process-wide JSON log threshold, hot-reloadable:
+#                      debug | info | warn | error. Default info. The reload
+#                      goroutine is the ONLY runtime writer of the global
+#                      level, so a live config edit takes effect on the next
+#                      poll without touching in-flight requests. Gate detail:
+#                      completion lines log at info (asserted by the e2e
+#                      suite); opencode UA warm-up logs at debug.
 # ---------------------------------------------------------------------------
 
 egress:
@@ -223,3 +231,7 @@ upstream:
 user_agent:
   # UA-triple sync cadence in SECONDS; default 3600. 0 disables the loop.
   sync_interval: 3600
+
+# Process-wide JSON log threshold; default info. Hot-reloadable — edit live,
+# the poller applies it without restarting or disturbing in-flight requests.
+log-level: info

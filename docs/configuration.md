@@ -30,6 +30,8 @@ is.
 ## The config document
 
 ```yaml
+# process-wide JSON log threshold; hot-reloadable
+log-level: info # debug | info | warn | error
 upstream:
   base: https://opencode.ai
 user_agent:
@@ -63,6 +65,25 @@ health:
   failure_threshold: 3 # consecutive failures before cooldown; 0 = never
   cooldown: 30s # Go duration string; bare numbers are a load error
 ```
+
+## Log level
+
+| Field       | Type                                   | Default | Meaning                                                                                                                                                                                                                           |
+| ----------- | -------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `log-level` | `debug` \| `info` \| `warn` \| `error` | `info`  | Process-wide JSON log threshold. The config-reload goroutine is the ONLY runtime writer of the global level; a live config edit takes effect on the next poll without touching in-flight requests. Anything else is a load error. |
+
+The mapping is exact; `trace` and `fatal` are deliberately not config values.
+Events are leveled:
+
+- **info** — lifecycle (listening, config loaded, shutdown) and one
+  per-request completion line (the black-box suite asserts its facts at this
+  level, so it cannot be demoted);
+- **debug** — opencode UA warm-up; per-request completion carries extra
+  structured fields for correlation;
+- **warn** — fault signals a request survived (reload read/rejection,
+  transport-setup failure, forced SSE→JSON abort, shutdown grace forced
+  close);
+- **error** — fatal startup/config/healthcheck failures.
 
 ## Service sections
 
@@ -167,6 +188,9 @@ final content.
 - Process-wide state migrates deliberately across swaps (health history,
   scheduler rotation, transport cache) — see
   [architecture.md](architecture.md#process-wide-state-lifecycles).
+- `log-level` swaps with the rest of the snapshot: the reload goroutine writes
+  `zerolog.SetGlobalLevel` for it, so the very next event after a swap obeys
+  the new threshold.
 
 ## Validation errors
 
@@ -188,6 +212,8 @@ often hit:
 - durations (`health.cooldown`) are Go duration strings (`"30s"`) — a bare
   number is a load error;
 - an unset `${VAR}` fails the whole load, naming the variable.
+- `log-level` is one of `debug`, `info`, `warn`, `error` (anything else is
+  rejected with `log-level must be one of debug, info, warn, error, got %q`).
 
 Input values echoed into errors are bounded (`boundedEcho`) — a hostile
 config line cannot bloat a log or smuggle unbounded bytes into an error

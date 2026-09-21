@@ -91,25 +91,32 @@ The semantics agents most often get wrong:
 7. Streaming commitment: once a live upstream response exists there is no
    fallback, ever; a mid-stream death aborts the downstream response
    (`internal/router/stream.go`).
+8. `log-level` (debug|info|warn|error, default info) is a process-global
+   zerolog threshold. The config-reload goroutine is the ONLY runtime writer
+   of `zerolog.SetGlobalLevel`; the swap message must keep the literal
+   `config reload: swapped to new config (generation %d` — the e2e suite
+   greps it. Completion lines log at info and are the e2e suite's only
+   request-outcome evidence (Debug would hide them).
 
 ## Layout
 
-| Package              | Role                                                                                                                                                                                                  |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                               |
-| `internal/config`    | every runtime constant + the `OCFP_`-prefixed bootstrap env vars; multi-egress YAML model (routes, egresses, `upstream.base`, `user_agent.sync_interval`), interpolation, redaction, hot-reload store |
-| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                      |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                           |
-| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration                                                                                   |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                    |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                  |
-| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging                                          |
-| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                          |
-| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                |
-| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                    |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                               |
-| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                              |
-| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                  |
+| Package              | Role                                                                                                                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                            |
+| `internal/logging`   | zerolog construction (`time`/`level`/`msg` field names), the constructor-edge compatibility adapter for legacy test callbacks                                                                                      |
+| `internal/config`    | every runtime constant + the `OCFP_`-prefixed bootstrap env vars; multi-egress YAML model (routes, egresses, `upstream.base`, `user_agent.sync_interval`, `log-level`), interpolation, redaction, hot-reload store |
+| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                   |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                        |
+| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration                                                                                                |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                                 |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                               |
+| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging                                                       |
+| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                       |
+| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                             |
+| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                                 |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                            |
+| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                           |
+| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                               |
 
 ## Porting discipline (the rules that keep parity)
 

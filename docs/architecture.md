@@ -15,6 +15,24 @@ HTTP request
   → Response        (+ completion log: generation=N route=… egress=…)
 ```
 
+## Logging
+
+JSON lines on stdout (one logger, `internal/logging`), gated by a
+**package-global zerolog level** that mirrors `log-level` from the config
+snapshot. The global level, not per-module loggers, is the design: every
+event checks it at emit time, so a config reload that flips the level applies
+it atomically to the next event — no handler state is touched.
+
+- the **reload goroutine is the only runtime writer** of
+  `zerolog.SetGlobalLevel` (`config.Store.tick`); `cmd/server` bootstraps the
+  first level after the initial load;
+- the level travels with the snapshot like any other field — an in-flight
+  request still logs under the threshold of the generation it pinned;
+- fields are the JSON-envelope constants `time` / `level` / `msg`,
+  initialized once in `internal/logging`.
+- every event carries `generation=N` naming its request's snapshot; events
+  from the store reload path carry the NEW generation after a swap.
+
 ## Immutable runtime generations
 
 The config document is loaded into an immutable `Runtime` snapshot
@@ -147,6 +165,7 @@ upstream and are translated transparently for chat clients.
 | Package              | Role                                                                                                                                                         |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                      |
+| `internal/logging`   | zerolog construction + the compatibility adapter at constructor edges; centralized `time`/`level`/`msg` field names                                          |
 | `internal/config`    | every runtime constant + bootstrap env vars; multi-egress YAML model, interpolation, redaction, hot-reload store, the immutable `Runtime` snapshot           |
 | `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                             |
 | `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                  |

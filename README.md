@@ -19,9 +19,13 @@ streaming and non-streaming.
   matrix, consecutive-failure cooldowns, typed 407 handling, streaming
   commitment (no fallback once the upstream response is live).
 - **One config file, hot-reloaded**: every service setting lives in a single
-  YAML document — upstream base, UA-sync cadence,
+  YAML document — upstream base, UA-sync cadence, the log level,
   egresses, routes, fallback, health. Edits hot-reload in place; requests in
   flight keep the generation they started on.
+- **Structured JSON logs**: one line per event on stdout, gated by the
+  hot-reloadable `log-level` (default `info`); every request logs a
+  completion line with generation / route / egress / attempts / class /
+  status / latency / model / fallback.
 - **Secret hygiene**: credentials are `${VAR}` env references resolved at
   load — the file carries no literals, logs and errors never echo them.
 
@@ -38,6 +42,7 @@ Point `OCFP_CONFIG` at a document to enable egress routing or a
 different upstream:
 
 ```yaml
+log-level: info # debug | info | warn | error; hot-reloadable
 upstream:
   base: https://opencode.ai
 user_agent:
