@@ -29,7 +29,8 @@ streaming and non-streaming.
 
 ```sh
 go run ./cmd/server          # listens on :8090, upstream https://opencode.ai, auth off
-docker compose up -d --build # or: build + serve via compose (HOST_PORT, default 30258)
+docker compose up -d --build # build + serve via compose (HOST_PORT, default 30258);
+                             # create ./config.yaml first — see docs/deployment.md
 ```
 
 With no config the built-in runtime serves the default upstream with auth

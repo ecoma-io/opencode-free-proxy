@@ -17,8 +17,21 @@ docker run -d -p 8090:8090 \
 ## Docker Compose
 
 The repo ships a minimal compose file (`compose.yaml`) that builds the image
-and mounts `compose.config.yaml` (direct egress, auth off) as the config
-document:
+and mounts your local `./config.yaml` as the config document. That file is
+operator-owned and gitignored — **create it before `docker compose up`**
+(bind-mounting a missing path makes Docker materialize a directory, which the
+proxy then fails to read at startup). For the anonymous free tier, a minimal
+document is enough:
+
+```yaml
+# config.yaml — direct egress, auth off
+egress:
+  - id: direct
+
+routes:
+  - id: default
+    egress: [direct]
+```
 
 ```sh
 docker compose up -d --build                  # anonymous free tier
@@ -27,7 +40,8 @@ HOST_PORT=9090 docker compose up -d --build   # different host port
 
 To require a Bearer key or a custom upstream, edit the mounted document (or
 point the mount at your own file) — see
-[configuration.md](configuration.md) for the schema and
+[configuration.md](configuration.md) for the schema (the annotated shipped
+example is `config.example.yaml` in the repo root) and
 [authentication.md](authentication.md) for the auth section. The mount is a
 bind mount on purpose: editing the file on the host hot-reloads in place.
 
@@ -36,13 +50,15 @@ bind mount on purpose: editing the file on the host hot-reloads in place.
 `OFP_CONFIG` names the document path **inside the container**; the file it
 points at must be mounted (read-only is fine — the proxy never writes it).
 Secrets enter through `${VAR}` interpolation, resolved from the container's
-environment at load time, so the mounted file itself carries no credentials:
+environment at load time, so the mounted file itself carries no credentials —
+forward each referenced variable through `compose.yaml`'s `environment` when
+you add one:
 
 ```yaml
 # compose.yaml (excerpt)
 environment:
   OFP_CONFIG: /etc/ofp/config.yaml
-  OFP_PRIMARY_API_KEY: ${OFP_PRIMARY_API_KEY} # forwarded from your shell/secret store
+  # OFP_PRIMARY_API_KEY: ${OFP_PRIMARY_API_KEY} # forward vars your config.yaml references
 volumes:
   - ./config.yaml:/etc/ofp/config.yaml:ro
 ```
@@ -89,9 +105,10 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
 
 ## Production considerations
 
-- **Put auth on.** The built-in no-config runtime and `compose.config.yaml`
-  run with auth off — fine for localhost, wrong for anything exposed. Add an
-  `auth.keys` section and interpolate the secrets from the environment.
+- **Put auth on.** The built-in no-config runtime runs with auth off — fine
+  for localhost, wrong for anything exposed, and a compose deployment is
+  exactly as open as the `config.yaml` you mount. Add an `auth.keys` section
+  and interpolate the secrets from the environment.
 - **TLS termination is not this proxy's job.** It serves plain HTTP by
   design; front it with your ingress/reverse proxy for TLS. The egress side
   supports `https` proxy types (TLS-to-the-proxy CONNECT hop) and `socks5`

@@ -9,13 +9,13 @@ import (
 )
 
 // The shipped example and the parser are locked together: these tests load
-// ../../example.config.yaml through the REAL load path (LoadFile: read →
+// ../../config.example.yaml through the REAL load path (LoadFile: read →
 // interpolate → parse → validate → resolve) instead of an in-test fixture,
 // so any schema or validation change that would break an operator's copy of
 // the example fails CI here first.
 
 // examplePath is the repo-root example, relative to this package's dir.
-const examplePath = "../../example.config.yaml"
+const examplePath = "../../config.example.yaml"
 
 // Fake credentials in the e2e-fixture style (AGENTS.md: clearly fake values,
 // never real ones). Each egress gets a distinct password so a copy-pasted or
@@ -47,7 +47,7 @@ func loadExample(t *testing.T) *Runtime {
 	setExampleEnv(t)
 	rt, err := LoadFile(examplePath)
 	if err != nil {
-		t.Fatalf("example.config.yaml rejected by the real loader: %v", err)
+		t.Fatalf("config.example.yaml rejected by the real loader: %v", err)
 	}
 	return rt
 }

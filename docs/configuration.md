@@ -8,7 +8,7 @@ health — all live in the config document, not in env vars. (The pre-0.4
 `OFP_API_KEY` / `OFP_UPSTREAM_BASE` / `OFP_UA_SYNC_INTERVAL` env vars are
 removed; their sections below replace them.)
 
-`example.config.yaml` in the repo root is the complete annotated schema, and
+`config.example.yaml` in the repo root is the complete annotated schema, and
 `internal/config/example_test.go` loads it through the real loader, so the
 example and the parser cannot drift.
 
@@ -147,7 +147,7 @@ request hot path is a pure cache read — see
 
 The shipped documents keep every secret as a dollar-brace env reference,
 never a literal — a convention `internal/config/example_test.go` pins for
-`example.config.yaml`, not a rule the loader enforces: an inlined literal
+`config.example.yaml`, not a rule the loader enforces: an inlined literal
 loads fine, so never commit one. Interpolation runs over the **raw file
 bytes before YAML parsing — comments included** — and an UNSET variable is
 a load error naming the variable. Two consequences:

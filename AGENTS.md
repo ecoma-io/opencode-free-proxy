@@ -50,7 +50,7 @@ only to `languages: [yaml]` fixtures.
 
 ## The multi-egress config: canonical example + parity test
 
-`example.config.yaml` (repo root) is the annotated schema, and
+`config.example.yaml` (repo root) is the annotated schema, and
 `internal/config/example_test.go` loads it through the real loader
 (`config.LoadFile` — interpolate → parse → validate → resolve), so the
 example and the parser are locked together: change them together or CI fails.

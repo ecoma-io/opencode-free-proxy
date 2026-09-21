@@ -2,15 +2,16 @@
 # host. The image's built-in HEALTHCHECK (entrypoint subcommand — scratch has
 # no shell) is inherited; compose does not override it.
 #
-# Usage:
+# Usage (create ./config.yaml first — see config.example.yaml for the
+# annotated schema, or docs/deployment.md for a minimal anonymous document):
 #   docker compose up -d --build                  # anonymous free tier
 #   HOST_PORT=9090 docker compose up -d --build   # different host port
 #
 # The proxy's service settings (upstream base, inbound auth, UA sync cadence)
 # live in the OFP_CONFIG document mounted below — the removed OFP_API_KEY /
-# OFP_UPSTREAM_BASE / OFP_UA_SYNC_INTERVAL env vars no longer exist. See
-# compose.config.yaml and example.config.yaml for how to enable auth or a
-# non-default upstream.
+# OFP_UPSTREAM_BASE / OFP_UA_SYNC_INTERVAL env vars no longer exist. The
+# mounted ./config.yaml is operator-owned and gitignored; config.example.yaml
+# in the repo root shows how to enable auth or a non-default upstream.
 
 services:
   proxy:
@@ -31,4 +32,4 @@ services:
     volumes:
       # Bind, don't copy: editing the file on the host (adding an auth
       # section, pointing upstream.base elsewhere) hot-reloads in place.
-      - ./compose.config.yaml:/etc/ofp/config.yaml:ro
+      - ./config.yaml:/etc/ofp/config.yaml:ro
