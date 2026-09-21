@@ -85,7 +85,7 @@
 #                    load error. The per-egress upstream retry matrix sits
 #                    unchanged INSIDE each attempt.
 #
-# health (policy — runtime state semantics live in the README)
+# health (policy — runtime state semantics live in docs/architecture.md)
 #   enabled            bool, default true with a config file. The built-in
 #                      no-config runtime runs with health OFF.
 #   failure_threshold  int, default 3 — consecutive failures before a

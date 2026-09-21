@@ -100,8 +100,8 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
   traffic: requests in flight keep their generation; new requests pick up
   the swap. Invalid intermediate states (e.g. an editor's partial write that
   still parses but fails validation) keep the last good runtime — but
-  prefer atomic rewrites (`mv` over a `rename(2)`) to avoid serving a torn
-  read window.
+  prefer an atomic rewrite (write a temp file in the same directory, then
+  `rename(2)` it into place) to avoid serving a torn read window.
 - **Health gating is opt-in by config.** With no `OFP_CONFIG` the process
   runs health OFF — a config-less deployment can never acquire a
   failure-threshold outage. A config file enables it (threshold 3, cooldown

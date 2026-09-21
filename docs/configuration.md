@@ -145,15 +145,18 @@ request hot path is a pure cache read — see
 
 ## Environment interpolation (`${VAR}`)
 
-Every secret in the document is a dollar-brace env reference, never a
-literal. Interpolation runs over the **raw file bytes before YAML parsing —
-comments included** — and an UNSET variable is a load error naming the
-variable. Two consequences:
+The shipped documents keep every secret as a dollar-brace env reference,
+never a literal — a convention `internal/config/example_test.go` pins for
+`example.config.yaml`, not a rule the loader enforces: an inlined literal
+loads fine, so never commit one. Interpolation runs over the **raw file
+bytes before YAML parsing — comments included** — and an UNSET variable is
+a load error naming the variable. Two consequences:
 
 - never write the placeholder syntax inside a comment (an unset reference in
   a comment still fails the load);
-- the file carries no literal credential anywhere, so it can be committed,
-  mounted read-only, and shared without redaction.
+- a document that references only `${VAR}`s carries no literal credential
+  anywhere, so it can be committed, mounted read-only, and shared without
+  redaction.
 
 Proxy credentials ride the proxy url userinfo (`user:password@host:port`);
 they are stripped by `config.RedactProxyURL` everywhere a proxy URL can reach
@@ -265,8 +268,11 @@ and applies to FUTURE requests only.
 
 The client sees the LAST REAL verdict: when the plan runs out of egresses
 before the budget, the final dialed egress's own status and message are
-returned (base.js never synthesizes a failure — a 429 that outlives the plan
-stays a 429, preserving the client's backoff semantics). The synthetic
+returned — a deliberate divergence from base.js, which DOES synthesize
+`All N URLs failed with status 429` when the plan outlives its URLs
+(base.js:183; see the divergence note in `internal/upstream/fallback.go`):
+this proxy keeps the last real verdict so the status the client backoffs on
+stays the upstream's. The synthetic
 `502 none of the eligible egresses could serve the request` appears only when
 NOTHING was dialed — every plan entry was skipped (slot-full, unknown
 egress, transport build failed) or the head set was empty (`attempts=0` in

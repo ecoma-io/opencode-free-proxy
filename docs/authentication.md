@@ -26,7 +26,7 @@ may not share a `key` value (both are load errors; see validation below).
 A matched request's completion log line carries the key **name**:
 
 ```text
-ab12cd34 generation=3 route=default egress=primary attempts=1 class=ok status=200 ... api_key_name="primary"
+ab12cd34 generation=3 route=default egress=primary attempts=1 class=success status=200 ... api_key_name="primary"
 ```
 
 The name is the only part of a key that is ever echoed — not in logs, not in

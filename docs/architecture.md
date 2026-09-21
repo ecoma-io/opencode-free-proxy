@@ -101,8 +101,11 @@ Mirrors 9router chatCore plus the chat.js pre-resolution stages
 (`internal/router/handler.go`; line-for-line port of `open-sse/` — see
 AGENTS.md for the porting discipline):
 
-1. `[1m]` context-marker strip (Claude Code 1M beta annotation).
-2. Auth → missing-model check → `x-test-connection` probe (fixed synthetic
+1. Auth gate — first of all, before the method check and the body read: a
+   401 never reads the body, takes `clientMu`, a health state, or an
+   upstream.
+2. `[1m]` context-marker strip (Claude Code 1M beta annotation) →
+   missing-model check → `x-test-connection` probe (fixed synthetic
    completion, no upstream call) → claude-cli bypass short-circuit (warmup /
    title extraction / count / title-prompt patterns answer without an
    upstream call, streaming or not).
