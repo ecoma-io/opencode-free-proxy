@@ -9,13 +9,16 @@ License 2.0, and that you have the right to grant that license.
 
 ## The behavior contract
 
-[`README.md`](README.md) is the authoritative behavior contract: the
-pipeline stages, the model-naming rules, the retry matrix, and what the
-proxy forwards where. [`AGENTS.md`](AGENTS.md) carries the porting
-discipline built on top of it — JS citations on every ported behavior, JS
-truthiness through `internal/jsonx`, constants only in `internal/config`,
-documented divergences, and fail-open vs fail-closed as part of the
-contract.
+[`README.md`](README.md) is the entry point and quick start. The behavior
+contract lives across the docs split and the code: the request pipeline,
+the model-naming rules, and what the proxy forwards where are in
+[`docs/architecture.md`](docs/architecture.md), the config document is
+[`docs/configuration.md`](docs/configuration.md), and the retry matrix is
+the `RetryRules` table in [`internal/config`](internal/config/config.go).
+[`AGENTS.md`](AGENTS.md) carries the porting discipline built on top of
+it — JS citations on every ported behavior, JS truthiness through
+`internal/jsonx`, constants only in `internal/config`, documented
+divergences, and fail-open vs fail-closed as part of the contract.
 
 A change that moves documented behavior updates both documents in the same
 pull request. A document that lags the code is a defect, not a follow-up.
@@ -66,10 +69,10 @@ pull-request title in CI:
 - Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
   `build`, `ci`, `chore`, `revert`.
 - Scopes name the area: `identity`, `cloak`, `translate`, `relay`,
-  `upstream`, `router`, `caps`, `usage`, `jsonx`, `config`, `cmd`, `e2e`,
-  `docs`, `deps`, `ci`, `workspace`, `release`. The scope is optional;
-  `deps` and `ci` exist so that dependency-automation pull requests pass the
-  same gate as human ones.
+  `upstream`, `router`, `routing`, `health`, `caps`, `usage`, `jsonx`,
+  `config`, `cmd`, `e2e`, `docs`, `deps`, `ci`, `workspace`, `release`.
+  The scope is optional; `deps` and `ci` exist so that dependency-automation
+  pull requests pass the same gate as human ones.
 - Breaking changes add `!` before the colon and a `BREAKING CHANGE:` footer.
 - Subject at most 100 characters; body line length unlimited.
 

@@ -30,10 +30,15 @@ pnpm format                          # prettier over docs/workflows/configs
 All gates (vet both tag sets, gofmt, golangci-lint, full test suites) must
 pass before every commit. The repo toolchain (commitlint, lefthook,
 prettier) lives in `package.json` — `pnpm install` wires the git hooks;
-commitlint's `scope-enum` mirrors the package table below. CI (`.github/
-workflows/`) runs the same gates plus CodeQL, Semgrep, Gitleaks, and the
-black-box e2e suite; release-please owns `CHANGELOG.md` and tags (do not
-hand-edit either).
+commitlint's `scope-enum` (`commitlint.config.mjs`) holds one scope per
+package in the layout table below plus the non-package scopes `docs`,
+`deps`, `ci`, `workspace`, and `release`. CI (`.github/workflows/`) runs
+the same gates plus a `-trimpath` build, a commitlint gate on the
+pull-request title (squash merges make it the commit subject), and the
+black-box e2e suite; the Analysis workflow (CodeQL, Semgrep, Gitleaks)
+also runs weekly on a cron (`.github/workflows/analysis.yml`), and Renovate
+(`.github/renovate.json5`) drafts dependency PRs under the `deps` scope.
+release-please owns `CHANGELOG.md` and tags (do not hand-edit either).
 
 ## The Semgrep directory has two non-obvious constraints
 
@@ -129,8 +134,9 @@ The semantics agents most often get wrong:
    non-iterable `choices` chunk drops, shared retry budget across statuses).
 6. **Fail-open vs fail-closed is part of the contract** (UA cache warm probe,
    models fallback to the static registry, 429 never retried). Keep it.
-7. **Process-wide state has a lifecycle, not just a shape** (README "Process
-   wide state lifecycles"): health state is reclaimed once per generation and
+7. **Process-wide state has a lifecycle, not just a shape**
+   (docs/architecture.md "Process-wide state lifecycles"): health state is
+   reclaimed once per generation and
    never under a live request's pin (`health.Registry.Pin` at snapshot pin
    time); scheduler rotation migrates by fingerprint (preserve on equivalent
    reload, deterministic reset on change, prune on removal); the transport
@@ -141,10 +147,12 @@ The semantics agents most often get wrong:
 
 ## Environment
 
-| `OCFP_PORT` | `8090` | Listen port (`0` valid in tests) |
-| `OCFP_CONFIG` | _(empty = built-in)_ | Multi-egress routing config file (YAML); hot-reloaded, invalid keeps last good; also carries `upstream.base`, `user_agent.sync_interval` |
-| `OCFP_CONFIG_POLL_MS` | `1000` | Hot-reload poll interval for `OCFP_CONFIG` (ms) |
-| `OCFP_SHUTDOWN_GRACE` | `55000` | Drain window: in-flight streams finish before forced close (ms) |
+| Variable              | Default              | Meaning                                                                                                                                  |
+| --------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `OCFP_PORT`           | `8090`               | Listen port (`0` valid in tests)                                                                                                         |
+| `OCFP_CONFIG`         | _(empty = built-in)_ | Multi-egress routing config file (YAML); hot-reloaded, invalid keeps last good; also carries `upstream.base`, `user_agent.sync_interval` |
+| `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval for `OCFP_CONFIG` (ms)                                                                                          |
+| `OCFP_SHUTDOWN_GRACE` | `55000`              | Drain window: in-flight streams finish before forced close (ms)                                                                          |
 
 ## Security
 

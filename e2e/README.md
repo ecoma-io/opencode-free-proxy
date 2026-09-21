@@ -21,10 +21,16 @@ run.
 Covered, end to end through the wire:
 
 - `/healthz`
+- the suite's `OCFP_CONFIG` document really drives the runtime — the
+  upstream call lands on its configured `upstream.base`
+  (`TestConfigDrivenServiceSettings`)
 - chat non-streaming: forced upstream SSE → JSON aggregate (content, usage
   5/2/7, finish reason); upstream sees `stream:true`, `Bearer public`,
   `opencode/*` UA, the fingerprint tool quartet
 - chat streaming: deltas + usage chunk + `[DONE]` forwarded
+- official compound opencode UA (`opencode/1.18.31 …`) forwarded
+  byte-identical — the forging path never rewrites a valid downstream UA
+  (`TestOfficialUAPassthrough`)
 - `/v1/responses` non-streaming → aggregated `response` object (id, status
   `completed`, usage) against the muse-spark upstream path
 - `/v1/responses` streaming → event-framed SSE, no synthesized

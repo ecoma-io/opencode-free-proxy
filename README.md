@@ -17,7 +17,7 @@ streaming and non-streaming.
   weighted rotation.
 - **Fallback + health**: distinct-egress fallback with a per-egress retry
   matrix, consecutive-failure cooldowns, typed 407 handling, streaming
-  commitment (no fallback after the first byte).
+  commitment (no fallback once the upstream response is live).
 - **One config file, hot-reloaded**: every service setting lives in a single
   YAML document — upstream base, UA-sync cadence,
   egresses, routes, fallback, health. Edits hot-reload in place; requests in

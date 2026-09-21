@@ -231,7 +231,7 @@ func (f *fakeUpstream) handleGeneration(kind string) http.HandlerFunc {
 func (f *fakeUpstream) handleModels(w http.ResponseWriter, r *http.Request) {
 	f.record("models", r, nil)
 	w.Header().Set("Content-Type", "application/json")
-	// Unfiltered upstream list: two non-free ids, one dead id, three keepers.
+	// Unfiltered upstream list: one non-free id, one dead id, three keepers.
 	_, _ = io.WriteString(w, `{"data":[
 		{"id":"gpt-5"},
 		{"id":"`+testedModel+`"},
