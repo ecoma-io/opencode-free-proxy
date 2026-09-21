@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -90,13 +91,18 @@ type Client struct {
 // timeout (FETCH_CONNECT_TIMEOUT_MS semantics: time to first response byte
 // headers; the SSE body itself streams unbounded). The direct transport: no
 // proxy, no credentials. IdleConnTimeout is on every transport for the reason
-// config.IdleConnTimeout states (no GC finalizer ever reaps a pooled conn).
+// config.IdleConnTimeout states (no GC finalizer ever reaps a pooled conn);
+// DialTimeout/TLSHandshakeTimeout bound the phases ResponseHeaderTimeout
+// cannot reach (see their doc in internal/config — the JS fetch bounds all
+// phases with one abort signal).
 func NewClient() *Client {
 	return &Client{
 		HTTP: &http.Client{
 			Transport: &http.Transport{
 				ResponseHeaderTimeout: config.ConnectTimeout,
 				IdleConnTimeout:       config.IdleConnTimeout,
+				DialContext:           (&net.Dialer{Timeout: config.DialTimeout}).DialContext,
+				TLSHandshakeTimeout:   config.TLSHandshakeTimeout,
 				ForceAttemptHTTP2:     true,
 			},
 		},

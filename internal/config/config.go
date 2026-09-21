@@ -109,6 +109,26 @@ const (
 	StreamStall    = 360 * time.Second // max gap between SSE chunks
 	DefaultRatio   = 0.75              // hidden-thinking synthesis share
 	SynthMaxOutput = 10                // below this output, no synthesis
+
+	// DialTimeout and TLSHandshakeTimeout bound the two transport phases
+	// ResponseHeaderTimeout cannot reach on the DIRECT paths. The JS router
+	// needs neither as a separate knob: base.js:133-138 arms ONE
+	// AbortController over FETCH_CONNECT_TIMEOUT_MS (runtimeConfig.js:58,
+	// 60 s) around the whole fetch and merges it with the caller's signal
+	// (AbortSignal.any), so DNS + dial + TLS + request + response headers
+	// share a single 60 s budget that aborts the fetch wherever it happens
+	// to be. Go's transport splits those phases across three independent
+	// fields, so the port approximates the single budget per phase: each
+	// phase gets the same 60 s, and each phase's expiry reaches the fetch
+	// as a transport error that classifies ClassTimeout like the JS abort
+	// (base.js:169-178 network-exception branch). Worst case one attempt
+	// spends ~3x the JS budget (dial + TLS + headers); a blackholed
+	// upstream fails at the FIRST phase, so real blackhole latency stays
+	// ~60 s + DNS. The tunneled CONNECT transport (connect.go) needs
+	// neither: its DialTLSContext bounds dial + CONNECT + origin TLS under
+	// one conn deadline already.
+	DialTimeout         = 60 * time.Second
+	TLSHandshakeTimeout = 60 * time.Second
 )
 
 // Retry matrix per upstream status: attempts/delay (default executor rules —

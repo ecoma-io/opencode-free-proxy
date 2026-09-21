@@ -675,3 +675,47 @@ func TestAllTransportsCarryIdleConnTimeout(t *testing.T) {
 	check(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTPS, URL: "https://127.0.0.1:9"})), "NewClientFor(https)")
 	check(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://127.0.0.1:9"})), "NewClientFor(socks5)")
 }
+
+// TestDirectPathsBoundDialAndTLS is the structural pin for
+// config.DialTimeout / config.TLSHandshakeTimeout: every transport that
+// dials or handshakes ITSELF must carry both bounds — before them, only
+// ResponseHeaderTimeout was set, so a blackholed dial or origin TLS
+// handshake hung with no phase bound at all (the JS fetch bounds all phases
+// with one abort signal; see the constants' doc). A behavioral blackhole
+// test would need the full 60 s budget per phase, so the pin is structural.
+//
+// The tunneled CONNECT transport is the deliberate exception: its
+// DialTLSContext owns dial + CONNECT + origin TLS under one conn deadline
+// (connect.go), so it must carry DialTLSContext and neither stdlib dial
+// field.
+func TestDirectPathsBoundDialAndTLS(t *testing.T) {
+	selfDialing := func(c *Client, which string) {
+		t.Helper()
+		tr, ok := c.HTTP.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("%s: transport is %T, want *http.Transport", which, c.HTTP.Transport)
+		}
+		if tr.DialContext == nil {
+			t.Errorf("%s: DialContext is nil — the TCP dial is unbounded", which)
+		}
+		if tr.TLSHandshakeTimeout != config.TLSHandshakeTimeout {
+			t.Errorf("%s: TLSHandshakeTimeout = %v, want %v", which, tr.TLSHandshakeTimeout, config.TLSHandshakeTimeout)
+		}
+	}
+	selfDialing(NewClient(), "NewClient")
+	selfDialing(noSleepClient(NewClientFor(nil)), "NewClientFor(direct)")
+	selfDialing(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: "http://127.0.0.1:9"})), "NewClientFor(http)")
+	selfDialing(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://127.0.0.1:9"})), "NewClientFor(socks5)")
+
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: "http://127.0.0.1:9"}))
+	tr, ok := c.tunneled.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("tunneled: transport is %T, want *http.Transport", c.tunneled.Transport)
+	}
+	if tr.DialTLSContext == nil {
+		t.Error("tunneled: DialTLSContext is nil — the CONNECT boundary (connect.go) must own the dial")
+	}
+	if tr.DialContext != nil || tr.TLSHandshakeTimeout != 0 {
+		t.Errorf("tunneled: carries stdlib dial fields (DialContext=%v TLSHandshakeTimeout=%v); DialTLSContext makes them dead config", tr.DialContext != nil, tr.TLSHandshakeTimeout)
+	}
+}
