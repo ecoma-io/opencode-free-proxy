@@ -131,10 +131,10 @@ func (c *UserAgentCache) Get() string {
 // nothing — the goroutine exists only between StartSync and its stop, so a
 // cache that is never started (tests, the healthcheck subcommand) has zero
 // sync goroutines. interval <= 0 starts nothing and returns a no-op stop
-// (time.NewTicker would panic) — a misconfigured cadence degrades to the
-// interval is re-read on EVERY cycle — a reload may have changed the
-// configured OFP_CONFIG user_agent.sync_interval — so the loop follows the
-// live store snapshot instead of a captured cadence. Re-arm is a read, never
+// (time.NewTicker would panic). The interval is re-read on EVERY cycle — a
+// reload may have changed the configured OFP_CONFIG user_agent.sync_interval
+// — so the loop follows the live store snapshot instead of a captured
+// cadence. Re-arm is a read, never
 // a second goroutine: a second StartSync would still run a second loop, which
 // is why main.go calls StartSync exactly once. A non-positive read at any
 // cycle idles on a 1 s re-check that never fetches (the compile-in fallback

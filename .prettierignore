@@ -1,3 +1,7 @@
+# release-please owns this file (AGENTS.md: do not hand-edit); prettier
+# reformatting it would churn every docs commit and conflict with the next
+# release PR.
+CHANGELOG.md
 # Semgrep fixtures are load-bearing bytes: their whole job is to match (or
 # not match) rules, and prettier reformatting them would invalidate
 # `semgrep --test` in analysis.yml.
