@@ -44,7 +44,7 @@ func spawnProxy(t *testing.T, cfgDir string, extra map[string]string) *proxySpaw
 	// SSL_CERT_FILE is dropped too: tests speaking TLS to a fixture https
 	// upstream pass their own root file via extra, and it must be the only
 	// source of the subprocess root pool.
-	cmd.Env = filteredEnv("PORT", "OFP_API_KEY", "OFP_UPSTREAM_BASE", "OFP_UA_SYNC_INTERVAL", "OFP_CONFIG", "OFP_CONFIG_POLL_MS", "OFP_SHUTDOWN_GRACE", "SSL_CERT_FILE")
+	cmd.Env = filteredEnv("PORT", "OFP_CONFIG", "OFP_CONFIG_POLL_MS", "OFP_SHUTDOWN_GRACE", "SSL_CERT_FILE")
 	cmd.Env = append(cmd.Env, "PORT="+port)
 	// The service settings (upstream.base, auth.keys) live in the OFP_CONFIG
 	// document already written into the spawn dir; the poll interval keeps

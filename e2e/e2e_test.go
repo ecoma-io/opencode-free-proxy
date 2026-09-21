@@ -340,7 +340,7 @@ routes:
 	}
 
 	proxyCmd = exec.Command(bin)
-	proxyCmd.Env = append(filteredEnv("PORT", "OFP_API_KEY", "OFP_UPSTREAM_BASE", "OFP_UA_SYNC_INTERVAL"),
+	proxyCmd.Env = append(filteredEnv("PORT", "OFP_CONFIG"),
 		"PORT="+port,
 		"OFP_CONFIG="+cfgPath)
 	proxyCmd.Stdout = &proxyOut
