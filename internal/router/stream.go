@@ -2,7 +2,9 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -27,6 +29,12 @@ var htmlTitleRe = regexp.MustCompile(`(?i)<title>([^<]+)</title>`)
 
 var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
 
+// maxNonSSEBodyBytes bounds the non-SSE guard's body read. JS reads the whole
+// body unbounded (`await providerResponse.text()`, streamingHandler.js:64);
+// the guard only ever uses the <title> or a raw body under 200 bytes, both
+// far below this bound (Go divergence: no unbounded reads of upstream bytes).
+const maxNonSSEBodyBytes = 1 << 20
+
 // stream dispatches a streaming client response: relay selection follows
 // streamingHandler.js buildTransformStream — translate when the client and
 // upstream formats differ, passthrough otherwise. Responses passthrough
@@ -39,14 +47,16 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	defer func() { _ = resp.Body.Close() }()
 
 	// Non-SSE upstream body (Cloudflare 5xx HTML page): return a clean JSON
-	// error instead of piping garbage through the SSE path. JS builds the
-	// message with formatProviderError — the one prefixed call site here.
+	// error instead of piping garbage through the SSE path
+	// (streamingHandler.js:62-80). JS reads the WHOLE body, and this one site
+	// hand-rolls the error body `{error:{message}}` instead of using
+	// errorResponse — no type/code envelope, only the formatProviderError-style
+	// `[status]: ` prefix (:75-78).
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	if ct != "" && !strings.Contains(ct, "text/event-stream") && !strings.Contains(ct, "application/json") {
-		buf := make([]byte, 4096)
-		n, _ := resp.Body.Read(buf)
-		short := shortHTMLMessage(string(buf[:n]), ct)
-		writeError(w, resp.StatusCode, fmt.Sprintf("[%d]: %s", resp.StatusCode, short))
+		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxNonSSEBodyBytes))
+		short := shortHTMLMessage(string(bodyText), ct)
+		writeBareStreamError(w, resp.StatusCode, fmt.Sprintf("[%d]: %s", resp.StatusCode, short))
 		return
 	}
 
@@ -82,7 +92,15 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 }
 
 // shortHTMLMessage sanitizes an upstream HTML error page into a short
-// client-safe message (streamingHandler.js non-SSE guard).
+// client-safe message (streamingHandler.js:65-68). The <title> wins; failing
+// that, a RAW body under 200 bytes is used stripped of tags (:68 tests
+// `bodyText.length`, the raw text — not the stripped text; Go measures bytes
+// where JS measures UTF-16 units, identical for the ASCII error pages this
+// guards). collapse also squeezes internal whitespace runs where JS only
+// trims the ends — same output for real error pages. Divergence: a body that
+// strips to empty keeps the generic fallback; the JS `sanitizedTitle || …`
+// chain would fall through to an empty message (`[status]: `), useless to any
+// client.
 func shortHTMLMessage(bodyText, ct string) string {
 	collapse := func(s string) string {
 		return strings.Join(strings.Fields(s), " ")
@@ -94,10 +112,23 @@ func shortHTMLMessage(bodyText, ct string) string {
 		}
 	}
 	clean := collapse(htmlTagRe.ReplaceAllString(bodyText, ""))
-	if clean != "" && len(clean) < 200 {
+	if clean != "" && len(bodyText) < 200 {
 		return clamp160(clean)
 	}
 	return fmt.Sprintf("Upstream returned non-SSE response (%s)", ct)
+}
+
+// writeBareStreamError emits the non-SSE guard's hand-rolled error body —
+// `{error:{message}}` with NO type/code. This one JS site bypasses
+// errorResponse (utils/error.js) and inlines the envelope
+// (streamingHandler.js:75-78), so unlike writeError it adds nothing the JS
+// body does not carry.
+func writeBareStreamError(w http.ResponseWriter, status int, message string) {
+	b, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message}})
+	w.Header().Set("Content-Type", "application/json")
+	corsHeaders(w.Header(), false)
+	w.WriteHeader(status)
+	_, _ = w.Write(b)
 }
 
 func clamp160(s string) string {

@@ -40,11 +40,18 @@ var aliasRe = regexp.MustCompile(`^(?i)oc/`)
 // conversations; the JS router reads the raw stream unbounded).
 const maxBodyBytes = 8 << 20
 
-// corsHeaders are attached to every response (utils/error.js + sseConstants).
+// corsHeaders are attached to every response. The preflight trio is the JS
+// routes' verbatim (src/app/api/v1/chat/completions/route.js:19-27, same in
+// responses/route.js:13-19): a WILDCARD Allow-Headers — a fixed list breaks
+// browser preflights for headers the proxy itself consumes (x-session-id,
+// x-test-connection, x-opencode-project, …), none of which the old list
+// named. utils/error.js:29-38 and sseConstants.js:19-24 are the NON-preflight
+// response-header sources (origin `*` only) — neither defines any allow-list,
+// so the routes above are the only Allow-Headers truth.
 func corsHeaders(h http.Header, sse bool) {
 	h.Set("Access-Control-Allow-Origin", "*")
 	h.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, x-opencode-client, x-opencode-session, x-opencode-request, x-opencode-project")
+	h.Set("Access-Control-Allow-Headers", "*")
 	if sse {
 		h.Set("Content-Type", "text/event-stream")
 		h.Set("Cache-Control", "no-cache")

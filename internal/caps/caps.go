@@ -50,7 +50,15 @@ func (d Modality) with(row Modality) Modality {
 }
 
 // Resolve ports getCapabilitiesForModel for this proxy's fixed provider.
-// model is the alias-free, suffix-free id (chatCore.js:171 passes modelInfo.model).
+// Callers pass the alias-free, suffix-free id (cloak.BaseModelID); chatCore.js:171
+// instead passes modelInfo.model, which can still carry the thinking suffix
+// "model(level)" at that point — stripThinkingSuffix only runs when the
+// upstream body is built (chatCore.js:187/212). The outcomes are equivalent:
+// no MODEL_CAPABILITIES row is keyed with a paren suffix, so a suffixed id
+// always misses the exact table and falls to the PATTERN globs, whose
+// trailing `*` (every row ends in one) absorbs the suffix — the first
+// matching row, and its flags, are the same for the level-name/number suffix
+// values the proxy ever derives.
 func Resolve(model string) Modality {
 	if model == "" {
 		// capabilities.js:454 — empty model short-circuits to the floor, with

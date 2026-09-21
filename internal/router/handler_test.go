@@ -847,6 +847,96 @@ func TestDownstreamCapture(t *testing.T) {
 	})
 }
 
+// TestOptionsPreflight: OPTIONS is answered 204 with the JS routes' preflight
+// trio (src/app/api/v1/chat/completions/route.js:19-27, same in
+// responses/route.js:13-19). Allow-Headers is the wildcard — a fixed list
+// rejects browser preflights for headers the proxy itself consumes
+// (x-session-id, x-test-connection, x-app, x-client-request-id, …).
+func TestOptionsPreflight(t *testing.T) {
+	_, mux := newRouter(t, "http://127.0.0.1:1")
+
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/models"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodOptions, path, nil))
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("%s: status = %d, want 204", path, rec.Code)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Fatalf("%s: origin = %q, want *", path, got)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "POST, GET, OPTIONS" {
+			t.Fatalf("%s: methods = %q, want POST, GET, OPTIONS", path, got)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "*" {
+			t.Fatalf("%s: allow-headers = %q, want the route.js wildcard *", path, got)
+		}
+	}
+}
+
+// TestNonSSEUpstreamGuard: an upstream reply that is neither SSE nor JSON gets
+// the streamingHandler.js:62-80 guard — a clean JSON error instead of HTML
+// piped through the SSE path. The realistic trigger here is a sub-400 HTML
+// interstitial: the executor converts every >=400 upstream into the uerr
+// envelope before stream() is ever reached, so the guard sees 2xx bodies.
+func TestNonSSEUpstreamGuard(t *testing.T) {
+	post := func(t *testing.T, upstreamBody string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := &upstreamRecorder{}
+		up := newScriptedUpstream(t, rec, 200, "text/html; charset=utf-8", upstreamBody)
+		defer up.Close()
+		_, mux := newRouter(t, up.URL)
+		return postJSON(t, mux, "/v1/chat/completions",
+			`{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
+	}
+	// bareError checks the guard's hand-rolled body: `{error:{message}}` only —
+	// no type/code, unlike writeError's errorResponse envelope
+	// (streamingHandler.js:75-78 bypasses utils/error.js here).
+	bareError := func(t *testing.T, res *httptest.ResponseRecorder, wantMsg string) {
+		t.Helper()
+		if ct := res.Header().Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("Content-Type = %q, want application/json (guard answers before any SSE header write)", ct)
+		}
+		body := mustJSON(t, res.Body.Bytes())
+		errObj := jobj(t, body["error"], "error")
+		if got := jstr(t, errObj["message"], "message"); got != wantMsg {
+			t.Fatalf("message = %q, want %q", got, wantMsg)
+		}
+		if _, has := errObj["type"]; has {
+			t.Fatalf("envelope carries type (%#v) — the JS site emits a bare {error:{message}}", errObj)
+		}
+		if _, has := errObj["code"]; has {
+			t.Fatalf("envelope carries code (%#v) — the JS site emits a bare {error:{message}}", errObj)
+		}
+	}
+
+	t.Run("html title wins and the envelope is bare", func(t *testing.T) {
+		res := post(t, "<html><head><title>Error 1020</title></head><body>Access denied.</body></html>")
+		if res.Code != 200 {
+			t.Fatalf("status = %d, want the upstream status passthrough (body %s)", res.Code, res.Body.String())
+		}
+		bareError(t, res, "[200]: Error 1020")
+	})
+
+	t.Run("raw body over 200 bytes gets the generic message even when the stripped text is short", func(t *testing.T) {
+		// 40 × "<b>xx</b>" = 360 raw bytes; stripped = 80 chars. JS tests
+		// bodyText.length (the RAW text, :68), so this is the generic arm.
+		res := post(t, strings.Repeat("<b>xx</b>", 40))
+		bareError(t, res, "[200]: Upstream returned non-SSE response (text/html; charset=utf-8)")
+	})
+
+	t.Run("raw body under 200 bytes is used stripped of tags", func(t *testing.T) {
+		res := post(t, "tiny <b>plain</b> text")
+		bareError(t, res, "[200]: tiny plain text")
+	})
+
+	t.Run("title past the first 4096-byte read is still found (whole-body read)", func(t *testing.T) {
+		// streamingHandler.js:64 reads the whole body (`response.text()`);
+		// the title sits beyond byte 4096 so any single capped Read misses it.
+		res := post(t, strings.Repeat("<!-- padding comment -->", 250)+"<title>Late Title</title>")
+		bareError(t, res, "[200]: Late Title")
+	})
+}
+
 // TestDrainGateRejectsNewRequests: Drain() must make relay answer 503 BEFORE
 // reading the body — nothing upstream is dialed after the gate trips. This is
 // the deterministic unit counterpart to the e2e shutdown tests, whose drain

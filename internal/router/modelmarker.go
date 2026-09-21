@@ -11,7 +11,17 @@ import (
 // The marker is a client-side annotation, not part of any model id: it never
 // matches a model, an alias or a provider/model pair, so a request that carries
 // it would die at resolution. The capability itself travels in the
-// `anthropic-beta: context-1m-2025-08-07` header, which is forwarded untouched.
+// `anthropic-beta: context-1m-2025-08-07` header.
+//
+// "Forwarded untouched" is JS's own claim (modelMarkers.js:7, chat.js:53), not
+// this proxy's: here the upstream headers are REBUILT by upstream.BuildHeaders,
+// which forwards only a fixed allow-list (User-Agent + the captured
+// x-opencode-* headers) and never copies anthropic-beta — the 9router executor
+// likewise rebuilds its headers from scratch (executors/opencode.js:388-408
+// returns a fixed eight-header map; base.js:46-75) instead of echoing the
+// client's, so the free-tier condition, not the beta header, is what the
+// upstream sees. Stripping the marker is enough to let the request route
+// normally.
 
 // contextMarkerRe is modelMarkers.js CONTEXT_MARKER (:11) — `/\[1m\]$/i`.
 var contextMarkerRe = regexp.MustCompile(`(?i)\[1m\]$`)

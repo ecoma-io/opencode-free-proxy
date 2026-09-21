@@ -24,7 +24,11 @@ type modelsEntry struct {
 // proxy's equivalent is the configured upstream base (upstream.base in
 // OCFP_CONFIG, default https://opencode.ai), so the whole list endpoint is
 // redirectable for tests/self-hosting. Falls back to the static registry
-// models when the upstream list is unreachable (fail-open, unchanged).
+// models only when the upstream list is unreachable or its body carries no
+// usable shape (fail-open); a REACHABLE list that filters to zero free ids is
+// served as an empty data array — JS returns `{data: []}` for that case too
+// (suggested-models/route.js:21-26), and phantom registry models would
+// misadvertise a dropped free tier.
 // The endpoint rides the public zen list with the upstream Bearer public
 // credential, like the 9router JS source.
 //
@@ -67,33 +71,45 @@ func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// parseUpstreamModels applies the free filter to the upstream JSON.
+// parseUpstreamModels applies the free filter to the upstream JSON. It ports
+// the shape chain `json.data ?? json.models ?? json`
+// (suggested-models/route.js:23): the object's `data` array first, then its
+// `models` array, then a top-level bare array. Any body carrying one of those
+// shapes is VALID — the result stays a non-nil (possibly empty) slice, so a
+// 200 with a valid but empty free list is served as `{data: []}` exactly like
+// JS (route.js:21-26 — the filter result is returned verbatim, empty or not).
+// Only a body carrying none of the shapes returns nil, which the handler
+// answers with the static registry: this proxy's documented fail-open
+// divergence (AGENTS.md porting rule 6 "models fallback to the static
+// registry") narrows JS's own `{data: []}` catch-all to genuinely unusable
+// bodies.
 func parseUpstreamModels(raw []byte) []modelsEntry {
-	var parsed struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+	type idList []struct {
+		ID string `json:"id"`
 	}
-	if err := json.Unmarshal(raw, &parsed); err != nil || len(parsed.Data) == 0 {
-		// Some versions return a bare array.
-		var arr []struct {
-			ID string `json:"id"`
+	var obj struct {
+		Data   idList `json:"data"`
+		Models idList `json:"models"`
+	}
+	var list idList
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		// route.js:23 — json.data ?? json.models: an absent or null key leaves
+		// the Go slice nil, so nil-ness IS the `??` coalescing. A JSON object
+		// with neither key falls through JS's `json` arm to the not-an-array
+		// case → `[]` (:24), which the non-nil empty result below reproduces.
+		list = obj.Data
+		if list == nil {
+			list = obj.Models
 		}
-		if err2 := json.Unmarshal(raw, &arr); err2 != nil {
-			return nil
-		}
-		for _, m := range arr {
-			parsed.Data = append(parsed.Data, struct {
-				ID string `json:"id"`
-			}{m.ID})
-		}
-		if len(parsed.Data) == 0 {
+	} else {
+		// The `?? json` arm: some versions return a top-level bare array.
+		if err2 := json.Unmarshal(raw, &list); err2 != nil {
 			return nil
 		}
 	}
 	seen := map[string]bool{}
-	out := make([]modelsEntry, 0, len(parsed.Data))
-	for _, m := range parsed.Data {
+	out := make([]modelsEntry, 0, len(list)) // non-nil: valid shapes stay valid-empty
+	for _, m := range list {
 		id := m.ID
 		if id == "" || seen[id] {
 			continue
@@ -106,9 +122,6 @@ func parseUpstreamModels(raw []byte) []modelsEntry {
 		}
 		seen[id] = true
 		out = append(out, modelsEntry{ID: id, Name: id})
-	}
-	if len(out) == 0 {
-		return nil
 	}
 	sortModels(out)
 	return out
