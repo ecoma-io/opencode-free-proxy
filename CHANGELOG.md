@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.3.0...v0.4.0) (2026-09-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** move env settings into OFP_CONFIG runtime snapshot ([#22](https://github.com/ecoma-io/opencode-free-proxy/issues/22))
+
+### Features
+
+* **config:** move env settings into OFP_CONFIG runtime snapshot ([#22](https://github.com/ecoma-io/opencode-free-proxy/issues/22)) ([cf93063](https://github.com/ecoma-io/opencode-free-proxy/commit/cf93063be67a47aed719a9f2a8859967cec9664a))
+
+
+### Bug Fixes
+
+* **router:** bind one request to one Runtime generation; complete config-migration docs ([#25](https://github.com/ecoma-io/opencode-free-proxy/issues/25)) ([d4a59ec](https://github.com/ecoma-io/opencode-free-proxy/commit/d4a59ecb99911dc1693b5c8fdc1ef206a8a4dc78))
+
 ## [0.3.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.2.0...v0.3.0) (2026-09-20)
 
 
