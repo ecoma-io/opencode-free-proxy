@@ -234,7 +234,14 @@ func NormalizeResponsesTools(body map[string]any) {
 			// JS !parameters.properties is truthiness — null/false/"" are all
 			// replaced (the upstream strict schema rejects a null properties).
 			if !truthy(parameters["properties"]) {
-				clone := jsonx.Clone(parameters).(map[string]any)
+				// Clone round-trips through JSON; for the decoded-JSON values
+				// that reach here it always yields a map, but the assertion is
+				// guarded anyway (a Clone marshal failure returns nil) rather
+				// than risking a panic on the defense-in-depth path.
+				clone, ok := jsonx.Clone(parameters).(map[string]any)
+				if !ok {
+					clone = jsonx.ObjOf()
+				}
 				clone["properties"] = jsonx.ObjOf()
 				parameters = clone
 			}

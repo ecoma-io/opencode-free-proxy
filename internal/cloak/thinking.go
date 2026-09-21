@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"opencode-free-proxy/internal/jsonx"
+	"opencode-free-proxy/internal/usage"
 )
 
 // Thinking knob names removed by StripAll, mirroring
@@ -164,40 +165,42 @@ func ExtractThinking(body map[string]any) *ThinkingCfg {
 		}
 	}
 
-	// Claude thinking block.
+	// Claude thinking block (thinkingUnified.js:71-79): the budget goes
+	// through `Number(t.budget_tokens)` + Number.isFinite — numeric STRINGS
+	// coerce (budget_tokens: "8192" is a 8192 budget) before the > 0 check.
 	if t := jsonx.AsObj(body["thinking"]); t != nil {
 		switch jsonx.AsStr(t["type"]) {
 		case "disabled":
 			return &ThinkingCfg{Mode: "none"}
 		case "adaptive", "enabled":
-			budget := jsonx.AsF64(t["budget_tokens"])
-			if budget > 0 {
+			if budget, ok := usage.NumOK(t["budget_tokens"]); ok && budget > 0 {
 				return &ThinkingCfg{Mode: "budget", Budget: budget}
 			}
 			return &ThinkingCfg{Mode: "auto"}
 		}
 	}
 
-	// Gemini: top-level, generationConfig, or request envelope.
-	var tc map[string]any
-	if v := jsonx.AsObj(body["thinkingConfig"]); v != nil {
-		tc = v
-	} else if gc := jsonx.AsObj(body["generationConfig"]); gc != nil {
-		if v := jsonx.AsObj(gc["thinkingConfig"]); v != nil {
-			tc = v
-		}
-	} else if req := jsonx.AsObj(body["request"]); req != nil {
-		if gc := jsonx.AsObj(req["generationConfig"]); gc != nil {
-			if v := jsonx.AsObj(gc["thinkingConfig"]); v != nil {
-				tc = v
-			}
-		}
+	// Gemini: top-level, generationConfig, or request envelope
+	// (thinkingUnified.js:82-92). The chain is a TRUTHY `||` evaluated on
+	// each operand's RESULT: a truthy non-object thinkingConfig (42, "x",
+	// true) wins the chain and then fails the `typeof === "object"` gate —
+	// the nested fallbacks are never consulted — while a FALSY nested
+	// thinkingConfig falls through to the request operand, whose value is
+	// taken even when falsy (it is the chain's last operand). Then
+	// `typeof tc.thinkingLevel === "string"` runs (an empty string counts),
+	// and thinkingBudget coerces through Number() like the Claude budget.
+	tcAny := body["thinkingConfig"]
+	if !truthy(tcAny) {
+		tcAny = jsonx.Get(body["generationConfig"], "thinkingConfig")
 	}
-	if tc != nil {
+	if !truthy(tcAny) {
+		tcAny = jsonx.Get(jsonx.Get(body["request"], "generationConfig"), "thinkingConfig")
+	}
+	if tc, isObj := tcAny.(map[string]any); tcAny != nil && isObj {
 		if s, is := tc["thinkingLevel"].(string); is {
 			return &ThinkingCfg{Mode: "level", Level: strings.ToLower(s)}
 		}
-		if tb, is := tc["thinkingBudget"].(float64); is {
+		if tb, ok := usage.NumOK(tc["thinkingBudget"]); ok {
 			if tb == 0 {
 				return &ThinkingCfg{Mode: "none"}
 			}
@@ -208,12 +211,13 @@ func ExtractThinking(body map[string]any) *ThinkingCfg {
 		}
 	}
 
-	// Qwen.
+	// Qwen (thinkingUnified.js:94-99): strict boolean checks; the budget
+	// coerces through Number() exactly like the Claude/Gemini budgets.
 	if b, is := body["enable_thinking"].(bool); is {
 		if !b {
 			return &ThinkingCfg{Mode: "none"}
 		}
-		if tb := jsonx.AsF64(body["thinking_budget"]); tb > 0 {
+		if tb, ok := usage.NumOK(body["thinking_budget"]); ok && tb > 0 {
 			return &ThinkingCfg{Mode: "budget", Budget: tb}
 		}
 		return &ThinkingCfg{Mode: "auto"}
