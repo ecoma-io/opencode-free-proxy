@@ -95,7 +95,7 @@ func main() {
 
 	addr := ":" + cfg.Port
 	conns := newConnTracker()
-	srv := &http.Server{Addr: addr, Handler: mux, ConnState: conns.connState}
+	srv := newHTTPServer(addr, mux, conns.connState)
 	go func() {
 		log.Printf("opencode-free-proxy %s listening on %s (upstream %s)", version, addr, store.Get().UpstreamBase())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -131,6 +131,46 @@ func main() {
 		log.Printf("shutdown: grace %v elapsed, force-closed %d connection(s): %v", cfg.ShutdownGrace, closed, err)
 	}
 	log.Printf("shutdown complete")
+}
+
+// newHTTPServer builds the process's one http.Server. Standing alone so the
+// timeout contract is asserted directly in tests (servertimeout_test.go).
+//
+// Go-side hardening, no JS counterpart: the JS server rides Node/undici
+// platform defaults, which bound header reads and idle keep-alives implicitly;
+// Go's http.Server defaults to NO timeouts, so a slow client trickling bytes
+// would otherwise pin a goroutine and a connection indefinitely — bounded
+// only by the shutdown grace. Set (values + rationale in internal/config):
+//
+//   - ReadHeaderTimeout: header reads only; the connection's read deadline
+//     is reset after the headers (GOROOT readRequest), so streaming request
+//     BODIES are never touched by it.
+//   - IdleTimeout: keep-alive connections idle BETWEEN requests only; it is
+//     armed after a response completes and cleared when the next request's
+//     first bytes arrive (GOROOT conn.serve), so an in-flight SSE response
+//     can never be truncated by it.
+//
+// Deliberately NOT set — ReadTimeout and WriteTimeout must stay zero:
+//
+//   - ReadTimeout bounds the ENTIRE request incl. body with one global
+//     deadline the handler cannot override — a slow legitimate body upload
+//     (up to the 8 MiB route cap) would be killed mid-read.
+//   - WriteTimeout bounds response writes from the moment a request's
+//     headers are read — an SSE stream that outlives it is killed
+//     MID-STREAM (the one deadline is never extended between flushes).
+//
+// Both look like obvious hardening to a future maintainer and both break
+// this proxy's primary workload (long-lived SSE). The real bounds on slow
+// upstreams/clients here are the per-egress ConnectTimeout/StreamStall and
+// the shutdown-grace force-close.
+func newHTTPServer(addr string, handler http.Handler, connState func(net.Conn, http.ConnState)) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ConnState:         connState,
+		ReadHeaderTimeout: config.HeaderReadTimeout,
+		IdleTimeout:       config.IdleTimeout,
+	}
 }
 
 // connTracker records the server's live client connections through

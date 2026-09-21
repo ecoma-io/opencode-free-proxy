@@ -5,7 +5,8 @@
 // base) in an OCFP_CONFIG document pointing at a fake
 // OpenCode Zen upstream, and then spoken
 // to over HTTP exactly like an external client. Nothing is imported from
-// internal/ except small JSON helpers — every assertion goes through the wire.
+// internal/ except small JSON helpers and read-only config constants (test
+// budget math only, timeouts_test.go) — every assertion goes through the wire.
 //
 // These tests are behind the `e2e` build tag so the default `go test ./...`
 // (offline unit suite) never builds them. Run with:

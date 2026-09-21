@@ -183,6 +183,40 @@ const (
 	DefaultPort = "8090"
 )
 
+// http.Server timing bounds (cmd/server/main.go). Go-side hardening with no
+// JS counterpart to mirror: the JS server rides Node/undici platform
+// defaults, which bound header reads and idle keep-alives implicitly; Go's
+// http.Server defaults to NO timeouts, so a slow client can pin a goroutine
+// and a connection indefinitely — bounded only by the shutdown grace. The two
+// omissions (ReadTimeout/WriteTimeout) are deliberate and documented at the
+// construction site in cmd/server/main.go: both would cut long-lived SSE
+// streams mid-flight.
+const (
+	// HeaderReadTimeout bounds reading a request's headers only — per Go
+	// docs the connection's read deadline is reset after the headers, so a
+	// slow-but-legitimate streaming request body is never touched by it. A
+	// real client's header block is under a kilobyte sent in one burst;
+	// 10 s covers any sane connect→send latency (dozens of round trips)
+	// while a slowloris drip that would otherwise hold a connection
+	// forever is cut after 10 s. Also comfortably below the 55 s shutdown
+	// grace, so header-stalled connections pre-dating a signal die inside
+	// the drain window regardless.
+	HeaderReadTimeout = 10 * time.Second
+
+	// IdleTimeout bounds a keep-alive connection that sits IDLE between
+	// requests. It never applies mid-response: net/http arms the idle read
+	// deadline only after a response completes and clears it the moment the
+	// next request's first bytes arrive (GOROOT src/net/http/server.go,
+	// conn.serve — verified for go1.26), so a long-lived SSE stream cannot
+	// be truncated by it at any chunk cadence. 120 s sits above common
+	// front-proxy/LB idle windows (ALB 60 s, nginx 75 s) so healthy client
+	// keep-alive reuse is not churned by us first, while a connection
+	// abandoned by a vanished client is reclaimed in 2 minutes instead of
+	// living until process shutdown; closing an idle keep-alive is
+	// transparent — the next request opens a fresh connection.
+	IdleTimeout = 120 * time.Second
+)
+
 // Client-facing OpenAI-compatible error typing (config/errorConfig.js).
 type ErrorInfo struct{ Type, Code string }
 

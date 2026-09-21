@@ -24,6 +24,8 @@ Covered, end to end through the wire:
 - the suite's `OCFP_CONFIG` document really drives the runtime — the
   upstream call lands on its configured `upstream.base`
   (`TestConfigDrivenServiceSettings`)
+- inbound listener timeouts: a client that stalls mid-request-line is cut
+  within the configured header deadline (`timeouts_test.go`)
 - chat non-streaming: forced upstream SSE → JSON aggregate (content, usage
   5/2/7, finish reason); upstream sees `stream:true`, `Bearer public`,
   `opencode/*` UA, the fingerprint tool quartet
