@@ -4,6 +4,7 @@
 package upstream
 
 import (
+	"math"
 	"strings"
 	"time"
 
@@ -131,11 +132,23 @@ func TransformRequest(model string, body map[string]any) {
 	cloak.InjectReasoningContent(model, body)
 }
 
-// clampMaxOutput mirrors Math.max(16, Number(x) || 0).
-func clampMaxOutput(v any) float64 {
+// clampMaxOutput mirrors Math.max(16, Number(x) || 0) (executors/opencode.js:362).
+// NaN collapses to 0 inside NumCoerce, and -Infinity falls to the floor
+// (Math.max(16, -Infinity) = 16), so those need no special case. The one
+// JS-reachable result Go cannot hold is +Infinity: Number("Infinity")||0
+// stays Infinity, JS keeps it in the body, and JSON.stringify serializes
+// non-finite numbers as null (executors/base.js:141) — so the upstream wire
+// payload is max_output_tokens:null. Go's json.Marshal ERRORS on +Inf (the
+// whole request would die), while nil marshals to the very same null — so
+// the non-finite result is returned as nil to keep the wire identical.
+func clampMaxOutput(v any) any {
 	n := jsonx.NumCoerce(v)
+	if math.IsInf(n, 1) {
+		return nil
+	}
 	if n < config.MinMaxOutputTokens {
-		return config.MinMaxOutputTokens
+		// float64 keeps the decoded-JSON number convention for map values.
+		return float64(config.MinMaxOutputTokens)
 	}
 	return n
 }

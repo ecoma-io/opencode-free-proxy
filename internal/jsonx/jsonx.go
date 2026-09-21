@@ -5,7 +5,10 @@ package jsonx
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
+	"math"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -54,12 +57,63 @@ func Truthy(v any) bool {
 	}
 }
 
-// NumCoerce mirrors JS Number(v): numbers pass, bools map to 1/0, numeric
-// strings parse, everything else (null, objects, garbage) yields 0 — the
-// `Number(x) || 0` idiom.
+// jsDecimalRe is the decimal production of the JS Number(string) grammar
+// (ECMA-262 StringNumericLiteral): optional sign, digits with optional
+// fraction, optional exponent. StringNumericLiteral is always decimal —
+// "0123" is 123, no legacy octal — exactly like strconv.ParseFloat.
+var jsDecimalRe = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
+
+// jsNumberString ports the string arm of JS Number(s) (ECMA-262
+// StringNumericLiteral): "" → 0, decimal literals, and the exact spellings
+// Infinity/+Infinity/-Infinity. Go's ParseFloat additionally accepts "inf"/
+// "nan" in any casing and "1_000" separators, which JS rejects — hence the
+// grammar gate before it. Out-of-range literals keep ParseFloat's rounded
+// value, which matches JS: "1e999" → +Inf, "1e-999" → 0. ok=false marks the
+// strings JS turns into NaN.
+func jsNumberString(s string) (float64, bool) {
+	if s == "" {
+		return 0, true // Number("") === 0
+	}
+	switch s {
+	case "Infinity", "+Infinity":
+		return math.Inf(1), true
+	case "-Infinity":
+		return math.Inf(-1), true
+	}
+	if !jsDecimalRe.MatchString(s) {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		// Past the grammar gate the only possible error is ErrRange, where
+		// ParseFloat still yields the rounded value Go shares with JS.
+		if errors.Is(err, strconv.ErrRange) {
+			return f, true
+		}
+		return 0, false
+	}
+	return f, true
+}
+
+// NumCoerce mirrors JS `Number(v) || 0` (executors/opencode.js:362): numbers
+// pass, bools map to 1/0, strings parse per the full-string Number()
+// grammar — partial prefixes ("12abc"), separator forms ("1_000") and
+// mis-spelled infinities ("inf") are NaN → 0 — and everything else (null,
+// objects, arrays) yields 0. It never returns NaN (NaN||0 = 0); ±Inf escape
+// only from an ±Inf input or the exact Infinity spellings, because Infinity
+// is truthy and survives `|| 0`.
+//
+// Deliberate divergences: hex/binary/octal string literals, which JS coerces
+// (Number("0x10")=16, unsigned only), yield 0 — not wire-realistic for the
+// sole caller, a token cap; and JS's toString bridge for single-element
+// arrays (Number([5])=5) is not replicated — a decoded JSON token cap is a
+// number, string or null, never an array.
 func NumCoerce(v any) float64 {
 	switch t := v.(type) {
 	case float64:
+		if math.IsNaN(t) {
+			return 0 // Number(NaN) || 0
+		}
 		return t
 	case bool:
 		if t {
@@ -67,15 +121,13 @@ func NumCoerce(v any) float64 {
 		}
 		return 0
 	case string:
-		s := strings.TrimSpace(t)
-		if s == "" {
-			return 0
+		// strings.TrimSpace ≈ the JS StrWhiteSpace trim; the sets differ only
+		// on U+0085 (Go trims, JS doesn't) and U+FEFF (JS trims, Go doesn't) —
+		// neither occurs in a wire field.
+		if n, ok := jsNumberString(strings.TrimSpace(t)); ok {
+			return n
 		}
-		var f float64
-		if _, err := fmt.Sscanf(s, "%g", &f); err != nil {
-			return 0
-		}
-		return f
+		return 0 // Number(garbage) is NaN → NaN || 0
 	default:
 		return 0
 	}
@@ -115,8 +167,11 @@ func Has(m any, key string) bool {
 	return ok
 }
 
-// Clone deep-copies v through a JSON round-trip. Non-JSON values (channels,
-// funcs) become null, mirroring JSON.stringify semantics.
+// Clone deep-copies v through a JSON round-trip. Any non-marshalable value
+// (channels, funcs) makes the whole clone nil. Deliberate divergence from
+// JSON.stringify, which silently drops such properties and still stringifies
+// the rest — callers here only Clone already-decoded JSON, where the
+// marshal-error path cannot fire.
 func Clone(v any) any {
 	b, err := json.Marshal(v)
 	if err != nil {

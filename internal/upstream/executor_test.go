@@ -256,6 +256,47 @@ func TestTransformRequestMuseResponses(t *testing.T) {
 		}
 	})
 
+	// String coercion table for Math.max(16, Number(x) || 0)
+	// (executors/opencode.js:362). Numeric strings fold to their Number();
+	// garbage strings are NaN → 0 → the 16 floor; the exact Infinity
+	// spellings survive `|| 0` (Infinity is truthy) and reach the wire as
+	// null — JSON.stringify serializes non-finite numbers as null
+	// (executors/base.js:141), which Go mirrors with nil so json.Marshal
+	// (router/handler.go:303) emits the same bytes instead of erroring.
+	t.Run("max_output_tokens string coercion", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			value any
+			want  any
+		}{
+			{"numeric string above the floor", "1024", float64(1024)},
+			{"partial prefix is NaN in JS", "12abc", float64(config.MinMaxOutputTokens)},
+			{"trailing junk is NaN in JS", "50abc", float64(config.MinMaxOutputTokens)},
+			{"numeric separator is NaN in JS", "1_000", float64(config.MinMaxOutputTokens)},
+			{"inf is not a JS infinity spelling", "inf", float64(config.MinMaxOutputTokens)},
+			{"NaN word is falsy in JS", "NaN", float64(config.MinMaxOutputTokens)},
+			{"JSON null is 0 in JS", nil, float64(config.MinMaxOutputTokens)},
+			{"-Infinity clamps to the floor (Math.max(16,-Infinity))", "-Infinity", float64(config.MinMaxOutputTokens)},
+			{"Infinity survives || 0 and wires as null", "Infinity", nil},
+			{"+Infinity survives || 0 and wires as null", "+Infinity", nil},
+			{"overflow literal is Infinity in JS (Number(\"1e999\"))", "1e999", nil},
+		}
+		for _, tc := range cases {
+			body := map[string]any{"max_output_tokens": tc.value}
+			TransformRequest(muse, body)
+			if got := body["max_output_tokens"]; !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("%s: max_output_tokens(%v) = %#v, want %#v", tc.name, tc.value, got, tc.want)
+			}
+			// Every row must stay marshalable: a +Inf/NaN that leaked here
+			// would kill the whole request at router/handler.go:303.
+			if b, err := json.Marshal(body); err != nil {
+				t.Fatalf("%s: marshal after clamp: %v", tc.name, err)
+			} else if tc.want == nil && !strings.Contains(string(b), `"max_output_tokens":null`) {
+				t.Fatalf("%s: wire = %s, want max_output_tokens:null", tc.name, b)
+			}
+		}
+	})
+
 	t.Run("existing reasoning object survives the fold", func(t *testing.T) {
 		// JS: body.reasoning = { ...currentReasoning, effort }; summary kept when truthy.
 		body := map[string]any{
