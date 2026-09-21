@@ -156,7 +156,21 @@ func (d *connectDialer) connect(ctx context.Context, conn net.Conn, addr string)
 	if err != nil {
 		return fmt.Errorf("proxy %s: connect read: %w", config.RedactProxyURL(d.proxy.String()), err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	// The CONNECT reply's body is deliberately NEVER closed or drained, on
+	// the 200 path or the refusal paths — GOROOT net/http dialConn does the
+	// same: it reads the reply with ReadResponse (transport.go:1908-1912,
+	// "Okay to use and discard buffered reader here, because TLS server will
+	// not speak until spoken to") and on a non-200 closes the CONN, never
+	// the body (:1930-1937). Closing would be actively harmful: a
+	// ReadResponse body's Close() fully DRAINS the declared body looking
+	// for trailers (transfer.go body.Close default branch, io.Copy of the
+	// remaining body), so a proxy answering "200 Content-Length: N>0" (or
+	// chunked) and then tunneling would pin the dial in that drain until
+	// the conn deadline — burning the whole ConnectTimeout budget and then
+	// failing the origin TLS handshake against the already-expired
+	// deadline. No leak results from skipping Close: the body owns no
+	// goroutine or fd, and the conn's lifetime is the caller's (closed on
+	// every error return in DialTLSContext, handed to TLS on success).
 	if resp.StatusCode == http.StatusProxyAuthRequired {
 		return &proxyAuthError{msg: fmt.Sprintf("proxy %s: CONNECT refused with 407 (authentication required)", config.RedactProxyURL(d.proxy.String()))}
 	}

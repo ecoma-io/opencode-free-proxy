@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
@@ -342,6 +343,94 @@ func TestConnectStallBoundedByContext(t *testing.T) {
 	case <-s.dropped:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the ctx deadline did not CLOSE the stalled tunnel conn")
+	}
+}
+
+// TestConnect200WithDeclaredBodyStillTunnels: a proxy that answers the
+// CONNECT with 200 plus a body it DECLARED but never sends
+// (Content-Length: 100) and then tunnels normally. The successful CONNECT
+// reply's body must never be closed or drained: body.Close() io.Copy-drains
+// the declared length (net/http transfer.go body.Close default branch),
+// which would pin the dial until the conn deadline AND swallow the origin's
+// first TLS bytes as "body" — GOROOT dialConn keeps the reply body unclosed
+// for exactly this reason (transport.go:1908-1912). The dial must succeed
+// promptly and the tunnel must carry a real round-trip.
+func TestConnect200WithDeclaredBodyStillTunnels(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: tunneled\n\n")
+	}))
+	defer origin.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				if err := connectRequestHello(c); err != nil {
+					return
+				}
+				// 200 + a declared body that never arrives, then a tunnel.
+				if _, err := c.Write([]byte("HTTP/1.1 200 Connection Established\r\nContent-Length: 100\r\n\r\n")); err != nil {
+					return
+				}
+				up, err := net.Dial("tcp", origin.Listener.Addr().String())
+				if err != nil {
+					return
+				}
+				defer func() { _ = up.Close() }()
+				go func() { _, _ = io.Copy(up, c) }()
+				_, _ = io.Copy(c, up)
+			}(conn)
+		}
+	}()
+
+	u, err := url.Parse("http://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(origin.Certificate())
+	d := newConnectDialer(u, func() *tls.Config { return &tls.Config{RootCAs: pool} })
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan dialResult, 1)
+	go func() {
+		conn, err := d.DialTLSContext(context.Background(), "tcp", origin.Listener.Addr().String())
+		done <- dialResult{conn: conn, err: err}
+	}()
+	var res dialResult
+	select {
+	case res = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dial blocked on the CONNECT reply — the declared body was drained instead of ignored")
+	}
+	if res.err != nil {
+		t.Fatalf("dial through the non-compliant proxy failed: %v", res.err)
+	}
+	defer func() { _ = res.conn.Close() }()
+	// The tunnel carries traffic: a plain GET over the TLS conn comes back
+	// with the origin's SSE.
+	if _, err := res.conn.Write([]byte("GET /zen/v1/chat/completions HTTP/1.1\r\nHost: " + origin.Listener.Addr().String() + "\r\nConnection: close\r\n\r\n")); err != nil {
+		t.Fatalf("write over the tunnel: %v", err)
+	}
+	raw, err := io.ReadAll(res.conn)
+	if err != nil {
+		t.Fatalf("read over the tunnel: %v", err)
+	}
+	if !strings.Contains(string(raw), "data: tunneled") {
+		t.Fatalf("tunneled body = %q, want the origin's SSE chunk", raw)
 	}
 }
 
