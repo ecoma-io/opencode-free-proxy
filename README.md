@@ -19,7 +19,7 @@ streaming and non-streaming.
   matrix, consecutive-failure cooldowns, typed 407 handling, streaming
   commitment (no fallback after the first byte).
 - **One config file, hot-reloaded**: every service setting lives in a single
-  YAML document — upstream base, named inbound auth keys, UA-sync cadence,
+  YAML document — upstream base, UA-sync cadence,
   egresses, routes, fallback, health. Edits hot-reload in place; requests in
   flight keep the generation they started on.
 - **Secret hygiene**: credentials are `${VAR}` env references resolved at
@@ -28,22 +28,18 @@ streaming and non-streaming.
 ## Quick start
 
 ```sh
-go run ./cmd/server          # listens on :8090, upstream https://opencode.ai, auth off
+go run ./cmd/server          # listens on :8090, upstream https://opencode.ai
 docker compose up -d --build # build + serve via compose (HOST_PORT, default 30258);
                              # create ./config.yaml first — see docs/deployment.md
 ```
 
-With no config the built-in runtime serves the default upstream with auth
-off. Point `OCFP_CONFIG` at a document to enable auth, egress routing, or a
+With no config the built-in runtime serves the default upstream directly.
+Point `OCFP_CONFIG` at a document to enable egress routing or a
 different upstream:
 
 ```yaml
 upstream:
   base: https://opencode.ai
-auth:
-  keys:
-    - name: primary
-      key: ${OFP_PRIMARY_API_KEY}
 user_agent:
   sync_interval: 3600
 egress:
@@ -69,7 +65,7 @@ Bootstrap env (the process itself — everything else lives in the file):
 ## Architecture in one paragraph
 
 Every request captures ONE immutable runtime generation at arrival and is
-served entirely under it — auth, route match, health policy, egress,
+served entirely under it — route match, health policy, egress,
 upstream base, fallback, logging — so a hot reload affects only requests
 that start after the swap. Routing picks where to start, fallback picks what
 to try after a retryable failure, health decides what may be tried at all;
@@ -89,13 +85,12 @@ pnpm format                          # prettier over docs/workflows/configs
 
 ## Documentation
 
-| Doc                                              | What it covers                                                                                    |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| [docs/configuration.md](docs/configuration.md)   | The full config document: schema, defaults, `${VAR}` interpolation, hot reload, validation errors |
-| [docs/authentication.md](docs/authentication.md) | Named inbound keys, logging (`api_key_name`), reload semantics, secret hygiene                    |
-| [docs/deployment.md](docs/deployment.md)         | Docker, Compose, config mounts, bootstrap env, graceful shutdown, production notes                |
-| [docs/architecture.md](docs/architecture.md)     | Request pipeline, immutable generations, process-wide state lifecycles                            |
-| [docs/recon-*.md](docs/README.md)                | Investigation records: UA chain, session continuity, mid-stream IP switches                       |
+| Doc                                            | What it covers                                                                                    |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| [docs/configuration.md](docs/configuration.md) | The full config document: schema, defaults, `${VAR}` interpolation, hot reload, validation errors |
+| [docs/deployment.md](docs/deployment.md)       | Docker, Compose, config mounts, bootstrap env, graceful shutdown, production notes                |
+| [docs/architecture.md](docs/architecture.md)   | Request pipeline, immutable generations, process-wide state lifecycles                            |
+| [docs/recon-*.md](docs/README.md)              | Investigation records: UA chain, session continuity, mid-stream IP switches                       |
 
 ## Contributing
 

@@ -6,14 +6,13 @@ generation** from arrival to last log line:
 ```text
 HTTP request
   → Runtime snapshot (captured ONCE, generation N)
-  → Auth            (auth.keys of generation N)
   → Route match     (routes of generation N)
   → Health policy   (policy pinned from generation N)
   → Scheduler       (round-robin / weighted head selection)
   → Egress          (per-egress transport of generation N)
   → Upstream        (upstream.base of generation N)
   → Fallback        (fallback policy of generation N; retry matrix per attempt)
-  → Response        (+ completion log: generation=N route=… egress=… api_key_name=…)
+  → Response        (+ completion log: generation=N route=… egress=…)
 ```
 
 ## Immutable runtime generations
@@ -26,21 +25,18 @@ behind an atomic pointer and hot-reloads by swapping the pointer:
   built-in no-config runtime = generation 0;
 - **a request is bound to one Runtime generation for its lifetime.** The
   handler captures the snapshot exactly once, at arrival, and every later
-  stage — the auth gate (`LookupAPIKey`), route match, the health policy,
+  stage — route match, the health policy,
   egress resolution, `UpstreamBase()`, the UA configuration, the fallback
   policy, and the completion log — reads that same snapshot. Nothing after
   arrival re-reads the store (`internal/router/handler.go`);
 - a reload therefore affects only requests that **start** after the swap. It
   can never split an in-flight request across two generations — not its
-  admission (a revoked key cannot un-authenticate a request already
-  admitted; an added key cannot widen admission mid-flight), not its
-  upstream, not its fallback plan;
-- log lines carry `generation=N`, and `api_key_name` (when auth is on)
-  always names a key of that same generation — log facts never mix
-  generations.
+  upstream, not its fallback plan, not its logged generation;
+- log lines carry `generation=N` naming the request's own snapshot — log
+  facts never mix generations.
 
-The snapshot is deeply copied at `Resolve` (egresses, routes, the auth key
-table): nothing outside the loader can write a live snapshot, and a request
+The snapshot is deeply copied at `Resolve` (egresses, routes): nothing
+outside the loader can write a live snapshot, and a request
 mutating what an accessor returned can never reach the store.
 
 ## Route vs eligibility vs health vs fallback
@@ -80,7 +76,7 @@ holding a stale snapshot can never prune against its older keep-set.
   ends. (Boundary case: a request bound to the older generation can reach
   its pin after a newer generation's reclaim already dropped an identity the
   new config removed; that request then plans against reset — healthy —
-  state for it. Health is advisory; routing, auth and fallback semantics are
+  state for it. Health is advisory; routing and fallback semantics are
   unaffected, and the observation re-registers the state.)
 - **Scheduler rotation** (`internal/routing`) — per-route round-robin cursor
   and smooth-WRR current-weights are fingerprinted by route id + strategy +
@@ -101,40 +97,37 @@ Mirrors 9router chatCore plus the chat.js pre-resolution stages
 (`internal/router/handler.go`; line-for-line port of `open-sse/` — see
 AGENTS.md for the porting discipline):
 
-1. Auth gate — first of all, before the method check and the body read: a
-   401 never reads the body, takes `clientMu`, a health state, or an
-   upstream.
-2. `[1m]` context-marker strip (Claude Code 1M beta annotation) →
+1. `[1m]` context-marker strip (Claude Code 1M beta annotation) →
    missing-model check → `x-test-connection` probe (fixed synthetic
    completion, no upstream call) → claude-cli bypass short-circuit (warmup /
    title extraction / count / title-prompt patterns answer without an
    upstream call, streaming or not).
-3. Detect endpoint format → snapshot the client's thinking intent.
-4. Unsupported-modality strip: `image_url` / `input_image` / `file` / audio
+2. Detect endpoint format → snapshot the client's thinking intent.
+3. Unsupported-modality strip: `image_url` / `input_image` / `file` / audio
    blocks are replaced with text placeholders when the model's resolved
    modality capabilities say the model can't read them.
-5. Prenorms: `normalizeThinkingConfig` → `ensureToolCallIds` →
+4. Prenorms: `normalizeThinkingConfig` → `ensureToolCallIds` →
    `fixMissingToolResponses`.
-6. Format translation (`needsTranslation` when source ≠ target).
-7. `applyThinking` (suffix/effort resolution) + `filterToOpenAIFormat` for
+5. Format translation (`needsTranslation` when source ≠ target).
+6. `applyThinking` (suffix/effort resolution) + `filterToOpenAIFormat` for
    chat-native targets, then claude-client tool dedupe (MCP/built-in
    duplicates).
-8. Executor: session resolution (`x-opencode-*` headers, claude-code /
+7. Executor: session resolution (`x-opencode-*` headers, claude-code /
    antigravity extraction, assistant-text hashing), request transform
    (fingerprint tools, `max_output_tokens` clamp, `store=false`, input
    normalization), header forging (`Bearer public`, compound opencode
    User-Agent synced from GitHub — passed through verbatim when the
    downstream UA is a valid ≥ 1.17 opencode client and forged otherwise) —
    headers are rebuilt on every retry attempt.
-9. Retry matrix: 429 → no retry; 502 ×3 @3s; 503 ×3 @2s; 504 ×2 @3s;
+8. Retry matrix: 429 → no retry; 502 ×3 @3s; 503 ×3 @2s; 504 ×2 @3s;
    network errors follow 502 — one shared attempt budget across all retryable
    statuses. 60 s response-header timeout, 360 s stream stall (reset per
    line).
-10. Relay: format-matched passthrough (with usage estimation seam) or
-    translation; non-streaming clients get the forced SSE→JSON aggregate
-    with the same usage/thinking synthesis as the JS router (only when the
-    upstream actually answered SSE — otherwise the stream path handles it,
-    exactly like the JS fall-through).
+9. Relay: format-matched passthrough (with usage estimation seam) or
+   translation; non-streaming clients get the forced SSE→JSON aggregate
+   with the same usage/thinking synthesis as the JS router (only when the
+   upstream actually answered SSE — otherwise the stream path handles it,
+   exactly like the JS fall-through).
 
 ## Endpoints
 

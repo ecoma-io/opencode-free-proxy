@@ -9,7 +9,6 @@
 // Configuration of the target proxy:
 //
 //	E2E_BASE_URL  proxy base (default http://127.0.0.1:8090)
-//	E2E_API_KEY   a key configured in the proxy's auth.keys (omit when auth is off)
 package e2e
 
 import (
@@ -25,7 +24,7 @@ import (
 	"opencode-free-proxy/internal/jsonx"
 )
 
-func liveTarget(t *testing.T) (base, key string) {
+func liveTarget(t *testing.T) (base string) {
 	t.Helper()
 	if os.Getenv("E2E_LIVE") != "1" {
 		t.Skip("live tests disabled — set E2E_LIVE=1 against a running proxy")
@@ -34,10 +33,10 @@ func liveTarget(t *testing.T) (base, key string) {
 	if base == "" {
 		base = "http://127.0.0.1:8090"
 	}
-	return base, os.Getenv("E2E_API_KEY")
+	return base
 }
 
-func livePost(t *testing.T, base, path, key string, body map[string]any) (*http.Response, string) {
+func livePost(t *testing.T, base, path string, body map[string]any) (*http.Response, string) {
 	t.Helper()
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -48,9 +47,6 @@ func livePost(t *testing.T, base, path, key string, body map[string]any) (*http.
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-	}
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -63,13 +59,10 @@ func livePost(t *testing.T, base, path, key string, body map[string]any) (*http.
 
 // TestLiveModels: the live free-tier list is served and shaped correctly.
 func TestLiveModels(t *testing.T) {
-	base, key := liveTarget(t)
+	base := liveTarget(t)
 	req, err := http.NewRequest("GET", base+"/v1/models", nil)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
@@ -100,8 +93,8 @@ func TestLiveModels(t *testing.T) {
 
 // TestLiveChatCompletion: one tiny non-streaming completion on the free tier.
 func TestLiveChatCompletion(t *testing.T) {
-	base, key := liveTarget(t)
-	resp, raw := livePost(t, base, "/v1/chat/completions", key, map[string]any{
+	base := liveTarget(t)
+	resp, raw := livePost(t, base, "/v1/chat/completions", map[string]any{
 		"model":    testedModel,
 		"messages": []any{map[string]any{"role": "user", "content": "Reply with the single word: ok"}},
 		"stream":   false,
@@ -128,8 +121,8 @@ func TestLiveChatCompletion(t *testing.T) {
 
 // TestLiveResponsesStream: muse-spark streams Responses SSE end to end.
 func TestLiveResponsesStream(t *testing.T) {
-	base, key := liveTarget(t)
-	resp, raw := livePost(t, base, "/v1/responses", key, map[string]any{
+	base := liveTarget(t)
+	resp, raw := livePost(t, base, "/v1/responses", map[string]any{
 		"model":  museModel,
 		"input":  "Reply with the single word: ok",
 		"stream": true,

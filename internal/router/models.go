@@ -25,9 +25,8 @@ type modelsEntry struct {
 // OCFP_CONFIG, default https://opencode.ai), so the whole list endpoint is
 // redirectable for tests/self-hosting. Falls back to the static registry
 // models when the upstream list is unreachable (fail-open, unchanged).
-// The endpoint is intentionally NOT auth-gated — same as the removed env
-// proxy and the 9router JS source: model discovery rides the public zen
-// list with the upstream Bearer public credential, not the inbound keys.
+// The endpoint rides the public zen list with the upstream Bearer public
+// credential, like the 9router JS source.
 //
 // The fetch rides the SHARED direct client (s.Upstream) rather than a
 // per-request http.Client: one connection pool, one transport configuration

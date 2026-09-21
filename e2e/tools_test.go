@@ -202,7 +202,7 @@ func TestMuseChatClientUpstreamResponsesShape(t *testing.T) {
 // TestMuseResponsesToolChoiceDemoted: a native Responses client's explicit
 // non-auto tool_choice is demoted for muse-spark the same way.
 func TestMuseResponsesToolChoiceDemoted(t *testing.T) {
-	resp := authorizedRequest(t, "POST", "/v1/responses", map[string]any{
+	resp := doRequest(t, "POST", "/v1/responses", map[string]any{
 		"model":       museModel,
 		"input":       "hi",
 		"tools":       []any{map[string]any{"type": "function", "name": "get_weather", "parameters": map[string]any{}}},
@@ -329,7 +329,7 @@ func TestBrokenToolCallIDRepaired(t *testing.T) {
 func TestResponsesClientToolCallFromChatUpstream(t *testing.T) {
 	fake.setReplies(toolCallSSE, "")
 	defer fake.setReplies("", "")
-	resp := authorizedRequest(t, "POST", "/v1/responses", map[string]any{
+	resp := doRequest(t, "POST", "/v1/responses", map[string]any{
 		"model":  testedModel,
 		"input":  "read main.go",
 		"tools":  []any{map[string]any{"type": "function", "name": "read_file", "parameters": map[string]any{}}},

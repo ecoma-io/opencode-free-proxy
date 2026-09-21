@@ -18,12 +18,10 @@
 # included — and an UNSET variable is a load error naming the variable.
 # Therefore:
 #
-#   1. export all seven before loading this file:
+#   1. export all six before loading this file:
 #        OCFP_EXAMPLE_HTTP_USER   OCFP_EXAMPLE_HTTP_PASS    egress http-proxy
 #        OCFP_EXAMPLE_HTTPS_USER  OCFP_EXAMPLE_HTTPS_PASS   egress https-proxy
 #        OCFP_EXAMPLE_SOCKS_USER  OCFP_EXAMPLE_SOCKS_PASS  egress socks5-proxy
-#        OCFP_EXAMPLE_API_KEY                             inbound auth primary
-#
 #
 #   2. never write the placeholder syntax inside a comment (this file does
 #      not, for exactly that reason) — comments are interpolated too.
@@ -102,20 +100,6 @@
 #                      (/zen/v1/chat/completions, /zen/v1/responses,
 #                      /zen/v1/models) derives from it — no other URL
 #                      appears in config or code.
-#
-# auth                 inbound bearer authentication. Empty or omitted keys[]
-#                      = authentication disabled (requests pass unauthenticated).
-#                      Enforced with the same envelope as the removed
-#                      OFP_API_KEY env var (401 "Invalid API key provided").
-#   keys[]             named credentials, each {name, key}
-#     name             string, required, unique, control-free — the identity
-#                      matched requests log as api_key_name. Only the name is
-#                      ever logged or echoed; never the key.
-#     key              string, required, unique — the secret clients present
-#                      as "Authorization: Bearer <key>". Never a literal in
-#                      this file: reference the environment (see CREDENTIALS).
-#                      The value never reaches a log line, load error, debug
-#                      string, response, or test output.
 #
 # user_agent           the opencode free-tier gate reads a compound
 #                      User-Agent; a background loop keeps that triple fresh.
@@ -235,15 +219,6 @@ upstream:
   # The OpenCode Zen free-tier root; every /zen/v1/... endpoint derives from
   # it. Trailing slashes would be normalized — keep it canonical anyway.
   base: https://opencode.ai
-
-auth:
-  # Inbound bearer keys. The value is an env reference, never a literal; the
-  # matching requests log the NAME (api_key_name) and nothing else.
-  keys:
-    - name: primary
-      key: "${OCFP_EXAMPLE_API_KEY}"
-  # Add a second key by appending another entry. Empty keys[] (or an omitted
-  # auth section) means authentication is off.
 
 user_agent:
   # UA-triple sync cadence in SECONDS; default 3600. 0 disables the loop.

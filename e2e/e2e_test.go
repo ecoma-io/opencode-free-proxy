@@ -2,7 +2,7 @@
 
 // Package e2e holds black-box end-to-end tests: the real server binary is
 // compiled, launched as a subprocess with its service settings (upstream
-// base, inbound auth keys) in an OCFP_CONFIG document pointing at a fake
+// base) in an OCFP_CONFIG document pointing at a fake
 // OpenCode Zen upstream, and then spoken
 // to over HTTP exactly like an external client. Nothing is imported from
 // internal/ except small JSON helpers — every assertion goes through the wire.
@@ -36,10 +36,6 @@ import (
 
 	"opencode-free-proxy/internal/jsonx"
 )
-
-// testAPIKey is the inbound key the proxy subprocess requires, defined in
-// the OCFP_CONFIG doc's auth.keys (its name is "e2e").
-const testAPIKey = "e2e-secret"
 
 // officialUARe is the compound User-Agent shape the official opencode CLI
 // sends; the forged UA for non-opencode clients must match it.
@@ -322,18 +318,15 @@ func runSuite(m *testing.M) (int, error) {
 	}
 	proxyBase = "http://127.0.0.1:" + port
 
-	// The subprocess takes its service settings (upstream.base, auth.keys)
-	// from an OCFP_CONFIG document — the removed env vars no longer exist.
+	// The subprocess takes its service settings (upstream.base) from an
+	// OCFP_CONFIG document — the removed env vars no longer exist.
 	cfgDoc := fmt.Sprintf(`upstream:
   base: %q
-auth:
-  keys:
-    - {name: e2e, key: %s}
 egress:
   - {id: direct}
 routes:
   - {id: default, egress: [direct]}
-`, fake.URL, testAPIKey)
+`, fake.URL)
 	cfgPath := filepath.Join(tmp, "cfg.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfgDoc), 0o600); err != nil {
 		return 1, err
@@ -413,7 +406,7 @@ func waitHealthy(url string, timeout time.Duration) error {
 
 var e2eClient = &http.Client{Timeout: 30 * time.Second}
 
-func authorizedRequest(t *testing.T, method, path string, body any, mutate func(*http.Request)) *http.Response {
+func doRequest(t *testing.T, method, path string, body any, mutate func(*http.Request)) *http.Response {
 	t.Helper()
 	var rd io.Reader
 	if body != nil {
@@ -430,7 +423,6 @@ func authorizedRequest(t *testing.T, method, path string, body any, mutate func(
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	if mutate != nil {
 		mutate(req)
 	}
@@ -443,7 +435,7 @@ func authorizedRequest(t *testing.T, method, path string, body any, mutate func(
 
 func postChat(t *testing.T, body map[string]any, mutate func(*http.Request)) *http.Response {
 	t.Helper()
-	return authorizedRequest(t, "POST", "/v1/chat/completions", body, mutate)
+	return doRequest(t, "POST", "/v1/chat/completions", body, mutate)
 }
 
 func decodeJSON(t *testing.T, resp *http.Response) map[string]any {
@@ -466,10 +458,9 @@ func errorEnvelope(t *testing.T, body map[string]any) map[string]any {
 }
 
 // TestConfigDrivenServiceSettings: the shared suite proxy is spawned from an
-// OCFP_CONFIG document (upstream.base + auth.keys) — no service env vars
-// remain. This test asserts the config actually drove the runtime: the
-// upstream call reached the configured base, and the completion log line
-// carries the configured api_key_name, never the credential.
+// OCFP_CONFIG document (upstream.base) — no service env vars remain. This
+// test asserts the config actually drove the runtime: the upstream call
+// reached the configured base, which the suite only wires as upstream.base.
 func TestConfigDrivenServiceSettings(t *testing.T) {
 	resp := postChat(t, chatBody(testedModel), nil)
 	defer resp.Body.Close()
@@ -479,15 +470,6 @@ func TestConfigDrivenServiceSettings(t *testing.T) {
 	up := fake.lastChatBody()
 	if up == nil {
 		t.Fatal("upstream never received the chat call")
-	}
-	// The base came from the config doc, not an env var: the request reached
-	// the fake upstream, which the suite only wires as upstream.base.
-	log := proxyOut.String()
-	if !strings.Contains(log, `api_key_name="e2e"`) {
-		t.Fatalf("completion log lacks api_key_name=\"e2e\":\n%s", log)
-	}
-	if strings.Contains(log, testAPIKey) {
-		t.Fatalf("secret leaked into the proxy log:\n%s", log)
 	}
 }
 
@@ -540,7 +522,7 @@ func TestOfficialUAPassthrough(t *testing.T) {
 }
 
 func TestHealthz(t *testing.T) {
-	resp := authorizedRequest(t, "GET", "/healthz", nil, nil)
+	resp := doRequest(t, "GET", "/healthz", nil, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -548,42 +530,6 @@ func TestHealthz(t *testing.T) {
 	b, _ := io.ReadAll(resp.Body)
 	if string(b) != "ok" {
 		t.Fatalf("body = %q, want %q", b, "ok")
-	}
-}
-
-func TestAuthEnforced(t *testing.T) {
-	chatBefore, respBefore, modelsBefore := fake.snapshot()
-	for _, tc := range []struct {
-		name string
-		key  string
-	}{{"missing key", ""}, {"wrong key", "not-the-key"}} {
-		t.Run(tc.name, func(t *testing.T) {
-			resp := authorizedRequest(t, "POST", "/v1/chat/completions", chatBody(testedModel), func(r *http.Request) {
-				if tc.key == "" {
-					r.Header.Del("Authorization")
-				} else {
-					r.Header.Set("Authorization", "Bearer "+tc.key)
-				}
-			})
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusUnauthorized {
-				t.Fatalf("status = %d, want 401", resp.StatusCode)
-			}
-			if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
-				t.Fatalf("CORS header = %q, want *", got)
-			}
-			var body map[string]any
-			_ = json.NewDecoder(resp.Body).Decode(&body)
-			e := errorEnvelope(t, body)
-			if e["code"] != "invalid_api_key" || e["type"] != "authentication_error" {
-				t.Fatalf("error envelope = %v", e)
-			}
-		})
-	}
-	chatAfter, respAfter, modelsAfter := fake.snapshot()
-	if chatBefore != chatAfter || respBefore != respAfter || modelsBefore != modelsAfter {
-		t.Fatalf("upstream was called on auth failure: chat %d→%d responses %d→%d models %d→%d",
-			chatBefore, chatAfter, respBefore, respAfter, modelsBefore, modelsAfter)
 	}
 }
 
@@ -686,7 +632,7 @@ func TestChatStreaming(t *testing.T) {
 }
 
 func TestResponsesNonStreaming(t *testing.T) {
-	resp := authorizedRequest(t, "POST", "/v1/responses", map[string]any{
+	resp := doRequest(t, "POST", "/v1/responses", map[string]any{
 		"model":  museModel,
 		"input":  "hi",
 		"stream": false,
@@ -727,7 +673,7 @@ func TestResponsesNonStreaming(t *testing.T) {
 }
 
 func TestResponsesStreaming(t *testing.T) {
-	resp := authorizedRequest(t, "POST", "/v1/responses", map[string]any{
+	resp := doRequest(t, "POST", "/v1/responses", map[string]any{
 		"model":  museModel,
 		"input":  "hi",
 		"stream": true,
@@ -888,7 +834,7 @@ func TestImageStrippedForNonVisionModel(t *testing.T) {
 }
 
 func TestModelsFiltered(t *testing.T) {
-	resp := authorizedRequest(t, "GET", "/v1/models", nil, nil)
+	resp := doRequest(t, "GET", "/v1/models", nil, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)

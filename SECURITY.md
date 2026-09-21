@@ -10,21 +10,21 @@ itself a disclosure of the credential.
 - Or email **john.itvn@gmail.com** with: a description of the issue, a
   reproduction or proof of concept, and your assessment of the impact.
 
-Please never paste real API keys, `auth.keys` credential values, live proxy
+Please never paste real API keys, live proxy
 credentials, or session ids belonging to a real deployment into any report
 — a PoC that needs them should hold placeholders.
 
 ## What counts as a vulnerability here
 
 opencode-free-proxy sits between client tools and the opencode zen free
-tier, and deployments may configure inbound bearer keys (the `auth.keys`
-list in the OCFP_CONFIG document)
-to gate who can use it. Three defect classes therefore count as security
+tier. Three defect classes therefore count as security
 vulnerabilities even when the underlying mechanism is an ordinary bug:
 
-- **A configured credential reaching a place it must not** — an
-  `auth.keys` value (or any deployment secret) appearing in logs, error
-  bodies, or a response it did not authenticate. The upstream credential is
+- **A configured credential reaching a place it must not** — an egress
+  proxy credential (or any deployment secret) appearing in logs, error
+  bodies, or anywhere it was not meant to travel. The upstream credential
+  is fixed (`Bearer public`), so the secrets at risk are the ones a
+  deployment brings itself.
 - **A path that lets a request escape the fixed scope.** The scope is the
   free tier only (`Bearer public`, fingerprint-tool gate, free models) —
   any code path that sends different upstream credentials, reaches a

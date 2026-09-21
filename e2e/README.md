@@ -1,7 +1,7 @@
 # E2E tests
 
 Black-box tests: the real server binary is compiled, launched as a subprocess
-with an `OCFP_CONFIG` document (upstream base + auth keys, against a fake
+with an `OCFP_CONFIG` document (upstream base, against a fake
 OpenCode Zen upstream), and exercised over HTTP like any external client.
 
 They are behind the `e2e` build tag — the default `go test ./...` unit suite
@@ -20,7 +20,7 @@ run.
 
 Covered, end to end through the wire:
 
-- `/healthz`; auth on/off (401 envelope + CORS, no upstream call)
+- `/healthz`
 - chat non-streaming: forced upstream SSE → JSON aggregate (content, usage
   5/2/7, finish reason); upstream sees `stream:true`, `Bearer public`,
   `opencode/*` UA, the fingerprint tool quartet
@@ -123,7 +123,6 @@ unless `E2E_LIVE=1`; spends free-tier quota.
 E2E_LIVE=1 go test -tags e2e ./e2e/ -run TestLive
 # optional:
 #   E2E_BASE_URL=http://127.0.0.1:9000   target proxy
-#   E2E_API_KEY=...                      value of a key in the proxy's auth.keys
 ```
 
 Covers the live model list (free filter holds), one tiny chat completion, and

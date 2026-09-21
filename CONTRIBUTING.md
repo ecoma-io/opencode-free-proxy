@@ -120,7 +120,7 @@ request tags `v<version>` and publishes the Docker image to
 ## Reporting problems
 
 - Bugs: [the bug report form](.github/ISSUE_TEMPLATE/bug_report.yml).
-- Anything security-shaped — an `auth.keys` credential reaching a log
+- Anything security-shaped — an egress proxy credential reaching a log
   line, a request escaping the free-tier scope:
   [SECURITY.md](SECURITY.md), never a public issue.
 

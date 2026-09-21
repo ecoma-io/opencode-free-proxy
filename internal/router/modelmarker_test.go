@@ -47,7 +47,7 @@ func TestMarkerStripReachesUpstreamBody(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	res := postJSON(t, mux, "/v1/chat/completions",
 		`{"model":"oc/qwen3-coder-free[1m]","messages":[{"role":"user","content":"hi"}],"stream":false}`, nil)

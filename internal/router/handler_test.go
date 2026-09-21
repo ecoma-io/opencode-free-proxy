@@ -112,10 +112,9 @@ func newScriptedUpstream(t *testing.T, rec *upstreamRecorder, status int, conten
 
 // newRouter wires a Server exactly like cmd/server/main.go, with the retry
 // sleeps elided and a cold UA cache (Get() is network-free and returns the
-func newRouter(t *testing.T, upstreamURL, apiKey string) (*Server, *http.ServeMux) {
+func newRouter(t *testing.T, upstreamURL string) (*Server, *http.ServeMux) {
 	t.Helper()
-	// Upstream base becomes the runtime's upstream.base; a non-empty apiKey
-	// becomes a single named auth key (auth off when empty). The bare direct
+	// Upstream base becomes the runtime's upstream.base. The bare direct
 	// egress + catch-all route reproduce the old pre-routing proxy that
 	// these handler tests drive through an httptest upstream.
 	doc := fmt.Sprintf(`upstream:
@@ -125,11 +124,8 @@ egress:
 routes:
   - {id: default, egress: [direct]}
 `, upstreamURL)
-	if apiKey != "" {
-		doc += fmt.Sprintf("auth:\n  keys:\n    - {name: test-key, key: %q}\n", apiKey)
-	}
-	// Live polling store, exactly like main.go: the runtime (upstream base,
-	// auth keys) comes from the config file snapshot, never from env.
+	// Live polling store, exactly like main.go: the runtime (upstream base)
+	// comes from the config file snapshot, never from env.
 	p := writeCfg(t, t.TempDir(), doc)
 	store, err := config.NewStore(p, 0, nil)
 	if err != nil {
@@ -250,7 +246,7 @@ func TestChatStreamingPassthrough(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	res := postJSON(t, mux, "/v1/chat/completions",
 		`{"model":"oc/qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
@@ -348,7 +344,7 @@ func TestChatNonStreamingForcedJSON(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatReasoningStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	res := postJSON(t, mux, "/v1/chat/completions",
 		`{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":false}`, nil)
@@ -414,7 +410,7 @@ func TestUpstreamErrorPassthrough(t *testing.T) {
 			up := newScriptedUpstream(t, rec, tc.status, "application/json",
 				`{"error":{"message":"FreeTierError"}}`)
 			defer up.Close()
-			_, mux := newRouter(t, up.URL, "")
+			_, mux := newRouter(t, up.URL)
 
 			res := postJSON(t, mux, "/v1/chat/completions",
 				`{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
@@ -452,7 +448,7 @@ func TestMuseSparkTranslateToChatClient(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", responsesStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	res := postJSON(t, mux, "/v1/chat/completions",
 		`{"model":"oc/muse-spark-1.2-contributor-free(high)","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
@@ -524,7 +520,7 @@ func TestMuseSparkResponsesPassthrough(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", responsesStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	res := postJSON(t, mux, "/v1/responses",
 		`{"model":"muse-spark-1.2-contributor-free","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}`, nil)
@@ -585,7 +581,7 @@ func TestMuseSparkResponsesPassthroughAbortTerminal(t *testing.T) {
 			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\",\"status\":\"in_progress\"}}\n\n"))
 	}))
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	res := postJSON(t, mux, "/v1/responses",
 		`{"model":"muse-spark-1.2-contributor-free","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}`, nil)
@@ -615,7 +611,7 @@ func TestResponsesClientChatModelTranslate(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamNoUsageSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	res := postJSON(t, mux, "/v1/responses",
 		`{"model":"qwen3-coder-free","input":"hello","stream":true}`, nil)
@@ -674,58 +670,13 @@ func TestResponsesClientChatModelTranslate(t *testing.T) {
 	}
 }
 
-// TestAuth: Cfg.APIKey gates every endpoint with the 401 error envelope.
-func TestAuth(t *testing.T) {
-	rec := &upstreamRecorder{}
-	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
-	defer up.Close()
-	_, mux := newRouter(t, up.URL, "sk-secret")
-	payload := `{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":false}`
-
-	t.Run("missing key", func(t *testing.T) {
-		res := postJSON(t, mux, "/v1/chat/completions", payload, nil)
-		if res.Code != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want 401", res.Code)
-		}
-		errObj := jobj(t, mustJSON(t, res.Body.Bytes())["error"], "error")
-		if jstr(t, errObj["message"], "message") != "Invalid API key provided" { // JS: errorResponse(401, msg) — no prefix (src/sse/handlers/chat.js:82)
-			t.Fatalf("message = %v", errObj["message"])
-		}
-		if jstr(t, errObj["type"], "type") != "authentication_error" || jstr(t, errObj["code"], "code") != "invalid_api_key" {
-			t.Fatalf("envelope = %#v", errObj)
-		}
-		if n := rec.count(); n != 0 {
-			t.Fatalf("upstream must not be reached without a valid key, got %d calls", n)
-		}
-	})
-
-	t.Run("wrong key", func(t *testing.T) {
-		res := postJSON(t, mux, "/v1/chat/completions", payload,
-			map[string]string{"Authorization": "Bearer nope"})
-		if res.Code != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want 401", res.Code)
-		}
-	})
-
-	t.Run("correct key passes", func(t *testing.T) {
-		res := postJSON(t, mux, "/v1/chat/completions", payload,
-			map[string]string{"Authorization": "Bearer sk-secret"})
-		if res.Code != 200 {
-			t.Fatalf("status = %d, body %s", res.Code, res.Body.String())
-		}
-		if n := rec.count(); n != 1 {
-			t.Fatalf("expected the request to reach upstream, got %d calls", n)
-		}
-	})
-}
-
 // TestBadRequestsAndMethods: missing model, unparsable body, and the method
 // mux (Go 1.22 "POST /v1/..." patterns 405 everything else).
 func TestBadRequestsAndMethods(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	t.Run("missing model", func(t *testing.T) {
 		res := postJSON(t, mux, "/v1/chat/completions", `{"messages":[]}`, nil)
@@ -778,7 +729,7 @@ func TestModelAliasAndThinkingSuffix(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	t.Run("oc/ prefix stripped", func(t *testing.T) {
 		res := postJSON(t, mux, "/v1/chat/completions",
@@ -807,7 +758,7 @@ func TestModelAliasAndThinkingSuffix(t *testing.T) {
 	t.Run("muse suffix drives reasoning.effort", func(t *testing.T) {
 		museUp := newScriptedUpstream(t, rec, 200, "text/event-stream", responsesStreamSSE)
 		defer museUp.Close()
-		_, museMux := newRouter(t, museUp.URL, "")
+		_, museMux := newRouter(t, museUp.URL)
 		for _, tc := range []struct{ suffix, want string }{
 			{"(high)", "high"},
 			{"(xhigh)", "xhigh"},
@@ -841,7 +792,7 @@ func TestDownstreamCapture(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	_, mux := newRouter(t, up.URL, "")
+	_, mux := newRouter(t, up.URL)
 
 	t.Run("valid opencode UA passes through", func(t *testing.T) {
 		res := postJSON(t, mux, "/v1/chat/completions",
@@ -905,7 +856,7 @@ func TestDrainGateRejectsNewRequests(t *testing.T) {
 	rec := &upstreamRecorder{}
 	up := newScriptedUpstream(t, rec, 200, "text/event-stream", chatStreamSSE)
 	defer up.Close()
-	s, mux := newRouter(t, up.URL, "")
+	s, mux := newRouter(t, up.URL)
 
 	// Before draining: the request flows to the upstream.
 	res := postJSON(t, mux, "/v1/chat/completions",

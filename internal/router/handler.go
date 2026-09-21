@@ -85,31 +85,14 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // responses, /v1/chat/completions is openai — even with an input[] body).
 func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat relay.Format) {
 	// ONE immutable snapshot for the WHOLE request, captured at ARRIVAL: the
-	// single store read this handler ever makes. Everything downstream — the
-	// auth gate below, route matching, the health policy, egress resolution,
-	// upstream.base, the fallback policy and the completion log's
-	// generation=N — reads THIS rt, so a hot reload landing mid-request can
-	// never split a request across two generations (issue #24): a request
-	// admitted under generation N is served, dialed, retried and logged
-	// entirely under N, and the swap to N+1 affects only requests that have
-	// not arrived yet. Auth deliberately runs against the SAME snapshot (no
-	// second read at the routing block below): a reload that rotates the keys
-	// can neither revoke an in-flight request's admission nor widen it —
-	// admission and everything after it are one generation's decision.
+	// single store read this handler ever makes. Everything downstream —
+	// route matching, the health policy, egress resolution, upstream.base,
+	// the fallback policy and the completion log's generation=N — reads THIS
+	// rt, so a hot reload landing mid-request can never split a request
+	// across two generations (issue #24): a request arriving under
+	// generation N is served, dialed, retried and logged entirely under N,
+	// and the swap to N+1 affects only requests that have not arrived yet.
 	rt := s.runtime()
-	// The auth gate is first, before the method check and the body read (the
-	// 401 path never touches clientMu, a health state, or an upstream).
-	// authName feeds the completion log lines (api_key_name).
-	authName := ""
-	if rt.AuthEnabled() {
-		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		var ok bool
-		authName, ok = rt.LookupAPIKey(auth)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "Invalid API key provided")
-			return
-		}
-	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
@@ -264,7 +247,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// an identity the newer generation dropped can be reclaimed before this
 	// older-generation request pins it, and the request then plans against
 	// reset (healthy) state for it. Health is the advisory eligibility layer —
-	// the route set, egress transports, fallback budget and auth all remain
+	// the route set, egress transports and fallback budget all remain
 	// the arrival generation's — so the effect is bounded: one in-flight
 	// request may dial a cooling egress that the NEW config no longer
 	// references, exactly as any stale-snapshot request may. Observe
@@ -351,17 +334,10 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	start := time.Now()
 	resp, egID, attempts, class, uerr := s.Exec.Execute(reqCtx, url, buildHeaders, bodyJSON, plan, policy)
 	latency := time.Since(start)
-	// Completion log line: same facts per status. api_key_name is appended
-	// ONLY when auth is enabled — the configured NAME, never the credential,
-	// and only for requests that passed the gate.
+	// Completion log line: same facts per status.
 	logLine := func(status int) {
-		format := "%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t"
-		args := []any{reqID, rt.Generation, plan.RouteID, egID, attempts, class, status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1}
-		if authName != "" {
-			format += " api_key_name=%q"
-			args = append(args, authName)
-		}
-		s.logf(format, args...)
+		s.logf("%s generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
+			reqID, rt.Generation, plan.RouteID, egID, attempts, class, status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 	}
 	if uerr != nil {
 		cancelUpstream()

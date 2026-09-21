@@ -197,7 +197,7 @@ func TestForcedSSEToJsonOversizedUpstreamReturns502(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	_, mux := newRouter(t, upstream.URL, "")
+	_, mux := newRouter(t, upstream.URL)
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		done <- postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free"}`, nil)

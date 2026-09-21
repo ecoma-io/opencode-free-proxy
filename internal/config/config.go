@@ -163,7 +163,7 @@ var DefaultErrorMessages = map[int]string{
 }
 
 // FromEnv builds the process-bootstrap config from environment variables.
-// Every SERVICE setting (upstream base, inbound auth keys, UA sync cadence)
+// Every SERVICE setting (upstream base, UA sync cadence)
 // lives in the OCFP_CONFIG YAML document instead — see file.go; these four
 // variables are deliberately not part of it. Every env var the process reads
 // carries the OCFP_ prefix (OCFP_PORT included — never a bare PORT), so a

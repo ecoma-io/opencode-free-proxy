@@ -3,10 +3,10 @@
 Everything the proxy does at runtime is configured through **one YAML
 document** (`OCFP_CONFIG`) plus a handful of **bootstrap environment
 variables** that shape the process itself. Service settings — the upstream
-base, inbound auth keys, the UA-sync cadence, egresses, routes, fallback and
-health — all live in the config document, not in env vars. (The pre-0.4
+base and the UA-sync cadence — plus egresses, routes, fallback and
+health all live in the config document, not in env vars. (The pre-0.4
 `OFP_API_KEY` / `OFP_UPSTREAM_BASE` / `OFP_UA_SYNC_INTERVAL` env vars are
-removed; their sections below replace them.)
+removed; their sections below replace the surviving two.)
 
 `config.example.yaml` in the repo root is the complete annotated schema, and
 `internal/config/example_test.go` loads it through the real loader, so the
@@ -29,10 +29,6 @@ is.
 ```yaml
 upstream:
   base: https://opencode.ai
-auth:
-  keys:
-    - name: primary
-      key: ${OFP_PRIMARY_API_KEY}
 user_agent:
   sync_interval: 3600
 egress:
@@ -77,17 +73,6 @@ Every endpoint (`/zen/v1/chat/completions`, `/zen/v1/responses`,
 `/zen/v1/models`) is derived from `base` — no other upstream URL appears in
 config or code. A non-default base is how tests and self-hosted gateways
 redirect the whole proxy.
-
-### `auth`
-
-Inbound bearer authentication — see [authentication.md](authentication.md)
-for the full semantics.
-
-| Field         | Type         | Default  | Meaning                                                                                                  |
-| ------------- | ------------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `keys[]`      | [{name,key}] | empty    | named inbound bearer credentials; empty or omitted = auth off (`401 Invalid API key provided` otherwise) |
-| `keys[].name` | string       | required | unique, control-free; matched requests log it as `api_key_name` — the only part of a key ever echoed     |
-| `keys[].key`  | string       | required | unique secret (`Authorization: Bearer <key>`); env reference, never a literal; never logged or echoed    |
 
 ### `user_agent`
 
@@ -184,12 +169,12 @@ final content.
 
 `File.Validate` (`internal/config/file.go`) applies the structural +
 semantic checks in a fixed order and fails with the first violation, with an
-actionable path (`egress proxy-b: …`, `route streaming: …`,
-`auth.keys[1] (primary): duplicate key value`). The rules most often hit:
+actionable path (`egress proxy-b: …`, `route streaming: …`). The rules most
+often hit:
 
 - at least one `egress` and one `route`; every route `egress` id must exist
   and be listed at most once per route;
-- egress/route/key ids must be unique and free of control characters;
+- egress/route ids must be unique and free of control characters;
 - `weight`, `max_concurrency`, `max_body_bytes`, `min/max_body_bytes`,
   `failure_threshold`, `cooldown`, `max_attempts`, `sync_interval` must be
   ≥ 0 (explicit 0 keeps its documented meaning — never a default);
@@ -197,8 +182,6 @@ actionable path (`egress proxy-b: …`, `route streaming: …`,
   least one egress with weight > 0 in the route);
 - `upstream.base` must be an absolute http/https URL with a host and without
   userinfo, query, or fragment;
-- `auth.keys` names and values must each be unique, non-empty; the value is
-  never echoed — the error names the entries;
 - durations (`health.cooldown`) are Go duration strings (`"30s"`) — a bare
   number is a load error;
 - an unset `${VAR}` fails the whole load, naming the variable.

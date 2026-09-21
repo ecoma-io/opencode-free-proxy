@@ -71,7 +71,6 @@ func TestGracefulDrainFinishesInFlightStream(t *testing.T) {
 	req, _ := http.NewRequestWithContext(ctx, "POST", sp.base+"/v1/chat/completions",
 		strings.NewReader(`{"model":"qwen3-coder-free","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	resp, err := sp.client.Do(req)
 	if err != nil {
 		t.Fatalf("stream request: %v", err)
@@ -193,7 +192,6 @@ func TestGraceForcesCloseStalledStream(t *testing.T) {
 	req, _ := http.NewRequest("POST", sp.base+"/v1/chat/completions",
 		strings.NewReader(`{"model":"qwen3-coder-free","stream":true}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+testAPIKey)
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("stream request: %v", err)

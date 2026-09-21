@@ -12,8 +12,8 @@ body:
         `internal/config`, fail-open vs fail-closed) lives in
         [`AGENTS.md`](../../blob/main/AGENTS.md).
 
-        **Do not report a security vulnerability here.** A configured
-        `auth.keys` credential (or any live credential) reaching a log line
+        **Do not report a security vulnerability here.** A live credential
+        reaching a log line
         or an error goes through a
         [private security advisory](../../security/advisories/new)
         instead — see [SECURITY.md](../../blob/main/SECURITY.md).
