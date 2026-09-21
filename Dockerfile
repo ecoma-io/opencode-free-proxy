@@ -5,7 +5,7 @@
 # /healthz on $OCFP_PORT).
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-ARG VERSION=0.1.0-dev
+ARG VERSION=dev
 # Dependency layer before source: it only re-runs when go.mod/go.sum change.
 # The module cache (/go/pkg/mod) and compile cache (/root/.cache/go-build)
 # are BuildKit cache mounts, not layers — they persist across builds, so a
