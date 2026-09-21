@@ -32,17 +32,39 @@ const maxErrorBodyBytes = 1 << 20
 // Client performs the retrying upstream call (executors/base.js execute, the
 // single-URL shape this proxy uses).
 //
-// Redirects: HTTP is left with CheckRedirect unset, so http.Client follows up
-// to 10 redirects — faithful parity with the JS source, which passes no
-// `redirect:` option anywhere in the executor path (base.js:144-149 sends
-// only method/headers/body/signal through proxyFetch.js, which forwards the
-// options object untouched to native fetch — utils/proxyFetch.js:203-257 —
-// whose default is `redirect: "follow"`; the single `redirect: "manual"` in
-// open-sse is the image fetch, translator/concerns/image.js:97-98, a
-// different boundary). Accepted consequence: a 307/308 re-POSTs the body —
-// including `Authorization: Bearer public` and the x-opencode-* headers — to
-// the redirect target, exactly as the JS router would (pinned by
-// TestRedirectFollowedLikeJSFetch).
+// Redirects: the JS router follows them by default — base.js:144-149 sends
+// only method/headers/body/signal through proxyFetch.js (utils/
+// proxyFetch.js:203-257), native fetch's default `redirect: "follow"`. WHO
+// follows them differs by client:
+//
+//   - Egress clients (NewClientFor) set followRedirects: attempt follows each
+//     hop ITSELF, re-picking the scheme-appropriate transport per hop, because
+//     stdlib's redirect loop inside one http.Client cannot — an https request
+//     redirected to an http Location would make the TUNNELED transport dial
+//     the origin DIRECT (its Proxy is nil and DialContext unset → net/http's
+//     zeroDialer), leaking the host IP past the egress, and an http request
+//     redirected to https would make the ABSOLUTE-FORM transport speak CONNECT
+//     itself, whose 407 refusals carry only the reason phrase (untyped →
+//     retry storm, violating the issue #6 contract). undici never had the
+//     problem: fetch's redirect handling re-dispatches every hop through the
+//     same ProxyAgent dispatcher (undici/lib/web/fetch/index.js http-redirect
+//     fetch → mainFetch → httpNetworkOrCacheFetch), so all hops stay on the
+//     proxy. The hop cap is config.MaxRedirects — 20, undici's own limit
+//     (undici/lib/web/fetch/index.js:1250 `request.redirectCount === 20` →
+//     network error), NOT net/http's default of 10.
+//   - The direct client (NewClient) leaves CheckRedirect unset: one transport
+//     serves both schemes, so stdlib's follow is proxy-safe there.
+//
+// Accepted consequence (both paths, pinned by TestRedirectFollowedLikeJSFetch
+// and the redirect tests): a 307/308 re-POSTs the body — including
+// `Authorization: Bearer public` and the x-opencode-* headers — to the
+// redirect target. Deliberate divergence, kept from the pre-manual-follow
+// behavior: undici STRIPS Authorization on any cross-ORIGIN redirect
+// (undici/lib/web/fetch/index.js:1313-1317), which this port does not
+// replicate — the follow loop applies stdlib's coarser cross-DOMAIN rule
+// instead (see attempt), which keeps credentials across port changes. The
+// credentials here are the public bearer + opencode identity headers, all
+// deliberately replayable to any free-tier endpoint.
 type Client struct {
 	// HTTP is the main transport: direct for unproxied and socks5 egresses,
 	// Go's absolute-form proxy path for HTTP origins behind an HTTP(S)
@@ -52,6 +74,10 @@ type Client struct {
 	tunneled *http.Client
 	Sleep    func(time.Duration)
 	Now      func() time.Time
+
+	// followRedirects: attempt owns the redirect loop (see the Client doc).
+	// Set by NewClientFor; NewClient leaves it false so stdlib follows.
+	followRedirects bool
 
 	// TLSConfig holds the ORIGIN TLS settings for the tunneled CONNECT
 	// transport (and, cloned in, the proxy hop when the proxy endpoint is
@@ -208,19 +234,201 @@ func (c *Client) CloseIdleConnections() {
 // distinguishes transport failures. The transport is picked by TARGET scheme:
 // https through an HTTP(S) proxy rides the tunneled CONNECT boundary, http
 // rides the absolute-form proxy transport (or the single direct/socks5 one).
+//
+// For followRedirects clients the redirect chain is walked HERE, hop by hop,
+// so every hop re-runs the scheme→transport pick (see the Client doc). The
+// per-hop behavior mirrors the two engines this port sits between:
+//
+//   - undici (the JS router's fetch, undici/lib/web/fetch/index.js
+//     http-redirect fetch): a 3xx WITHOUT Location is the final answer
+//     (:1233-1237 `locationURL is null → return response`, same as
+//     net/http/client.go:643-649); a Location that fails to parse or is not
+//     http(s) is a network error (:1239-1247); the chain gives up after
+//     config.MaxRedirects followed hops with a network-class error (:1250);
+//     301/302 on POST and 303 on anything non-GET/HEAD switch the hop to GET
+//     with no body (:1290-1306 — identical to net/http redirectBehavior,
+//     client.go:512-539).
+//   - net/http's client follow loop (client.go do()): headers are re-copied
+//     from the ORIGINAL request on every hop (makeHeadersCopier), the
+//     sensitive set (Authorization & friends) is stripped once the chain
+//     leaves the initial DOMAIN — sticky thereafter (:688-693, 814-815) —
+//     and body-describing headers are dropped once a hop dropped the body
+//     (:817-821). NOT replicated: stdlib's Referer injection (:694-698) —
+//     the JS executor sends no Referer on any hop, and undici adds none.
+//
+// The mid-chain responses are drained bounded (drainAndClose) and closed;
+// their bodies are never surfaced.
 func (c *Client) attempt(ctx context.Context, url string, headers map[string]string, bodyJSON []byte) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyJSON))
-	if err != nil {
-		return nil, err
+	method := http.MethodPost
+	// Sticky per-chain state, both mirroring net/http's do loop: once the
+	// chain leaves the initial domain the sensitive headers stay stripped
+	// even if a later hop returns to it, and once a hop dropped the body it
+	// is never re-sent.
+	stripSensitive := false
+	droppedBody := false
+	initialHost, initialHostname := "", ""
+	hops := 0
+	current := url
+	for {
+		var body io.Reader
+		if !droppedBody && bodyJSON != nil {
+			body = bytes.NewReader(bodyJSON)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, current, body)
+		if err != nil {
+			return nil, err
+		}
+		if initialHost == "" {
+			initialHost = req.URL.Host
+			initialHostname = req.URL.Hostname()
+		}
+		for k, v := range headers {
+			if stripSensitive && isSensitiveRedirectHeader(k) {
+				continue
+			}
+			if droppedBody && isBodyRedirectHeader(k) {
+				continue
+			}
+			req.Header.Set(k, v)
+		}
+		if !c.followRedirects {
+			// The direct client (NewClient): stdlib follows, unchanged —
+			// its one transport serves both schemes, so stdlib's loop
+			// cannot bypass a proxy. (A tunneled transport only exists on
+			// followRedirects clients; the scheme pick below is the
+			// historical one, kept for parity.)
+			client := c.HTTP
+			if req.URL.Scheme == "https" && c.tunneled != nil {
+				client = c.tunneled
+			}
+			return client.Do(req)
+		}
+		resp, err := c.roundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+		if !isRedirectStatus(resp.StatusCode) {
+			return resp, nil
+		}
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			// A 3xx without Location is the answer, not a hop — undici
+			// returns it (fetch/index.js:1233-1237), net/http too
+			// (client.go:643-649). The caller decides what a 3xx body means.
+			return resp, nil
+		}
+		next, err := req.URL.Parse(loc)
+		if err != nil {
+			drainAndClose(resp)
+			return nil, fmt.Errorf("redirect: parse Location %q: %w", loc, err)
+		}
+		if next.Scheme != "http" && next.Scheme != "https" {
+			drainAndClose(resp)
+			return nil, fmt.Errorf("redirect: Location %q is not an HTTP(S) URL", loc)
+		}
+		hops++
+		if hops > config.MaxRedirects {
+			drainAndClose(resp)
+			return nil, fmt.Errorf("redirect count exceeded (%d)", config.MaxRedirects)
+		}
+		// 301/302 on POST, 303 on anything non-GET/HEAD: the next hop is a
+		// body-less GET (undici fetch/index.js:1290-1306; net/http
+		// redirectBehavior client.go:512-539). 307/308 keep method + body.
+		if (resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound) && method == http.MethodPost ||
+			resp.StatusCode == http.StatusSeeOther && method != http.MethodGet && method != http.MethodHead {
+			method = http.MethodGet
+			droppedBody = true
+		}
+		// net/http client.go:688-692: leaving the initial host only strips
+		// the sensitive set when the destination is a DIFFERENT domain —
+		// subdomains (and same-host port changes, Hostname() ignores the
+		// port) keep credentials.
+		if !stripSensitive && next.Host != initialHost && !sameDomainOrSub(next.Hostname(), initialHostname) {
+			stripSensitive = true
+		}
+		drainAndClose(resp)
+		current = next.String()
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
+}
+
+// roundTrip sends req through the transport the SCHEME picks, calling
+// RoundTrip directly — never http.Client.Do, whose internal follow loop is
+// exactly what the manual chain above exists to replace (it would re-cross a
+// scheme boundary on stdlib's terms, bypassing the per-hop transport pick).
+// A nil Transport falls back to http.DefaultTransport like http.Client
+// (net/http/client.go send).
+func (c *Client) roundTrip(req *http.Request) (*http.Response, error) {
+	return c.transportFor(req.URL.Scheme).RoundTrip(req)
+}
+
+// transportFor is the scheme→transport table: https rides the tunneled
+// CONNECT boundary when one exists (http/https proxy egresses), everything
+// else rides the main transport. Re-evaluated per hop by attempt.
+func (c *Client) transportFor(scheme string) http.RoundTripper {
+	if scheme == "https" && c.tunneled != nil {
+		if t := c.tunneled.Transport; t != nil {
+			return t
+		}
+		return http.DefaultTransport
 	}
-	client := c.HTTP
-	if req.URL.Scheme == "https" && c.tunneled != nil {
-		client = c.tunneled
+	if t := c.HTTP.Transport; t != nil {
+		return t
 	}
-	return client.Do(req)
+	return http.DefaultTransport
+}
+
+// isRedirectStatus mirrors undici's redirectStatusSet / net/http's
+// redirectBehavior: exactly these statuses redirect. 300/304/305 and the rest
+// are final answers.
+func isRedirectStatus(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
+}
+
+// isSensitiveRedirectHeader mirrors net/http's sensitive redirect set
+// (client.go:814-815): credentials that must not follow a redirect onto a
+// different domain.
+func isSensitiveRedirectHeader(k string) bool {
+	switch http.CanonicalHeaderKey(k) {
+	case "Authorization", "Www-Authenticate", "Cookie", "Cookie2",
+		"Proxy-Authorization", "Proxy-Authenticate":
+		return true
+	}
+	return false
+}
+
+// isBodyRedirectHeader mirrors net/http's body-header set (client.go:817-821):
+// headers describing a request body a POST→GET redirect hop no longer sends
+// (the fetch spec deletes the same names, undici fetch/index.js:1296-1302).
+func isBodyRedirectHeader(k string) bool {
+	switch http.CanonicalHeaderKey(k) {
+	case "Content-Encoding", "Content-Language", "Content-Location", "Content-Type":
+		return true
+	}
+	return false
+}
+
+// sameDomainOrSub mirrors net/http isDomainOrSubdomain (client.go:1028-1039):
+// dest equals parent, or dest is a dot-suffixed child ("api.example.com"
+// under "example.com"); a dest containing ':' or '%' (IPv6 literals/zones)
+// never suffix-matches. Deliberate divergence: stdlib normalizes both sides
+// through IDNA first (idnaASCIIFromURL, transport.go:3024) — this port does
+// not carry x/net/idna, so hosts differing only in A-label form count as
+// different domains and strip the sensitive set slightly more often. The
+// safe direction: over-stripping Authorization on an exotic redirect beats
+// leaking it.
+func sameDomainOrSub(dest, parent string) bool {
+	if dest == parent {
+		return true
+	}
+	if strings.ContainsAny(dest, ":%") {
+		return false
+	}
+	return strings.HasSuffix(dest, "."+parent)
 }
 
 // tryRetry consumes one draw from the shared per-URL budget against this

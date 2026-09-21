@@ -121,15 +121,19 @@ func (e *proxyAuthError) Error() string { return e.msg }
 // generic timeouts; timeouts beat connection errors (net.Error.Timeout).
 //
 // There is deliberately NO error-text probing — not even the canonical
-// "Proxy Authentication Required" reason phrase. (Go's own proxy support,
-// still used for plain-http origins, strips the numeric code of a refused
-// CONNECT and keeps only the phrase — but this package no longer lets
-// stdlib speak CONNECT at all: proxied https rides the typed boundary in
-// connect.go.) Beyond that, any transport error may carry arbitrary text
-// (an IPv6 literal with a :407 octet, a port, a hostname) that a substring
-// probe would misclassify. Ownership of a 407 is decided where the proxy
-// protocol is spoken — the typed boundary in connect.go/socks5.go — never
-// by inspecting the message (issue #6).
+// "Proxy Authentication Required" reason phrase. (Go's own proxy CONNECT
+// path strips the numeric code of a refused CONNECT and keeps only the
+// phrase — an unclassifiable error. This package keeps stdlib OFF that
+// path: attempt routes every https hop through the tunneled DialTLSContext
+// boundary in connect.go and every http hop through absolute-form, so no
+// transport here both carries a Proxy AND can see an https URL — the
+// manual redirect walk re-picks the transport per hop, so even an
+// http→https redirect hop rides the typed boundary instead of stdlib's
+// CONNECT. See the Client doc in client.go.) Beyond that, any transport
+// error may carry arbitrary text (an IPv6 literal with a :407 octet, a
+// port, a hostname) that a substring probe would misclassify. Ownership of
+// a 407 is decided where the proxy protocol is spoken — the typed boundary
+// in connect.go/socks5.go — never by inspecting the message (issue #6).
 func classifyNetErrFor(ctx context.Context, err error) Class {
 	if ctx.Err() != nil {
 		return ClassContextCanceled

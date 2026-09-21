@@ -125,6 +125,19 @@ var RetryRules = map[int]RetryRule{
 	504: {Attempts: 2, Delay: 3 * time.Second},
 }
 
+// MaxRedirects is how many redirects ONE upstream attempt follows before
+// giving up with a network-class error (which then rides the normal 502
+// retry rule, exactly like any other fetch exception in base.js:173-178).
+// The JS router's fetch is undici under a ProxyAgent dispatcher
+// (utils/proxyFetch.js getDispatcher → originalFetch(url, {dispatcher})),
+// and undici caps the chain at twenty: `if (request.redirectCount === 20)
+// return … makeNetworkError('redirect count exceeded')` —
+// node_modules/undici/lib/web/fetch/index.js:1250-1255 (the WHATWG fetch
+// algorithm). net/http's own default checkRedirect cap is 10, which would
+// NOT be parity — an upstream legitimately redirecting 11-20 times succeeds
+// in the JS router and must succeed here.
+const MaxRedirects = 20
+
 // Server defaults.
 const (
 	DefaultPort = "8090"

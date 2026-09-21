@@ -770,6 +770,230 @@ func TestProxyDialAddr(t *testing.T) {
 	}
 }
 
+// egressProxy is the fake HTTP(S) proxy for the redirect-path tests: a REAL
+// tunneling proxy for CONNECT (issue #6's wire) that ALSO forwards
+// absolute-form plain-http requests the way a forward proxy must — plus
+// per-request counters, so tests can prove which side of the boundary each
+// hop arrived on.
+type egressProxy struct {
+	srv      *httptest.Server
+	connects atomic.Int64
+	forwards atomic.Int64
+}
+
+// newEgressProxy builds the dual-protocol fake. connect407 makes the CONNECT
+// arm answer 407 instead of tunneling (the typed-refusal fixture).
+func newEgressProxy(t *testing.T, connect407 bool) *egressProxy {
+	t.Helper()
+	e := &egressProxy{}
+	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			e.connects.Add(1)
+			if connect407 {
+				w.Header().Set("Proxy-Authenticate", `Basic realm="egress-proxy"`)
+				w.WriteHeader(http.StatusProxyAuthRequired)
+				return
+			}
+			up, err := net.Dial("tcp", r.Host)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			client, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				_ = up.Close()
+				return
+			}
+			_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			go func() { _, _ = io.Copy(up, client) }()
+			go func() { _, _ = io.Copy(client, up) }()
+			return
+		}
+		// Absolute-form plain-http request: forward it as a real forward
+		// proxy would, and count the arrival — the proof an http hop rode
+		// the egress instead of a direct dial.
+		if !r.URL.IsAbs() {
+			t.Errorf("forward proxy expected an absolute-URI request, got %s", r.URL)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		e.forwards.Add(1)
+		fwd := &http.Request{
+			Method: r.Method,
+			URL:    r.URL,
+			Header: r.Header.Clone(),
+			Host:   r.URL.Host,
+		}
+		resp, err := http.DefaultTransport.RoundTrip(fwd)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		for k, vv := range resp.Header {
+			w.Header()[k] = vv
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(e.srv.Close)
+	return e
+}
+
+// TestCrossSchemeRedirectStaysOnEgress (the https→http direction): an https
+// origin behind an HTTP proxy egress answers 302 pointing at a plain-http
+// target. The manual redirect walk must re-pick the transport for the NEW
+// scheme — the http hop rides the absolute-form proxy path — instead of
+// letting stdlib follow inside the TUNNELED client, where a nil DialContext
+// on a Proxy-less transport dials the origin DIRECT and leaks the host IP
+// past the egress (plus the re-POSTed body, Authorization, and x-opencode-*
+// headers). The proxy's counters are the wire proof: 1 CONNECT (the https
+// hop) and 1 absolute-form forward (the http hop), with the target actually
+// served — and served ONLY through the proxy.
+func TestCrossSchemeRedirectStaysOnEgress(t *testing.T) {
+	var mu sync.Mutex
+	targetHits := 0
+	var targetBody string
+	var targetAuth string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		targetHits++
+		targetBody = string(b)
+		targetAuth = r.Header.Get("Authorization")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: hop2\n\n")
+	}))
+	defer target.Close()
+
+	// The https origin: one POST, then a 302 to the PLAIN-HTTP target.
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL+"/zen/v1/chat/completions")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer origin.Close()
+
+	pxy := newEgressProxy(t, false)
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.srv.URL}))
+	c.TLSConfig = &tls.Config{RootCAs: originRootPool(t, origin)}
+	headers := func() map[string]string {
+		return map[string]string{
+			"Authorization":      "Bearer " + config.PublicBearer,
+			"x-opencode-session": "e2e-session",
+		}
+	}
+
+	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", headers, []byte(`{"model":"big-pickle"}`))
+	if uerr != nil || class != ClassSuccess {
+		t.Fatalf("uerr=%v class=%s, want the followed chain served through the egress", uerr, class)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "data: hop2") {
+		t.Fatalf("body = %q, want the http target's SSE through the proxy", body)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if targetHits != 1 {
+		t.Fatalf("target hits = %d, want 1 (the http hop arrived)", targetHits)
+	}
+	if got := pxy.connects.Load(); got != 1 {
+		t.Fatalf("proxy CONNECTs = %d, want 1 (the https hop tunneled)", got)
+	}
+	// THE assertion: the plain-http hop ARRIVED ON THE PROXY in absolute
+	// form. Pre-fix behavior dials the target directly from the host —
+	// the forward counter would read 0 while the target still got hit.
+	if got := pxy.forwards.Load(); got != 1 {
+		t.Fatalf("proxy absolute-form forwards = %d, want 1 — the http redirect hop bypassed the egress", got)
+	}
+	// 302 rewrites the hop to a body-less GET; the kept headers (same-host
+	// 127.0.0.1 chain — stdlib's cross-DOMAIN rule does not strip) still
+	// arrive via the proxy: the accepted consequence, now egress-safe.
+	if targetBody != "" {
+		t.Fatalf("302 target saw body %q, want none (POST→GET drops it)", targetBody)
+	}
+	if targetAuth != "Bearer "+config.PublicBearer {
+		t.Fatalf("302 target saw Authorization %q, want the public bearer forwarded through the egress", targetAuth)
+	}
+}
+
+// TestCrossSchemeRedirect407IsTyped (the http→https direction): a plain-http
+// origin behind an HTTP proxy egress answers 302 to an https target, and the
+// proxy refuses the CONNECT with 407. The https hop must ride the TYPED
+// connect.go boundary — pre-fix, stdlib spoke the CONNECT itself on the
+// absolute-form transport, whose 407 surfaces as a reason-phrase-only plain
+// error (ClassConnectionError → the full 502 retry matrix = 4 CONNECT
+// dials). The issue #6 contract instead: exactly ONE CONNECT, typed
+// proxy-auth, immediate fallback eligibility.
+func TestCrossSchemeRedirect407IsTyped(t *testing.T) {
+	// The http origin: one POST, then a 302 to an unreachable https target —
+	// unreachable is fine, the proxy refuses the CONNECT before any origin
+	// dial.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "https://origin2.invalid/zen/v1/chat/completions")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer origin.Close()
+
+	pxy := newEgressProxy(t, true) // CONNECT arm answers 407
+	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.srv.URL}))
+
+	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if class != ClassProxyAuthError {
+		t.Fatalf("class = %s, want ClassProxyAuthError (the redirected https hop must ride the typed CONNECT boundary)", class)
+	}
+	if uerr == nil || uerr.Status != http.StatusBadGateway {
+		t.Fatalf("uerr = %+v, want the 502 envelope", uerr)
+	}
+	if uerr == nil || !strings.Contains(uerr.Message, "CONNECT refused with 407") {
+		t.Fatalf("error text = %q, want the typed boundary message", uerr.Message)
+	}
+	if got := pxy.connects.Load(); got != 1 {
+		t.Fatalf("CONNECTs = %d, want exactly 1 (typed proxy-auth never rides the 502 retry matrix — stdlib's CONNECT would have made it 4)", got)
+	}
+	if got := pxy.forwards.Load(); got != 1 {
+		t.Fatalf("proxy forwards = %d, want 1 (the http hop rode the egress)", got)
+	}
+}
+
+// TestRedirectCapIsUndiciTwenty: the manual walk follows 20 redirects and
+// gives up on the 21st with a network-class error — undici's contract
+// (`if (request.redirectCount === 20) return … makeNetworkError('redirect
+// count exceeded')`, fetch/index.js:1250-1255), NOT net/http's default cap
+// of 10. attempt is called DIRECTLY so the retry matrix does not multiply
+// the hit count; DoClassified routes this error through the normal 502
+// network-error rule exactly like any other fetch exception.
+func TestRedirectCapIsUndiciTwenty(t *testing.T) {
+	var hits atomic.Int64
+	chain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Location", r.URL.Path) // same-URL redirect: keep walking
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer chain.Close()
+
+	c := noSleepClient(NewClientFor(nil)) // direct egress client: manual walk
+	resp, err := c.attempt(context.Background(), chain.URL+"/zen/v1/chat/completions", nil, []byte("{}"))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if got := hits.Load(); got != int64(config.MaxRedirects)+1 {
+		t.Fatalf("upstream hits = %d, want %d (initial + all 20 followed redirects)", got, config.MaxRedirects+1)
+	}
+	if err == nil || !strings.Contains(err.Error(), "redirect count exceeded") {
+		t.Fatalf("err = %v, want the redirect-count-exceeded network error", err)
+	}
+	var pae *proxyAuthError
+	if errors.As(err, &pae) {
+		t.Fatalf("the cap error must stay a plain network error, never proxy-auth: %v", err)
+	}
+}
+
 // TestConnectReplyHeadersAreBounded: a hostile proxy flooding the CONNECT
 // reply with an unbounded header block must hit the reader's limit (stdlib
 // parity — net/http maxHeaderResponseSize) and fail the dial as a connection

@@ -32,18 +32,15 @@ import (
 // proxy — the pairing is validated at config load (issue #8). The proxy URL
 // itself is never logged; errors carry the redacted form.
 //
-// Redirects: both http.Clients below (and Client.HTTP from NewClient) leave
-// CheckRedirect unset, so http.Client follows up to 10 redirects — faithful
-// parity with the JS source, which passes no `redirect:` option in the
-// executor path (base.js:144-149 → utils/proxyFetch.js:203-257 forwards the
-// options to native fetch, default `redirect: "follow"`; the lone
-// redirect:"manual" lives in translator/concerns/image.js:97-98, a different
-// boundary). Accepted consequence: a 307/308 re-POSTs the body — including
-// `Authorization: Bearer public` and the x-opencode-* headers — to the
-// redirect target, exactly as the JS router would (pinned by
-// TestRedirectFollowedLikeJSFetch).
+// Redirects: the returned client sets followRedirects — attempt walks the
+// chain itself and re-picks the scheme-appropriate transport per hop, so a
+// cross-scheme redirect can never leave the egress (https→http would
+// otherwise dial DIRECT off the tunneled transport, http→https would put
+// STDLIB on the CONNECT with an untyped 407). See the Client doc in
+// client.go for the full rationale and the undici citations; the JS router
+// stays on its ProxyAgent for every hop the same way.
 func NewClientFor(p *config.Proxy) (*Client, error) {
-	c := &Client{Sleep: time.Sleep, Now: time.Now}
+	c := &Client{Sleep: time.Sleep, Now: time.Now, followRedirects: true}
 	if p == nil {
 		tr := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
