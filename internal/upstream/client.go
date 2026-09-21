@@ -89,12 +89,14 @@ type Client struct {
 // NewClient wires an http.Client whose response-header wait is the connect
 // timeout (FETCH_CONNECT_TIMEOUT_MS semantics: time to first response byte
 // headers; the SSE body itself streams unbounded). The direct transport: no
-// proxy, no credentials.
+// proxy, no credentials. IdleConnTimeout is on every transport for the reason
+// config.IdleConnTimeout states (no GC finalizer ever reaps a pooled conn).
 func NewClient() *Client {
 	return &Client{
 		HTTP: &http.Client{
 			Transport: &http.Transport{
 				ResponseHeaderTimeout: config.ConnectTimeout,
+				IdleConnTimeout:       config.IdleConnTimeout,
 				ForceAttemptHTTP2:     true,
 			},
 		},
@@ -219,10 +221,14 @@ func drainAndClose(resp *http.Response) {
 }
 
 // CloseIdleConnections closes the idle pooled conns of every transport the
-// client owns. The router calls it when a generation prune evicts the client:
-// without it an evicted transport's idle conns linger until GC finalizes
-// them (up to ~2 minutes between forced collections), making the FD
-// accounting of an egress swap nondeterministic.
+// client owns. The router calls it when a generation prune evicts the client
+// so an egress swap releases its fds promptly.
+//
+// This alone is NOT enough, and no GC backstop exists: net/http registers NO
+// finalizer for pooled conns, so a conn still busy when the prune runs
+// returns to its transport's idle pool afterwards and stays there forever.
+// IdleConnTimeout (set on every transport this package builds; see
+// config.IdleConnTimeout) is the backstop that eventually reaps it.
 func (c *Client) CloseIdleConnections() {
 	c.HTTP.CloseIdleConnections()
 	if c.tunneled != nil {

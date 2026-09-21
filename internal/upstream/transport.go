@@ -44,6 +44,7 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 	if p == nil {
 		tr := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
+			IdleConnTimeout:       config.IdleConnTimeout,
 			ForceAttemptHTTP2:     true,
 		}
 		c.HTTP = &http.Client{Transport: tr}
@@ -66,6 +67,7 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		// The http-origin transport: Go proxies it in absolute form.
 		viaProxy := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
+			IdleConnTimeout:       config.IdleConnTimeout,
 			ForceAttemptHTTP2:     true,
 			Proxy:                 http.ProxyURL(u),
 		}
@@ -74,6 +76,7 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		// dialer closure, not the transport.
 		tunneled := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
+			IdleConnTimeout:       config.IdleConnTimeout,
 			ForceAttemptHTTP2:     true,
 			DialTLSContext:        newConnectDialer(u, func() *tls.Config { return c.TLSConfig }).DialTLSContext,
 		}
@@ -82,6 +85,7 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 	case config.ProxySOCKS5:
 		tr := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
+			IdleConnTimeout:       config.IdleConnTimeout,
 			ForceAttemptHTTP2:     true,
 			DialContext:           newSocks5Dialer(u).DialContext,
 		}

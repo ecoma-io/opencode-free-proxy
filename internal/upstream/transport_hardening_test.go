@@ -645,3 +645,33 @@ func TestTerminalErrorBodyReadIsBounded(t *testing.T) {
 		t.Fatalf("message is not the truncated raw body: %.80q", uerr.Message)
 	}
 }
+
+// TestAllTransportsCarryIdleConnTimeout is the structural pin for
+// config.IdleConnTimeout: EVERY transport this package builds must carry it.
+// net/http registers no finalizer for pooled conns, so a conn that was busy
+// when a generation prune called CloseIdleConnections returns to the idle
+// pool and lives forever unless the transport's own idle timer reaps it (see
+// config.IdleConnTimeout). A transport added without the field regresses that
+// leak; this fails first.
+func TestAllTransportsCarryIdleConnTimeout(t *testing.T) {
+	check := func(c *Client, which string) {
+		t.Helper()
+		for label, hc := range map[string]*http.Client{"HTTP": c.HTTP, "tunneled": c.tunneled} {
+			if hc == nil {
+				continue
+			}
+			tr, ok := hc.Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("%s %s: transport is %T, want *http.Transport", which, label, hc.Transport)
+			}
+			if tr.IdleConnTimeout != config.IdleConnTimeout {
+				t.Errorf("%s %s: IdleConnTimeout = %v, want %v", which, label, tr.IdleConnTimeout, config.IdleConnTimeout)
+			}
+		}
+	}
+	check(NewClient(), "NewClient")
+	check(noSleepClient(NewClientFor(nil)), "NewClientFor(direct)")
+	check(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: "http://127.0.0.1:9"})), "NewClientFor(http)")
+	check(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTPS, URL: "https://127.0.0.1:9"})), "NewClientFor(https)")
+	check(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://127.0.0.1:9"})), "NewClientFor(socks5)")
+}

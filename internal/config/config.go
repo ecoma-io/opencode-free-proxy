@@ -138,6 +138,26 @@ var RetryRules = map[int]RetryRule{
 // in the JS router and must succeed here.
 const MaxRedirects = 20
 
+// IdleConnTimeout closes a pooled upstream conn after this much idle time,
+// on EVERY transport this process builds. Two reasons, one parity and one
+// hardening:
+//
+//   - Parity: the JS router's fetches run on undici dispatchers whose
+//     keepAliveTimeout default is 4 s (node_modules/undici/lib/dispatcher/
+//     client.js:252 `keepAliveTimeout == null ? 4e3 : keepAliveTimeout`;
+//     utils/proxyFetch.js getDispatcher builds its ProxyAgent without
+//     overriding it, and Node's global dispatcher carries the same client
+//     defaults), so idle keep-alive conns are dropped after 4 s in the JS
+//     router too.
+//   - Hardening: net/http registers NO finalizer for pooled conns. A conn
+//     still busy when a generation prune calls CloseIdleConnections returns
+//     to the idle pool afterwards and, without an idle timeout, sits there
+//     forever — pinning its fd and readLoop goroutine for the life of the
+//     process. The transport arms an idle timer whenever a conn re-enters
+//     the pool (net/http tryPutIdleConn), so this is the only backstop that
+//     reaches conns that outlive their client.
+const IdleConnTimeout = 4 * time.Second
+
 // Server defaults.
 const (
 	DefaultPort = "8090"
