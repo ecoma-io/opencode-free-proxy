@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.4.0...v0.5.0) (2026-09-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** PORT/OFP_CONFIG/OFP_CONFIG_POLL_MS/OFP_SHUTDOWN_GRACE are no longer read; set the OCFP_-prefixed equivalents.
+
+### Features
+
+* **config:** ocfp_ env prefix, remove inbound auth keys, 55s grace, dev docker builds ([#29](https://github.com/ecoma-io/opencode-free-proxy/issues/29)) ([0bf9d00](https://github.com/ecoma-io/opencode-free-proxy/commit/0bf9d0073b87bd297e3feff0fd9dfbda8f31baa0))
+
 ## [0.4.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.3.0...v0.4.0) (2026-09-21)
 
 
