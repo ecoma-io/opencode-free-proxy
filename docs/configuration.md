@@ -5,8 +5,11 @@ document** (`OCFP_CONFIG`) plus a handful of **bootstrap environment
 variables** that shape the process itself. Service settings — the upstream
 base and the UA-sync cadence — plus egresses, routes, fallback and
 health all live in the config document, not in env vars. (The pre-0.4
-`OFP_API_KEY` / `OFP_UPSTREAM_BASE` / `OFP_UA_SYNC_INTERVAL` env vars are
-removed; their sections below replace the surviving two.)
+`OFP_UPSTREAM_BASE` / `OFP_UA_SYNC_INTERVAL` env vars moved into the config
+document in v0.4.0; inbound auth survived one more release as config
+document `auth.keys` and was removed entirely in v0.5.0 — the removed
+`OFP_API_KEY` env var from before v0.4 has no successor, see
+[deployment.md → Production considerations](deployment.md#production-considerations).)
 
 `config.example.yaml` in the repo root is the complete annotated schema, and
 `internal/config/example_test.go` loads it through the real loader, so the

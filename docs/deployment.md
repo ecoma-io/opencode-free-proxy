@@ -42,7 +42,9 @@ To add egresses, routes or a custom upstream, edit the mounted document (or
 point the mount at your own file) — see
 [configuration.md](configuration.md) for the schema (the annotated shipped
 example is `config.example.yaml` in the repo root). The mount is a
-bind mount on purpose: editing the file on the host hot-reloads in place.
+bind mount on purpose: editing the file on the host hot-reloads — but
+because it binds a single file, the host edit must stay in place (see
+[Editing the mounted file](#editing-the-mounted-file) below).
 
 ## The config file mount
 
@@ -69,6 +71,35 @@ volumes:
 The file is re-read every `OCFP_CONFIG_POLL_MS` (default 1 s); a bad rewrite
 keeps the last good runtime — see
 [configuration.md → Hot reload](configuration.md#hot-reload-semantics).
+
+### Editing the mounted file
+
+Hot reload detects change by SHA-256 over the bytes the poller reads each
+tick (`internal/config/store.go`), and every deployment path shipped here —
+the `docker run -v` above and the compose `volumes:` entry — bind-mounts a
+**single file**. A single-file bind mount stays pinned to the inode the
+container started with: a host-side write to that inode is seen, a
+host-side `rename(2)` (write a temp file, move it into place) is NOT — the
+renamed file is a NEW inode, the container keeps reading the old one, the
+hash never changes, and an unchanged file logs nothing, so the missed
+reload is completely silent.
+
+- **With a single-file mount, write in place** — shell redirection
+  (`cat new.yaml > config.yaml`, `printf`/`echo >`), `tee`, `cp` from a
+  staged file: all of these truncate-and-rewrite the SAME inode. Do NOT
+  `sed -i`, `mv`, or any "atomic write" helper — those rename a temp file
+  into place and are invisible to the container.
+- **Watch your editor's write protocol.** Vim's default save renames a
+  temp file over the original — the exact trap; `:set backupcopy=yes`
+  makes `:w` overwrite in place. Anything else that recreates the file
+  instead of rewriting it has the same failure.
+- **To rename/replace freely, mount the directory instead** —
+  `-v "$PWD:/etc/ofp:ro"` with `OCFP_CONFIG=/etc/ofp/config.yaml` (compose:
+  `- ./:/etc/ofp:ro`). Inside a directory bind mount the poller opens the
+  file by path on every tick, so a rename lands on the new inode and the
+  atomic rewrite also removes the torn-read window (a partially-written
+  file that still parses and validates would otherwise serve until the
+  next tick).
 
 ## Bootstrap environment
 
@@ -109,7 +140,10 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
 2. **Force** — after `OCFP_SHUTDOWN_GRACE` (default 55 s) every still-tracked
    connection is force-closed, so a stuck stream cannot pin the process
    forever. Container stop commands should budget for the grace
-   (`docker stop -t 60 …` to outlive the default 55 s).
+   (`docker stop -t 60 …` to outlive the default 55 s). The shipped
+   `compose.yaml` sets `stop_grace_period: 60s` for the same reason — a
+   compose file without it SIGKILLs at compose's 10 s default, 45 s before
+   the drain window ends.
 
 ## Production considerations
 
@@ -124,9 +158,12 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
 - **Reloads are atomic per request.** Editing the mounted file is safe under
   traffic: requests in flight keep their generation; new requests pick up
   the swap. Invalid intermediate states (e.g. an editor's partial write that
-  still parses but fails validation) keep the last good runtime — but
-  prefer an atomic rewrite (write a temp file in the same directory, then
-  `rename(2)` it into place) to avoid serving a torn read window.
+  still parses but fails validation) keep the last good runtime. Mind the
+  mount shape, though: with the shipped single-file bind mounts a host-side
+  `rename(2)` is invisible to the container — a silent no-reload on a
+  stale inode — so write in place, or mount the directory and rename
+  atomically inside it to avoid serving a torn read window (see
+  [Editing the mounted file](#editing-the-mounted-file)).
 - **Health gating is opt-in by config.** With no `OCFP_CONFIG` the process
   runs health OFF — a config-less deployment can never acquire a
   failure-threshold outage. A config file enables it (threshold 3, cooldown
