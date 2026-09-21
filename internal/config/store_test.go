@@ -446,9 +446,9 @@ health: {failure_threshold: 4, cooldown: 12s}
 
 	// LoadBytes runs the full pipeline on its own account too: interpolation
 	// and validation both gate a snapshot behind the caller's bytes.
-	t.Setenv("OFP_TEST_RELOAD_URL", "http://env.example:9")
+	t.Setenv("OCFP_TEST_RELOAD_URL", "http://env.example:9")
 	withEnv, err := LoadBytes([]byte(`
-egress: [{id: a, proxy: {type: http, url: "${OFP_TEST_RELOAD_URL}"}}]
+egress: [{id: a, proxy: {type: http, url: "${OCFP_TEST_RELOAD_URL}"}}]
 routes: [{id: r, egress: [a]}]
 `))
 	if err != nil {
@@ -457,8 +457,8 @@ routes: [{id: r, egress: [a]}]
 	if e, _ := withEnv.Egress("a"); e.Proxy.URL != "http://env.example:9" {
 		t.Fatalf("env not interpolated through LoadBytes: %q", e.Proxy.URL)
 	}
-	if _, err := LoadBytes([]byte("egress: [{id: a, proxy: {type: http, url: \"http://${OFP_TEST_UNSET_VAR}:1\"}}]\n" +
-		"routes: [{id: r, egress: [a]}]\n")); err == nil || !strings.Contains(err.Error(), "OFP_TEST_UNSET_VAR") {
+	if _, err := LoadBytes([]byte("egress: [{id: a, proxy: {type: http, url: \"http://${OCFP_TEST_UNSET_VAR}:1\"}}]\n" +
+		"routes: [{id: r, egress: [a]}]\n")); err == nil || !strings.Contains(err.Error(), "OCFP_TEST_UNSET_VAR") {
 		t.Fatalf("unset var must be a load error naming it, got %v", err)
 	}
 	if _, err := LoadBytes([]byte("egress: [{id: a}, {id: a}]\nroutes: [{id: r, egress: [a]}]\n")); err == nil {

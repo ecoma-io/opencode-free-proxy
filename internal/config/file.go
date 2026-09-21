@@ -221,7 +221,7 @@ type UserAgentConfig struct {
 	SyncInterval *int `yaml:"sync_interval,omitempty"`
 }
 
-// File is the OFP_CONFIG YAML document.
+// File is the OCFP_CONFIG YAML document.
 type File struct {
 	Egress    []Egress        `yaml:"egress"`
 	Routes    []Route         `yaml:"routes"`
@@ -600,7 +600,7 @@ func (f *File) Validate() error {
 	return nil
 }
 
-// UpstreamBase returns the effective upstream base URL — the OFP_CONFIG
+// UpstreamBase returns the effective upstream base URL — the OCFP_CONFIG
 // upstream.base, or the built-in default. Trailing slashes are normalized at
 // Resolve; every request URL is derived from this value.
 func (rt *Runtime) UpstreamBase() string { return rt.upstreamBase }

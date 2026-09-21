@@ -18,7 +18,7 @@ credentials, or session ids belonging to a real deployment into any report
 
 opencode-free-proxy sits between client tools and the opencode zen free
 tier, and deployments may configure inbound bearer keys (the `auth.keys`
-list in the OFP_CONFIG document)
+list in the OCFP_CONFIG document)
 to gate who can use it. Three defect classes therefore count as security
 vulnerabilities even when the underlying mechanism is an ordinary bug:
 

@@ -34,7 +34,7 @@ docker compose up -d --build # build + serve via compose (HOST_PORT, default 302
 ```
 
 With no config the built-in runtime serves the default upstream with auth
-off. Point `OFP_CONFIG` at a document to enable auth, egress routing, or a
+off. Point `OCFP_CONFIG` at a document to enable auth, egress routing, or a
 different upstream:
 
 ```yaml
@@ -59,12 +59,12 @@ routes:
 
 Bootstrap env (the process itself — everything else lives in the file):
 
-| Var                  | Default              | Meaning                                                      |
-| -------------------- | -------------------- | ------------------------------------------------------------ |
-| `PORT`               | `8090`               | Listen port                                                  |
-| `OFP_CONFIG`         | _(empty = built-in)_ | Config document (YAML); hot-reloaded                         |
-| `OFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                |
-| `OFP_SHUTDOWN_GRACE` | `30000` (30s)        | Drain window: active streams finish before forced close (ms) |
+| Var                   | Default              | Meaning                                                      |
+| --------------------- | -------------------- | ------------------------------------------------------------ |
+| `OCFP_PORT`           | `8090`               | Listen port                                                  |
+| `OCFP_CONFIG`         | _(empty = built-in)_ | Config document (YAML); hot-reloaded                         |
+| `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                |
+| `OCFP_SHUTDOWN_GRACE` | `30000` (30s)        | Drain window: active streams finish before forced close (ms) |
 
 ## Architecture in one paragraph
 

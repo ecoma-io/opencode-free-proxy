@@ -2,7 +2,7 @@
 
 // Graceful-shutdown E2E: SIGTERM must stop new work — 503 drain gate or,
 // once Shutdown closed the listener, connection-refused — while in-flight
-// streams finish under OFP_SHUTDOWN_GRACE; past the grace the remaining
+// streams finish under OCFP_SHUTDOWN_GRACE; past the grace the remaining
 // connections are force-closed. The 503 gate branch itself is asserted
 // deterministically in internal/router (TestDrainGateRejectsNewRequests);
 // the subprocess polls here accept either rejection shape because the
@@ -63,7 +63,7 @@ func TestGracefulDrainFinishesInFlightStream(t *testing.T) {
 	dir := cfgDir(t)
 	writeCFG(t, dir, upstreamBase(up.URL)+"egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n")
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_SHUTDOWN_GRACE": "5000",
+		"OCFP_SHUTDOWN_GRACE": "5000",
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -160,7 +160,7 @@ func TestGracefulDrainFinishesInFlightStream(t *testing.T) {
 	waitExit(t, sp, 8*time.Second)
 }
 
-// TestGraceForcesCloseStalledStream: OFP_SHUTDOWN_GRACE is tiny; an upstream
+// TestGraceForcesCloseStalledStream: OCFP_SHUTDOWN_GRACE is tiny; an upstream
 // that stalls mid-stream means the connection never drains; after the grace
 // the server force-closes — the client sees the connection die (error or
 // truncated body with no [DONE]).
@@ -186,7 +186,7 @@ func TestGraceForcesCloseStalledStream(t *testing.T) {
 	dir := cfgDir(t)
 	writeCFG(t, dir, upstreamBase(up.URL)+"egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n")
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_SHUTDOWN_GRACE": "300",
+		"OCFP_SHUTDOWN_GRACE": "300",
 	})
 
 	client := &http.Client{Timeout: 10 * time.Second}

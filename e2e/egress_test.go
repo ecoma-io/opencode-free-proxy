@@ -171,8 +171,8 @@ routes:
 	// section must be present or the base reverts to the real opencode.ai.
 	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+"health:\n  enabled: false\n")
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_CONFIG":         "cfg.yaml",
-		"OFP_CONFIG_POLL_MS": "50",
+		"OCFP_CONFIG":         "cfg.yaml",
+		"OCFP_CONFIG_POLL_MS": "50",
 	})
 
 	done := make(chan *http.Response, 1)
@@ -283,9 +283,9 @@ routes:
   - {id: r, egress: [a, b]}
 `, tlsZen.URL, refusing.URL))
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_CONFIG":         "cfg.yaml",
-		"OFP_CONFIG_POLL_MS": "50",
-		"SSL_CERT_FILE":      certPath,
+		"OCFP_CONFIG":         "cfg.yaml",
+		"OCFP_CONFIG_POLL_MS": "50",
+		"SSL_CERT_FILE":       certPath,
 	})
 
 	if eg := drainChat(t, sp.post(t, streamBody, nil)); eg != "b" {
@@ -329,8 +329,8 @@ routes:
   - {id: r, egress: [a, b]}
 `+healthYAML, proxyA.URL, proxyB.URL))
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_CONFIG":         "cfg.yaml",
-		"OFP_CONFIG_POLL_MS": "50",
+		"OCFP_CONFIG":         "cfg.yaml",
+		"OCFP_CONFIG_POLL_MS": "50",
 	})
 
 	resp := sp.post(t, streamBody, nil)
@@ -397,8 +397,8 @@ routes:
 	}
 	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML("http://127.0.0.1:"+dead)+healthYAML)
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_CONFIG":         "cfg.yaml",
-		"OFP_CONFIG_POLL_MS": "50",
+		"OCFP_CONFIG":         "cfg.yaml",
+		"OCFP_CONFIG_POLL_MS": "50",
 	})
 	// req1: the dead port refuses; the dial failure rides the 502 retry
 	// matrix INSIDE the attempt (that is what a real dead proxy looks like),
@@ -456,8 +456,8 @@ routes:
 `, proxyA.URL, proxyB.URL)
 	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+healthYAML)
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_CONFIG":         "cfg.yaml",
-		"OFP_CONFIG_POLL_MS": "50",
+		"OCFP_CONFIG":         "cfg.yaml",
+		"OCFP_CONFIG_POLL_MS": "50",
 	})
 	if eg := drainChat(t, sp.post(t, streamBody, nil)); eg != "b" {
 		t.Fatalf("req1 X-OFP-Egress = %q, want b", eg)

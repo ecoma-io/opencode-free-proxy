@@ -8,7 +8,7 @@
 #   HOST_PORT=9090 docker compose up -d --build   # different host port
 #
 # The proxy's service settings (upstream base, inbound auth, UA sync cadence)
-# live in the OFP_CONFIG document mounted below — the removed OFP_API_KEY /
+# live in the OCFP_CONFIG document mounted below — the removed OFP_API_KEY /
 # OFP_UPSTREAM_BASE / OFP_UA_SYNC_INTERVAL env vars no longer exist. The
 # mounted ./config.yaml is operator-owned and gitignored; config.example.yaml
 # in the repo root shows how to enable auth or a non-default upstream.
@@ -28,7 +28,7 @@ services:
       # The config document is the single source of truth for upstream.base,
       # auth.keys, and user_agent.sync_interval. The file is re-read every
       # poll interval and hot-reloaded on change.
-      OFP_CONFIG: /etc/ofp/config.yaml
+      OCFP_CONFIG: /etc/ofp/config.yaml
     volumes:
       # Bind, don't copy: editing the file on the host (adding an auth
       # section, pointing upstream.base elsewhere) hot-reloads in place.

@@ -3,7 +3,7 @@ package config
 // Tests for the runtime's service fields — upstream.base, auth.keys and
 // user_agent.sync_interval — which replaced the removed OFP_API_KEY /
 // OFP_UPSTREAM_BASE / OFP_UA_SYNC_INTERVAL env vars: they live in the
-// OFP_CONFIG document and land in the immutable per-generation Runtime
+// OCFP_CONFIG document and land in the immutable per-generation Runtime
 // snapshot exactly like egresses and routes.
 
 import (

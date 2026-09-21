@@ -33,13 +33,13 @@ const (
 // the full set — exactly the contract an operator faces.
 func setExampleEnv(t *testing.T) {
 	t.Helper()
-	t.Setenv("OFP_EXAMPLE_HTTP_USER", exampleUser)
-	t.Setenv("OFP_EXAMPLE_HTTP_PASS", exampleHTTPPass)
-	t.Setenv("OFP_EXAMPLE_HTTPS_USER", exampleUser)
-	t.Setenv("OFP_EXAMPLE_HTTPS_PASS", exampleTLSPass)
-	t.Setenv("OFP_EXAMPLE_SOCKS_USER", exampleUser)
-	t.Setenv("OFP_EXAMPLE_SOCKS_PASS", exampleSocksPass)
-	t.Setenv("OFP_EXAMPLE_API_KEY", exampleAPIKey)
+	t.Setenv("OCFP_EXAMPLE_HTTP_USER", exampleUser)
+	t.Setenv("OCFP_EXAMPLE_HTTP_PASS", exampleHTTPPass)
+	t.Setenv("OCFP_EXAMPLE_HTTPS_USER", exampleUser)
+	t.Setenv("OCFP_EXAMPLE_HTTPS_PASS", exampleTLSPass)
+	t.Setenv("OCFP_EXAMPLE_SOCKS_USER", exampleUser)
+	t.Setenv("OCFP_EXAMPLE_SOCKS_PASS", exampleSocksPass)
+	t.Setenv("OCFP_EXAMPLE_API_KEY", exampleAPIKey)
 }
 
 func loadExample(t *testing.T) *Runtime {
@@ -169,7 +169,7 @@ func TestExampleConfigLoads(t *testing.T) {
 		t.Fatalf("health cooldown = %v, want 45s", rt.HealthCooldown())
 	}
 
-	// Service settings: the three new OFP_CONFIG sections resolved into the
+	// Service settings: the three new OCFP_CONFIG sections resolved into the
 	// snapshot (upstream base, named inbound keys, UA sync cadence).
 	if rt.UpstreamBase() != UpstreamBase {
 		t.Fatalf("upstream base = %q, want the default %q", rt.UpstreamBase(), UpstreamBase)
@@ -234,10 +234,10 @@ func TestExampleConfigCarriesNoLiteralCredentials(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"OFP_EXAMPLE_HTTP_USER", "OFP_EXAMPLE_HTTP_PASS",
-		"OFP_EXAMPLE_HTTPS_USER", "OFP_EXAMPLE_HTTPS_PASS",
-		"OFP_EXAMPLE_SOCKS_USER", "OFP_EXAMPLE_SOCKS_PASS",
-		"OFP_EXAMPLE_API_KEY",
+		"OCFP_EXAMPLE_HTTP_USER", "OCFP_EXAMPLE_HTTP_PASS",
+		"OCFP_EXAMPLE_HTTPS_USER", "OCFP_EXAMPLE_HTTPS_PASS",
+		"OCFP_EXAMPLE_SOCKS_USER", "OCFP_EXAMPLE_SOCKS_PASS",
+		"OCFP_EXAMPLE_API_KEY",
 	} {
 		if !strings.Contains(doc, name) {
 			t.Fatalf("example file no longer references %s", name)

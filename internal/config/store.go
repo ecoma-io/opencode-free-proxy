@@ -85,7 +85,7 @@ func NewStore(path string, interval time.Duration, logf func(string, ...any)) (*
 }
 
 // NewDefault returns a store holding the synthetic direct-egress runtime and
-// no poller (used when OFP_CONFIG is unset).
+// no poller (used when OCFP_CONFIG is unset).
 func NewDefault() *Store {
 	s := &Store{done: make(chan struct{})}
 	s.cur.Store(DefaultRuntime())

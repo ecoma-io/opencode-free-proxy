@@ -56,7 +56,7 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 	if err != nil {
 		// Same redaction rule as config.Validate: *url.Error's text embeds the
 		// raw url with credentials; only the reason may surface. (Unreachable
-		// via OFP_CONFIG — Validate parses the identical string first — but
+		// via OCFP_CONFIG — Validate parses the identical string first — but
 		// this constructor must not become a leak for future callers.)
 		reason := err
 		if inner := errors.Unwrap(err); inner != nil {

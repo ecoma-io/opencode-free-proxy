@@ -1,7 +1,7 @@
 //go:build e2e
 
 // Snapshot/fallback E2E: a real server subprocess driven through real HTTP
-// forward proxies, its service settings pinned by the OFP_CONFIG document
+// forward proxies, its service settings pinned by the OCFP_CONFIG document
 // already written into the spawn dir (upstream.base, auth.keys) — so
 // per-egress behavior is observable on the wire through the egress proxies.
 // Facts asserted come off the wire: X-OFP-Egress headers,
@@ -31,7 +31,7 @@ type proxySpawn struct {
 }
 
 // spawnProxy builds and runs the server binary with the given extra env
-// (PORT/OFP_CONFIG appended over a filtered environment) and waits until
+// (PORT/OCFP_CONFIG appended over a filtered environment) and waits until
 // /healthz answers. t.Cleanup terminates it with SIGTERM then SIGKILL.
 func spawnProxy(t *testing.T, cfgDir string, extra map[string]string) *proxySpawn {
 	t.Helper()
@@ -44,16 +44,16 @@ func spawnProxy(t *testing.T, cfgDir string, extra map[string]string) *proxySpaw
 	// SSL_CERT_FILE is dropped too: tests speaking TLS to a fixture https
 	// upstream pass their own root file via extra, and it must be the only
 	// source of the subprocess root pool.
-	cmd.Env = filteredEnv("PORT", "OFP_CONFIG", "OFP_CONFIG_POLL_MS", "OFP_SHUTDOWN_GRACE", "SSL_CERT_FILE")
-	cmd.Env = append(cmd.Env, "PORT="+port)
-	// The service settings (upstream.base, auth.keys) live in the OFP_CONFIG
+	cmd.Env = filteredEnv("OCFP_PORT", "OCFP_CONFIG", "OCFP_CONFIG_POLL_MS", "OCFP_SHUTDOWN_GRACE", "SSL_CERT_FILE")
+	cmd.Env = append(cmd.Env, "OCFP_PORT="+port)
+	// The service settings (upstream.base, auth.keys) live in the OCFP_CONFIG
 	// document already written into the spawn dir; the poll interval keeps
 	// hot-reload tests snappy.
-	if _, ok := extra["OFP_CONFIG"]; !ok {
-		cmd.Env = append(cmd.Env, "OFP_CONFIG=cfg.yaml")
+	if _, ok := extra["OCFP_CONFIG"]; !ok {
+		cmd.Env = append(cmd.Env, "OCFP_CONFIG=cfg.yaml")
 	}
-	if _, ok := extra["OFP_CONFIG_POLL_MS"]; !ok {
-		cmd.Env = append(cmd.Env, "OFP_CONFIG_POLL_MS=200")
+	if _, ok := extra["OCFP_CONFIG_POLL_MS"]; !ok {
+		cmd.Env = append(cmd.Env, "OCFP_CONFIG_POLL_MS=200")
 	}
 	for k, v := range extra {
 		cmd.Env = append(cmd.Env, k+"="+v)
@@ -87,7 +87,7 @@ func spawnProxy(t *testing.T, cfgDir string, extra map[string]string) *proxySpaw
 	return sp
 }
 
-// writeCFG writes the OFP_CONFIG document into the spawn dir (returned by
+// writeCFG writes the OCFP_CONFIG document into the spawn dir (returned by
 // cfgDir for the caller, kept inside the spawn for atomic rewrite by tests).
 func writeCFG(t *testing.T, dir, doc string) {
 	t.Helper()
@@ -209,9 +209,9 @@ routes:
 `, proxyA.URL, proxyB.URL)
 	writeCFG(t, dir, cfg)
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_CONFIG":         "cfg.yaml",
-		"OFP_CONFIG_POLL_MS": "50",
-		"OFP_SHUTDOWN_GRACE": "2000",
+		"OCFP_CONFIG":         "cfg.yaml",
+		"OCFP_CONFIG_POLL_MS": "50",
+		"OCFP_SHUTDOWN_GRACE": "2000",
 	})
 
 	done := make(chan *http.Response, 1)
@@ -324,8 +324,8 @@ health:
 `, proxyA.URL, proxyB.URL)
 	writeCFG(t, dir, cfg)
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_CONFIG":         "cfg.yaml",
-		"OFP_CONFIG_POLL_MS": "50",
+		"OCFP_CONFIG":         "cfg.yaml",
+		"OCFP_CONFIG_POLL_MS": "50",
 	})
 
 	consume := func(want string) {
@@ -410,8 +410,8 @@ routes:
   - {id: r, egress: [a, b]}
 `, proxyA.URL, proxyB.URL))
 	sp := spawnProxy(t, dir, map[string]string{
-		"OFP_CONFIG":         "cfg.yaml",
-		"OFP_CONFIG_POLL_MS": "50",
+		"OCFP_CONFIG":         "cfg.yaml",
+		"OCFP_CONFIG_POLL_MS": "50",
 	})
 
 	resp := sp.post(t, streamBody, nil)

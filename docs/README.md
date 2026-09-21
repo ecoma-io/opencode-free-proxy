@@ -5,12 +5,12 @@ source citations.
 
 ## Guides
 
-| Doc                                    | What it covers                                                                                                           |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| [configuration.md](configuration.md)   | The full `OFP_CONFIG` document: schema tables, defaults, `${VAR}` interpolation, hot-reload semantics, validation errors |
-| [authentication.md](authentication.md) | Named inbound bearer keys: multiple keys, `api_key_name` logging, reload semantics, secret hygiene                       |
-| [deployment.md](deployment.md)         | Docker / Compose, config mounts, bootstrap env, healthz, graceful shutdown, production considerations                    |
-| [architecture.md](architecture.md)     | Request pipeline, immutable runtime generations, process-wide state lifecycles, package layout                           |
+| Doc                                    | What it covers                                                                                                            |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| [configuration.md](configuration.md)   | The full `OCFP_CONFIG` document: schema tables, defaults, `${VAR}` interpolation, hot-reload semantics, validation errors |
+| [authentication.md](authentication.md) | Named inbound bearer keys: multiple keys, `api_key_name` logging, reload semantics, secret hygiene                        |
+| [deployment.md](deployment.md)         | Docker / Compose, config mounts, bootstrap env, healthz, graceful shutdown, production considerations                     |
+| [architecture.md](architecture.md)     | Request pipeline, immutable runtime generations, process-wide state lifecycles, package layout                            |
 
 ## Investigation records
 

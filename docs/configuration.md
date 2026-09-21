@@ -1,7 +1,7 @@
 # Configuration
 
 Everything the proxy does at runtime is configured through **one YAML
-document** (`OFP_CONFIG`) plus a handful of **bootstrap environment
+document** (`OCFP_CONFIG`) plus a handful of **bootstrap environment
 variables** that shape the process itself. Service settings — the upstream
 base, inbound auth keys, the UA-sync cadence, egresses, routes, fallback and
 health — all live in the config document, not in env vars. (The pre-0.4
@@ -14,12 +14,12 @@ example and the parser cannot drift.
 
 ## Bootstrap (process) environment
 
-| Var                  | Default              | Meaning                                                                             |
-| -------------------- | -------------------- | ----------------------------------------------------------------------------------- |
-| `PORT`               | `8090`               | Listen port (`0` valid in tests)                                                    |
-| `OFP_CONFIG`         | _(empty = built-in)_ | Path to the config document; hot-reloaded. Empty = the built-in direct runtime.     |
-| `OFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                                       |
-| `OFP_SHUTDOWN_GRACE` | `30000`              | Drain window: in-flight streams finish before forced close (ms) — see deployment.md |
+| Var                   | Default              | Meaning                                                                             |
+| --------------------- | -------------------- | ----------------------------------------------------------------------------------- |
+| `OCFP_PORT`           | `8090`               | Listen port (`0` valid in tests)                                                    |
+| `OCFP_CONFIG`         | _(empty = built-in)_ | Path to the config document; hot-reloaded. Empty = the built-in direct runtime.     |
+| `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                                       |
+| `OCFP_SHUTDOWN_GRACE` | `30000`              | Drain window: in-flight streams finish before forced close (ms) — see deployment.md |
 
 These are read once at startup and are **not** hot-reloaded. Everything below
 is.
@@ -164,7 +164,7 @@ a log or an error.
 
 ## Hot reload semantics
 
-With `OFP_CONFIG` set, the file is re-read every `OFP_CONFIG_POLL_MS`. Each
+With `OCFP_CONFIG` set, the file is re-read every `OCFP_CONFIG_POLL_MS`. Each
 poll reads the file **once**, hashes those bytes (SHA-256), and re-parses
 only on change; repeated writes between ticks coalesce into one parse of the
 final content.

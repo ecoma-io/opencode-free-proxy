@@ -18,7 +18,7 @@ const (
 	// agentic client. stream must be true; tools must include the fingerprint
 	// quartet; User-Agent must look like opencode >= 1.17.
 	// Zen* paths are the request suffixes on the CONFIGURED upstream base
-	// (the OFP_CONFIG upstream.base, default https://opencode.ai); request
+	// (the OCFP_CONFIG upstream.base, default https://opencode.ai); request
 	// URLs are never absolute outside this const set (upstream.BuildURL,
 	// models.go, cloak).
 	ZenChatPath      = "/zen/v1/chat/completions"
@@ -73,7 +73,7 @@ const (
 	// UASyncInterval is the default background sync cadence for the UA
 	// triple. The request hot path NEVER triggers a fetch (documented
 	// divergence from opencodeClientVersion.js lazy warm — the ticker keeps
-	// the cache at most one interval stale instead). OFP_CONFIG section
+	// the cache at most one interval stale instead). OCFP_CONFIG section
 	// user_agent.sync_interval (integer seconds, 0 = disabled) overrides it
 	// per generation.
 	UASyncInterval = time.Hour
@@ -164,21 +164,23 @@ var DefaultErrorMessages = map[int]string{
 
 // FromEnv builds the process-bootstrap config from environment variables.
 // Every SERVICE setting (upstream base, inbound auth keys, UA sync cadence)
-// lives in the OFP_CONFIG YAML document instead — see file.go; these four
-// variables are deliberately not part of it.
+// lives in the OCFP_CONFIG YAML document instead — see file.go; these four
+// variables are deliberately not part of it. Every env var the process reads
+// carries the OCFP_ prefix (OCFP_PORT included — never a bare PORT), so a
+// deployment can identify the service's whole environment by one prefix.
 type Config struct {
 	Port string
-	// ConfigPath is OFP_CONFIG: the routing + service config file. Empty =
+	// ConfigPath is OCFP_CONFIG: the routing + service config file. Empty =
 	// the built-in default runtime.
 	ConfigPath string
-	// ShutdownGrace is OFP_SHUTDOWN_GRACE: how long draining waits for
+	// ShutdownGrace is OCFP_SHUTDOWN_GRACE: how long draining waits for
 	// active requests/streams before forced close.
 	ShutdownGrace time.Duration
-	// ConfigPoll is OFP_CONFIG_POLL_MS: the hot-reload poll interval.
+	// ConfigPoll is OCFP_CONFIG_POLL_MS: the hot-reload poll interval.
 	ConfigPoll time.Duration
 }
 
-// DefaultShutdownGrace is used when OFP_SHUTDOWN_GRACE is unset (ms).
+// DefaultShutdownGrace is used when OCFP_SHUTDOWN_GRACE is unset (ms).
 const DefaultShutdownGrace = 30 * time.Second
 
 // DefaultConfigPoll is the hot-reload poll interval (the rotation-proxy
@@ -187,14 +189,14 @@ const DefaultConfigPoll = time.Second
 
 func FromEnv() *Config {
 	return &Config{
-		Port:       envOr("PORT", DefaultPort),
-		ConfigPath: os.Getenv("OFP_CONFIG"),
-		// OFP_SHUTDOWN_GRACE is milliseconds like every other ms sibling
-		// (OFP_CONFIG_POLL_MS). A "30s" duration string would be silently
+		Port:       envOr("OCFP_PORT", DefaultPort),
+		ConfigPath: os.Getenv("OCFP_CONFIG"),
+		// OCFP_SHUTDOWN_GRACE is milliseconds like every other ms sibling
+		// (OCFP_CONFIG_POLL_MS). A "30s" duration string would be silently
 		// dropped by envMs' ParseDuration; envMs matches the documented
 		// contract.
-		ShutdownGrace: envMs("OFP_SHUTDOWN_GRACE", DefaultShutdownGrace),
-		ConfigPoll:    envMs("OFP_CONFIG_POLL_MS", DefaultConfigPoll),
+		ShutdownGrace: envMs("OCFP_SHUTDOWN_GRACE", DefaultShutdownGrace),
+		ConfigPoll:    envMs("OCFP_CONFIG_POLL_MS", DefaultConfigPoll),
 	}
 }
 

@@ -22,7 +22,7 @@ type modelsEntry struct {
 // filters.js "opencode-free"): ids ending in "-free" (plus big-pickle),
 // minus known-dead ids. The JS route fetches a caller-supplied `url`; this
 // proxy's equivalent is the configured upstream base (upstream.base in
-// OFP_CONFIG, default https://opencode.ai), so the whole list endpoint is
+// OCFP_CONFIG, default https://opencode.ai), so the whole list endpoint is
 // redirectable for tests/self-hosting. Falls back to the static registry
 // models when the upstream list is unreachable (fail-open, unchanged).
 // The endpoint is intentionally NOT auth-gated — same as the removed env

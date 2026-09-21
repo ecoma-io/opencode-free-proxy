@@ -132,7 +132,7 @@ func (c *UserAgentCache) Get() string {
 // cache that is never started (tests, the healthcheck subcommand) has zero
 // sync goroutines. interval <= 0 starts nothing and returns a no-op stop
 // (time.NewTicker would panic). The interval is re-read on EVERY cycle — a
-// reload may have changed the configured OFP_CONFIG user_agent.sync_interval
+// reload may have changed the configured OCFP_CONFIG user_agent.sync_interval
 // — so the loop follows the live store snapshot instead of a captured
 // cadence. Re-arm is a read, never
 // a second goroutine: a second StartSync would still run a second loop, which

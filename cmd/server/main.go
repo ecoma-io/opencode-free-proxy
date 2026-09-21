@@ -1,6 +1,6 @@
 // Command server runs the OpenCode free-tier proxy: an OpenAI-compatible
 // router (chat completions + responses + models) backed solely by the
-// opencode free provider. With OFP_CONFIG set it becomes a config-driven,
+// opencode free provider. With OCFP_CONFIG set it becomes a config-driven,
 // stateless multi-egress proxy: typed YAML routing with hot reload, egress
 // fallback + health, per-egress concurrency limits and graceful shutdown.
 package main
@@ -46,7 +46,7 @@ func main() {
 	// built lazily by the router.
 	direct := upstream.NewClient()
 
-	// Routing config: OFP_CONFIG set → typed file with a hot-reload poller
+	// Routing config: OCFP_CONFIG set → typed file with a hot-reload poller
 	// (a startup load failure is fatal — there is no prior snapshot to fall
 	// back on); unset → the default single-egress runtime, byte-identical to
 	// the pre-routing proxy.
@@ -110,7 +110,7 @@ func main() {
 	//   the HTTP server finish in-flight requests/streams. Shutdown closes
 	//   the listener and the idle connections and waits for the ACTIVE ones.
 	//
-	//   Phase 2 (force): OFP_SHUTDOWN_GRACE bounds phase 1. Shutdown itself
+	//   Phase 2 (force): OCFP_SHUTDOWN_GRACE bounds phase 1. Shutdown itself
 	//   never closes an active connection — a stuck stream (upstream that
 	//   trickles below the stall deadline) would outlive the grace — so when
 	//   the grace lapses, every still-tracked connection is force-closed
@@ -176,10 +176,10 @@ func (t *connTracker) forceCloseAll() int {
 }
 
 // runHealthcheck backs the Docker HEALTHCHECK: GET the server's own /healthz
-// on the configured port and report success. The 5 s client timeout matches
-// HEALTHCHECK --timeout=5s.
+// on the configured port (OCFP_PORT) and report success. The 5 s client
+// timeout matches HEALTHCHECK --timeout=5s.
 func runHealthcheck() error {
-	port := os.Getenv("PORT")
+	port := os.Getenv("OCFP_PORT")
 	if port == "" {
 		port = config.DefaultPort
 	}

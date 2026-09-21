@@ -7,7 +7,7 @@ import (
 )
 
 // TestRunHealthcheck drives the Docker HEALTHCHECK subcommand against a real
-// listener via the PORT env var (the subcommand's only configuration input).
+// listener via the OCFP_PORT env var (the subcommand's only configuration input).
 func TestRunHealthcheck(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -15,7 +15,7 @@ func TestRunHealthcheck(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
-	t.Setenv("PORT", srvPort(t, srv))
+	t.Setenv("OCFP_PORT", srvPort(t, srv))
 
 	if err := runHealthcheck(); err != nil {
 		t.Fatalf("healthy server: %v", err)

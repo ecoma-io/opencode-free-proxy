@@ -42,7 +42,7 @@ func TestUserAgentCacheConstructSpawnsNothing(t *testing.T) {
 }
 
 // TestStartSyncDisabledIntervalIdlesWithoutFetching: a disabled cadence (the
-// OFP_CONFIG user_agent.sync_interval is <= 0 at read time) must NOT fetch —
+// OCFP_CONFIG user_agent.sync_interval is <= 0 at read time) must NOT fetch —
 // the loop idles on a 1 s re-check that never touches the network, so a
 // reload that re-enables sync resumes in place. The stop stays idempotent.
 func TestStartSyncDisabledIntervalIdlesWithoutFetching(t *testing.T) {

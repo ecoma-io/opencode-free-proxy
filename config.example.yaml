@@ -1,9 +1,9 @@
 # ---------------------------------------------------------------------------
-# opencode-free-proxy — annotated multi-egress routing config (OFP_CONFIG)
+# opencode-free-proxy — annotated multi-egress routing config (OCFP_CONFIG)
 # ---------------------------------------------------------------------------
 #
-# Start the server with OFP_CONFIG pointed at a file shaped like this one.
-# The file is re-read every OFP_CONFIG_POLL_MS (default 1000 ms); a poll
+# Start the server with OCFP_CONFIG pointed at a file shaped like this one.
+# The file is re-read every OCFP_CONFIG_POLL_MS (default 1000 ms); a poll
 # cycle hashes the bytes (SHA-256) and re-parses only on change. A file that
 # fails parse or validation keeps the LAST GOOD runtime, and an in-flight
 # request keeps the immutable snapshot it started on — a reload never touches
@@ -19,10 +19,10 @@
 # Therefore:
 #
 #   1. export all seven before loading this file:
-#        OFP_EXAMPLE_HTTP_USER   OFP_EXAMPLE_HTTP_PASS    egress http-proxy
-#        OFP_EXAMPLE_HTTPS_USER  OFP_EXAMPLE_HTTPS_PASS   egress https-proxy
-#        OFP_EXAMPLE_SOCKS_USER  OFP_EXAMPLE_SOCKS_PASS  egress socks5-proxy
-#        OFP_EXAMPLE_API_KEY                             inbound auth primary
+#        OCFP_EXAMPLE_HTTP_USER   OCFP_EXAMPLE_HTTP_PASS    egress http-proxy
+#        OCFP_EXAMPLE_HTTPS_USER  OCFP_EXAMPLE_HTTPS_PASS   egress https-proxy
+#        OCFP_EXAMPLE_SOCKS_USER  OCFP_EXAMPLE_SOCKS_PASS  egress socks5-proxy
+#        OCFP_EXAMPLE_API_KEY                             inbound auth primary
 #
 #
 #   2. never write the placeholder syntax inside a comment (this file does
@@ -131,7 +131,7 @@ egress:
   - id: http-proxy
     proxy:
       type: http
-      url: "http://${OFP_EXAMPLE_HTTP_USER}:${OFP_EXAMPLE_HTTP_PASS}@http-proxy.example.net:8080"
+      url: "http://${OCFP_EXAMPLE_HTTP_USER}:${OCFP_EXAMPLE_HTTP_PASS}@http-proxy.example.net:8080"
     enabled: true # default; spelled out for completeness
     weight: 5 # used by weighted_round_robin routes only
     max_concurrency: 8 # 8 in-flight requests/streams, then skips
@@ -139,7 +139,7 @@ egress:
   - id: https-proxy
     proxy:
       type: https
-      url: "https://${OFP_EXAMPLE_HTTPS_USER}:${OFP_EXAMPLE_HTTPS_PASS}@https-proxy.example.net:8443"
+      url: "https://${OCFP_EXAMPLE_HTTPS_USER}:${OCFP_EXAMPLE_HTTPS_PASS}@https-proxy.example.net:8443"
     weight: 3
     max_body_bytes: 4194304 # eligibility gate: bodies over 4 MiB never pick it
   # SOCKS5 with RFC 1929 username/password auth. socks5:// resolves target
@@ -149,7 +149,7 @@ egress:
   - id: socks5-proxy
     proxy:
       type: socks5
-      url: "socks5://${OFP_EXAMPLE_SOCKS_USER}:${OFP_EXAMPLE_SOCKS_PASS}@socks-proxy.example.net:1080"
+      url: "socks5://${OCFP_EXAMPLE_SOCKS_USER}:${OCFP_EXAMPLE_SOCKS_PASS}@socks-proxy.example.net:1080"
     weight: 1
     max_concurrency: 4
     # Allow-list: ANY pattern matching admits the model (OR — route
@@ -241,7 +241,7 @@ auth:
   # matching requests log the NAME (api_key_name) and nothing else.
   keys:
     - name: primary
-      key: "${OFP_EXAMPLE_API_KEY}"
+      key: "${OCFP_EXAMPLE_API_KEY}"
   # Add a second key by appending another entry. Empty keys[] (or an omitted
   # auth section) means authentication is off.
 

@@ -325,7 +325,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 
 	// One snapshot read for the base — never two reads that could straddle a
 	// reload swap. (s.Cfg.UpstreamBase was the OFP_UPSTREAM_BASE env; the
-	// base now lives in the OFP_CONFIG upstream.base of the SAME generation
+	// base now lives in the OCFP_CONFIG upstream.base of the SAME generation
 	// that pinned routing above.)
 	url := upstream.BuildURL(rt.UpstreamBase(), upstreamModel)
 	reqCtx, cancelUpstream := context.WithCancel(r.Context())

@@ -6,7 +6,7 @@ package router
 //
 // NOTE on wiring: the JS route fetches a caller-supplied `url` and returns
 // {data: []} when the fetch fails; the Go proxy serves /v1/models directly and
-// derives the URL from the pinned runtime's upstream.base (OFP_CONFIG
+// derives the URL from the pinned runtime's upstream.base (OCFP_CONFIG
 // upstream.base + "/zen/v1/models"), so the happy path is redirectable like
 // the JS route. The FILTER logic is unit-tested through parseUpstreamModels;
 // the handler test below exercises the fallback (unreachable base), and
