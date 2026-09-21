@@ -473,4 +473,15 @@ func TestResolveSession(t *testing.T) {
 			t.Fatalf("generated id %q is not canonical (translate fixed point gave %q)", got, again)
 		}
 	})
+
+	t.Run("detected client tool feeds the translation sha", func(t *testing.T) {
+		// chatCore.js:163 detectClientTool → executors/opencode.js:153
+		// translateSessionId(resolved, clientTool): a claude UA derives the
+		// claude-keyed id, not the generic one.
+		body := map[string]any{"prompt_cache_key": "conv-42"}
+		d := Downstream{Headers: map[string]string{"user-agent": "claude-cli/2.0.14 (external, cli)"}}
+		if got := ResolveSession(body, d); got != identity.TranslateSessionID("conv-42", "claude") {
+			t.Fatalf("session = %q, want the claude-keyed translation %q", got, identity.TranslateSessionID("conv-42", "claude"))
+		}
+	})
 }

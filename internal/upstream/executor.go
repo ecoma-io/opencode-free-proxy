@@ -66,7 +66,13 @@ func ResolveSession(body map[string]any, d Downstream) string {
 	if resolved == "" {
 		return identity.GenerateSessionID(time.Now())
 	}
-	return identity.TranslateSessionID(resolved, "generic")
+	// JS feeds the DETECTED client tool into the sha — chatCore.js:163
+	// detectClientTool threads through executor.execute (chatCore.js:345) into
+	// translateSessionId(resolved, clientTool) (executors/opencode.js:153,
+	// sha at :89-103); falsy maps to "generic" (opencode.js:95). Detected
+	// clients therefore derive different — still deterministic — session ids
+	// than the generic fallback.
+	return identity.TranslateSessionID(resolved, identity.DetectClientTool(d.Headers, body))
 }
 
 // TransformRequest ports OpenCodeExecutor.transformRequest. model is the
