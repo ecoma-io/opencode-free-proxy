@@ -181,7 +181,7 @@ type Config struct {
 }
 
 // DefaultShutdownGrace is used when OCFP_SHUTDOWN_GRACE is unset (ms).
-const DefaultShutdownGrace = 30 * time.Second
+const DefaultShutdownGrace = 55 * time.Second
 
 // DefaultConfigPoll is the hot-reload poll interval (the rotation-proxy
 // gateway design polled at 1 s; repeated writes coalesce).

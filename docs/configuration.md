@@ -19,7 +19,7 @@ example and the parser cannot drift.
 | `OCFP_PORT`           | `8090`               | Listen port (`0` valid in tests)                                                    |
 | `OCFP_CONFIG`         | _(empty = built-in)_ | Path to the config document; hot-reloaded. Empty = the built-in direct runtime.     |
 | `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                                       |
-| `OCFP_SHUTDOWN_GRACE` | `30000`              | Drain window: in-flight streams finish before forced close (ms) — see deployment.md |
+| `OCFP_SHUTDOWN_GRACE` | `55000`              | Drain window: in-flight streams finish before forced close (ms) — see deployment.md |
 
 These are read once at startup and are **not** hot-reloaded. Everything below
 is.

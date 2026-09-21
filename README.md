@@ -60,7 +60,7 @@ Bootstrap env (the process itself — everything else lives in the file):
 | `OCFP_PORT`           | `8090`               | Listen port                                                  |
 | `OCFP_CONFIG`         | _(empty = built-in)_ | Config document (YAML); hot-reloaded                         |
 | `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                |
-| `OCFP_SHUTDOWN_GRACE` | `30000` (30s)        | Drain window: active streams finish before forced close (ms) |
+| `OCFP_SHUTDOWN_GRACE` | `55000` (55s)        | Drain window: active streams finish before forced close (ms) |
 
 ## Architecture in one paragraph
 

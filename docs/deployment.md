@@ -73,7 +73,7 @@ keeps the last good runtime — see
 | `OCFP_PORT`           | `8090`               | Listen port (container listens on all interfaces)                   |
 | `OCFP_CONFIG`         | _(empty = built-in)_ | Config document path; hot-reloaded. Empty = built-in direct runtime |
 | `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                       |
-| `OCFP_SHUTDOWN_GRACE` | `30000`              | Drain window before force-close (ms)                                |
+| `OCFP_SHUTDOWN_GRACE` | `55000`              | Drain window before force-close (ms)                                |
 
 No other process env vars exist; every service setting (upstream base, UA
 sync cadence, routing) lives in the config document.
@@ -97,10 +97,10 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
 1. **Drain** — new requests get `503 Server is shutting down`; the config
    poller and UA sync stop; in-flight requests and streams run to completion
    (or to the upstream's own stall deadline) under `srv.Shutdown`.
-2. **Force** — after `OCFP_SHUTDOWN_GRACE` (default 30 s) every still-tracked
+2. **Force** — after `OCFP_SHUTDOWN_GRACE` (default 55 s) every still-tracked
    connection is force-closed, so a stuck stream cannot pin the process
    forever. Container stop commands should budget for the grace
-   (`docker stop -t 35 …` to outlive the default 30 s).
+   (`docker stop -t 60 …` to outlive the default 55 s).
 
 ## Production considerations
 
