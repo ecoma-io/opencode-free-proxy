@@ -23,7 +23,7 @@ type ChatToRespState struct {
 	InThinking bool
 
 	ReasoningID        string
-	ReasoningIndex     int
+	ReasoningIndex     any // raw chunk index (openai-responses.js:125 stores it uncoerced)
 	ReasoningDone      bool
 	ReasoningPartAdded bool
 	ReasoningBuf       string
@@ -77,22 +77,24 @@ func (s *ChatToRespState) emit(events *[]Event, eventType string, data map[strin
 	*events = append(*events, Event{Event: eventType, Data: data})
 }
 
-func (s *ChatToRespState) startReasoning(events *[]Event, idx int) {
+func (s *ChatToRespState) startReasoning(events *[]Event, rawIdx any) {
 	if s.ReasoningID != "" {
 		return
 	}
-	s.ReasoningID = "rs_" + s.ResponseID + "_" + itoa(idx)
-	s.ReasoningIndex = idx
+	// JS template literal `rs_${id}_${idx}` stringifies the raw index
+	// (openai-responses.js:124); output_index keeps the raw value (:128).
+	s.ReasoningID = "rs_" + s.ResponseID + "_" + jsStringOf(rawIdx)
+	s.ReasoningIndex = rawIdx
 
 	s.emit(events, "response.output_item.added", jsonx.ObjOf(
 		"type", "response.output_item.added",
-		"output_index", idx,
+		"output_index", rawIdx,
 		"item", jsonx.ObjOf("id", s.ReasoningID, "type", ItemReasoning, "summary", jsonx.ArrOf()),
 	))
 	s.emit(events, "response.reasoning_summary_part.added", jsonx.ObjOf(
 		"type", "response.reasoning_summary_part.added",
 		"item_id", s.ReasoningID,
-		"output_index", idx,
+		"output_index", rawIdx,
 		"summary_index", 0,
 		"part", jsonx.ObjOf("type", ItemSummaryText, "text", ""),
 	))
@@ -146,12 +148,17 @@ func (s *ChatToRespState) msgID(idx int) string {
 	return "msg_" + s.ResponseID + "_" + itoa(idx)
 }
 
-func (s *ChatToRespState) emitTextContent(events *[]Event, idx int, content string) {
+// emitTextContent takes the RAW chunk index: JS keys the msg* maps on the
+// property-key coercion of it (jsIndex) but emits `output_index: idx` raw
+// (openai-responses.js:197-219) — a numeric-string index "5" announces with
+// output_index "5" and closes with parseInt("5") = 5.
+func (s *ChatToRespState) emitTextContent(events *[]Event, rawIdx any, content string) {
+	idx := jsIndex(rawIdx)
 	if !s.MsgItemAdded[idx] {
 		s.MsgItemAdded[idx] = true
 		s.emit(events, "response.output_item.added", jsonx.ObjOf(
 			"type", "response.output_item.added",
-			"output_index", idx,
+			"output_index", rawIdx,
 			"item", jsonx.ObjOf(
 				"id", s.msgID(idx),
 				"type", ItemMessage,
@@ -164,7 +171,7 @@ func (s *ChatToRespState) emitTextContent(events *[]Event, idx int, content stri
 		s.emit(events, "response.content_part.added", jsonx.ObjOf(
 			"type", "response.content_part.added",
 			"item_id", s.msgID(idx),
-			"output_index", idx,
+			"output_index", rawIdx,
 			"content_index", 0,
 			"part", jsonx.ObjOf("type", ItemOutputText, "annotations", jsonx.ArrOf(), "logprobs", jsonx.ArrOf(), "text", ""),
 		))
@@ -172,7 +179,7 @@ func (s *ChatToRespState) emitTextContent(events *[]Event, idx int, content stri
 	s.emit(events, "response.output_text.delta", jsonx.ObjOf(
 		"type", "response.output_text.delta",
 		"item_id", s.msgID(idx),
-		"output_index", idx,
+		"output_index", rawIdx,
 		"content_index", 0,
 		"delta", content,
 		"logprobs", jsonx.ArrOf(),
@@ -234,10 +241,14 @@ func extractCustomToolInput(argumentsText string) string {
 }
 
 func (s *ChatToRespState) emitToolCall(events *[]Event, tc map[string]any) {
-	tcIdx := 0
-	if v, is := tc["index"].(float64); is {
-		tcIdx = int(v)
+	// JS `const tcIdx = tc.index ?? 0` (openai-responses.js:275) — nullish,
+	// not truthy: 0 stays 0, and the raw value is emitted as output_index.
+	// The state maps key on its property-key coercion (jsIndex).
+	tcIdxRaw := tc["index"]
+	if tcIdxRaw == nil {
+		tcIdxRaw = float64(0)
 	}
+	tcIdx := jsIndex(tcIdxRaw)
 	newCallID := jsonx.AsStr(tc["id"])
 	fn := jsonx.AsObj(tc["function"])
 	funcName := jsonx.AsStr(jsonx.Get(fn, "name"))
@@ -271,12 +282,15 @@ func (s *ChatToRespState) emitToolCall(events *[]Event, tc map[string]any) {
 		}
 		s.emit(events, "response.output_item.added", jsonx.ObjOf(
 			"type", "response.output_item.added",
-			"output_index", tcIdx,
+			"output_index", tcIdxRaw,
 			"item", item,
 		))
 	}
 
-	if args := jsonx.AsStr(jsonx.Get(fn, "arguments")); args != "" {
+	// JS `if (tc.function?.arguments)` (:305) — truthiness, not stringiness:
+	// the raw value rides the delta and the buffer accumulates its String()
+	// coercion (`buf += arguments`, :318).
+	if args := jsonx.Get(fn, "arguments"); jsonx.Truthy(args) {
 		refCallID := s.FuncCallIds[tcIdx]
 		if refCallID == "" {
 			refCallID = newCallID
@@ -285,13 +299,13 @@ func (s *ChatToRespState) emitToolCall(events *[]Event, tc map[string]any) {
 			s.emit(events, "response.function_call_arguments.delta", jsonx.ObjOf(
 				"type", "response.function_call_arguments.delta",
 				"item_id", "fc_"+refCallID,
-				"output_index", tcIdx,
+				"output_index", tcIdxRaw,
 				"delta", args,
 			))
 		}
 		// Custom input is emitted once at close (raw fragments would leak the
 		// {"input":"..."} wrapper Codex must not see).
-		s.FuncArgsBuf[tcIdx] += args
+		s.FuncArgsBuf[tcIdx] += jsStringOf(args)
 	}
 }
 
@@ -413,10 +427,15 @@ func (s *ChatToRespState) Convert(chunk map[string]any) []Event {
 	if choice == nil {
 		return nil
 	}
-	idx := 0
-	if v, is := choice["index"].(float64); is {
-		idx = int(v)
+	// JS `const idx = choice.index || 0` (openai-responses.js:33) —
+	// truthiness: falsy indices (0, "", null, absent) become 0; a truthy
+	// raw value (numeric string) is emitted as-is and keys the maps through
+	// its property-key coercion (jsIndex).
+	idxRaw := choice["index"]
+	if !jsonx.Truthy(idxRaw) {
+		idxRaw = float64(0)
 	}
+	idx := jsIndex(idxRaw)
 	delta := jsonx.AsObj(choice["delta"])
 	if delta == nil {
 		delta = jsonx.ObjOf()
@@ -456,7 +475,7 @@ func (s *ChatToRespState) Convert(chunk map[string]any) []Event {
 
 	// Reasoning across vendor shapes.
 	if reasoningText := ExtractReasoningText(delta); reasoningText != "" {
-		s.startReasoning(&events, idx)
+		s.startReasoning(&events, idxRaw)
 		s.emitReasoningDelta(&events, reasoningText)
 	}
 
@@ -464,7 +483,7 @@ func (s *ChatToRespState) Convert(chunk map[string]any) []Event {
 		if strings.Contains(content, "<think>") {
 			s.InThinking = true
 			content = strings.Replace(content, "<think>", "", 1)
-			s.startReasoning(&events, idx)
+			s.startReasoning(&events, idxRaw)
 		}
 		if strings.Contains(content, "</think>") {
 			// JS split/join semantics: first part is reasoning, the rest
@@ -484,7 +503,7 @@ func (s *ChatToRespState) Convert(chunk map[string]any) []Event {
 			return events
 		}
 		if content != "" {
-			s.emitTextContent(&events, idx, content)
+			s.emitTextContent(&events, idxRaw, content)
 		}
 	}
 
@@ -498,12 +517,19 @@ func (s *ChatToRespState) Convert(chunk map[string]any) []Event {
 		}
 	}
 
-	if finish := jsonx.AsStr(choice["finish_reason"]); finish != "" {
-		for i := range s.MsgItemAdded {
+	// JS `if (choice.finish_reason)` (openai-responses.js:111) — truthiness:
+	// any truthy value closes the response, not only strings. The closing
+	// loops walk the maps ASCENDING (JS `for (const i in ...)` over integer
+	// property keys, :112-114) — a bare Go map range is randomized, which
+	// made parallel items close in nondeterministic order (former known
+	// parity bug #7); flushEvents already iterated sorted — now this path
+	// matches it.
+	if jsonx.Truthy(choice["finish_reason"]) {
+		for _, i := range sortedKeys(s.MsgItemAdded) {
 			s.closeMessage(&events, i)
 		}
 		s.closeReasoning(&events)
-		for i := range s.FuncCallIds {
+		for _, i := range sortedKeys(s.FuncCallIds) {
 			s.closeToolCall(&events, i)
 		}
 		s.sendCompleted(&events)

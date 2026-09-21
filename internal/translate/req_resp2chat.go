@@ -25,23 +25,29 @@ func jsonStringify(v any) string {
 }
 
 // ResponsesToChatRequest ports openaiResponsesToOpenAIRequest: OpenAI
-// Responses request → Chat Completions request. Bodies without `input` pass
-// through untouched; invalid input shapes return the original body (the JS
-// translator bails after spreading, leaving the Responses fields in place).
+// Responses request → Chat Completions request. Bodies without a truthy
+// `input` pass through untouched; invalid input shapes return the original
+// body (the JS translator bails after spreading, leaving the Responses
+// fields in place).
 func ResponsesToChatRequest(body map[string]any) map[string]any {
 	if body == nil {
 		return nil
 	}
-	if _, has := body["input"]; !has {
+	// JS `if (!body.input) return body` (openai-responses.js:23) — truthiness:
+	// ""/0/false/null leave the body untranslated (key presence would
+	// wrongly translate an empty-string input into placeholder messages).
+	if !jsonx.Truthy(body["input"]) {
 		return body
 	}
 
 	result := jsonx.Clone(body).(map[string]any)
 	result["messages"] = []any{}
 
-	if instr := jsonx.AsStr(body["instructions"]); instr != "" {
+	// JS `if (body.instructions)` (:29) — truthiness; the raw value becomes
+	// the system message content.
+	if jsonx.Truthy(body["instructions"]) {
 		result["messages"] = append(result["messages"].([]any),
-			jsonx.ObjOf("role", RoleSystem, "content", instr))
+			jsonx.ObjOf("role", RoleSystem, "content", body["instructions"]))
 	}
 
 	inputItems := cloak.NormalizeResponsesInput(body["input"])
@@ -86,9 +92,12 @@ func ResponsesToChatRequest(body map[string]any) map[string]any {
 		if item == nil {
 			continue
 		}
+		// JS `item.type || (item.role ? MESSAGE : null)` (:67) — truthiness
+		// on both: a truthy non-string type matches no branch, and an empty
+		// role does NOT promote a typeless item to a message.
 		itemType := jsonx.AsStr(item["type"])
-		if itemType == "" {
-			if _, hasRole := item["role"]; hasRole {
+		if !jsonx.Truthy(item["type"]) {
+			if jsonx.Truthy(item["role"]) {
 				itemType = ItemMessage
 			}
 		}
@@ -111,12 +120,18 @@ func ResponsesToChatRequest(body map[string]any) map[string]any {
 					case ItemInputText, ItemOutputText:
 						mapped = append(mapped, jsonx.ObjOf("type", BlockText, "text", c["text"]))
 					case ItemInputImage:
-						url := jsonx.AsStr(c["image_url"])
-						if url == "" {
-							url = jsonx.AsStr(c["file_id"])
+						// JS `c.image_url || c.file_id || ""` and
+						// `c.detail || "auto"` (:89-90) — truthiness chains
+						// keeping the raw value.
+						url := c["image_url"]
+						if !jsonx.Truthy(url) {
+							url = c["file_id"]
 						}
-						detail := jsonx.AsStr(c["detail"])
-						if detail == "" {
+						if !jsonx.Truthy(url) {
+							url = ""
+						}
+						detail := c["detail"]
+						if !jsonx.Truthy(detail) {
 							detail = "auto"
 						}
 						mapped = append(mapped, jsonx.ObjOf(
@@ -149,8 +164,11 @@ func ResponsesToChatRequest(body map[string]any) map[string]any {
 			}
 			// Nameless calls are skipped AFTER the shell message is created —
 			// an empty tool_calls array can survive to flush (JS #444 parity).
-			name := strings.TrimSpace(jsonx.AsStr(item["name"]))
-			if name == "" {
+			// JS gates on the trimmed name (:115) but pushes the RAW one
+			// (:116, :124) — trimming would desynchronize the call from its
+			// tool declaration.
+			name := jsonx.AsStr(item["name"])
+			if strings.TrimSpace(name) == "" {
 				continue
 			}
 			if itemType == ItemCustomToolCall {
@@ -158,22 +176,33 @@ func ResponsesToChatRequest(body map[string]any) map[string]any {
 			}
 			var toolInput any
 			if itemType == ItemCustomToolCall {
-				// JS wraps freeform input as {"input": <string>} in the chat
-				// tool_calls.arguments (openai-responses.js toolInput) — the
-				// response side unwraps it via extractCustomToolInput.
+				// JS wraps freeform input as {"input": <string-or-json>} in
+				// the chat tool_calls.arguments (openai-responses.js:117-118)
+				// — the response side unwraps it via extractCustomToolInput.
+				// `JSON.stringify(item.input ?? "")` turns a missing/null
+				// input into the two-character string `""` (not "").
 				in := item["input"]
+				var wrapped string
 				if s, isStr := in.(string); isStr {
-					toolInput = jsonx.ObjOf("input", s)
+					wrapped = s
 				} else if in == nil {
-					toolInput = jsonx.ObjOf("input", "") // JS: stringify(item.input ?? "")
+					wrapped = `""`
 				} else {
-					toolInput = jsonx.ObjOf("input", jsonStringify(in))
+					wrapped = jsonStringify(in)
 				}
+				toolInput = jsonx.ObjOf("input", wrapped)
 			} else {
 				toolInput = item["arguments"]
 			}
-			args := jsonx.AsStr(toolInput)
-			if _, isStr := toolInput.(string); !isStr {
+			// JS `typeof toolInput === "string" ? toolInput :
+			// JSON.stringify(toolInput ?? {})` (:125) — null/absent
+			// arguments become "{}" (null ?? {}), never "null".
+			var args string
+			if s, isStr := toolInput.(string); isStr {
+				args = s
+			} else if toolInput == nil {
+				args = "{}"
+			} else {
 				args = jsonStringify(toolInput)
 			}
 			calls := currentAssistantMsg["tool_calls"].([]any)
@@ -186,10 +215,15 @@ func ResponsesToChatRequest(body map[string]any) map[string]any {
 		case ItemFunctionCallOutput, ItemCustomToolCallOutput:
 			flushAssistant()
 			flushToolResults()
-			result["messages"] = append(result["messages"].([]any), jsonx.ObjOf(
-				"role", RoleTool,
-				"tool_call_id", item["call_id"],
-				"content", jsonStringify(item["output"])))
+			// JS `typeof item.output === "string" ? item.output :
+			// JSON.stringify(item.output)` (:146): an ABSENT output is
+			// JSON.stringify(undefined) = undefined — the content key
+			// vanishes on the wire — while an explicit null keeps "null".
+			toolMsg := jsonx.ObjOf("role", RoleTool, "tool_call_id", item["call_id"])
+			if out, has := item["output"]; has {
+				toolMsg["content"] = jsonStringify(out)
+			}
+			result["messages"] = append(result["messages"].([]any), toolMsg)
 
 		case ItemAdditionalTools:
 			if tools, isArr := item["tools"].([]any); isArr {
@@ -225,7 +259,10 @@ func ResponsesToChatRequest(body map[string]any) map[string]any {
 			if tool == nil {
 				continue
 			}
-			if _, alreadyChat := tool["function"]; alreadyChat {
+			// JS `if (tool.function) return tool` (openai-responses.js:189)
+			// — truthiness: a null function is NOT already-chat shape and
+			// falls through to the Responses-tool conversion below.
+			if jsonx.Truthy(tool["function"]) {
 				out = append(out, tool)
 				continue
 			}
@@ -237,17 +274,17 @@ func ResponsesToChatRequest(body map[string]any) map[string]any {
 				customToolNames[name] = true
 				var hint []string
 				if fmt2 := jsonx.AsObj(tool["format"]); fmt2 != nil {
-					if s := jsonx.AsStr(fmt2["syntax"]); s != "" {
-						hint = append(hint, s)
-					}
-					if s := jsonx.AsStr(fmt2["definition"]); s != "" {
-						hint = append(hint, s)
+					// JS [syntax, definition].filter(Boolean).join("\n")
+					// (:198) — truthy non-strings stringify through join.
+					for _, k := range []string{"syntax", "definition"} {
+						if v := fmt2[k]; jsonx.Truthy(v) {
+							hint = append(hint, jsStringOf(v))
+						}
 					}
 				}
-				desc := jsonx.AsStr(tool["description"])
-				// JS: formatHint = [syntax, definition].join("\n"), then
+				// JS: String(tool.description || "") (:203), then
 				// [description, formatHint].join("\n\n") — two different joins.
-				joined := joinNonEmpty([]string{desc, joinNonEmpty(hint, "\n")}, "\n\n")
+				joined := joinNonEmpty([]string{jsStringOrEmpty(tool["description"]), joinNonEmpty(hint, "\n")}, "\n\n")
 				out = append(out, jsonx.ObjOf(
 					"type", BlockFunction,
 					"function", jsonx.ObjOf(
@@ -265,7 +302,9 @@ func ResponsesToChatRequest(body map[string]any) map[string]any {
 			}
 			fn := jsonx.ObjOf(
 				"name", name,
-				"description", jsonx.AsStr(tool["description"]),
+				// JS String(tool.description || "") (:224) — truthy
+				// non-string descriptions stringify, falsy become "".
+				"description", jsStringOrEmpty(tool["description"]),
 				"parameters", normalizeToolParameters(tool["parameters"]))
 			if strict, has := tool["strict"]; has {
 				fn["strict"] = strict
@@ -335,30 +374,49 @@ func joinNonEmpty(parts []string, sep string) string {
 	return strings.Join(out, sep)
 }
 
-// normalizeToolParameters ensures object schemas carry a properties map.
+// jsStringOrEmpty is JS `String(v || "")` (:203, :224) over decoded JSON:
+// falsy values coerce to ""; truthy non-strings stringify (templated/joined).
+func jsStringOrEmpty(v any) string {
+	if !jsonx.Truthy(v) {
+		return ""
+	}
+	return jsStringOf(v)
+}
+
+// normalizeToolParameters ports openai-responses.js:275-278.
+//   - `if (!params) return {...}` — falsy parameters (null/0/false/"") get
+//     the default object schema. A TRUTHY array (e.g. `parameters: []`)
+//     passes through as-is: JS truthiness is blind to its non-object shape.
+//   - `params.type === "object" && !params.properties` replaces the
+//     properties field whenever it is falsy (null/0/false/""), a keyed
+//     presence check would wrongly keep them.
 func normalizeToolParameters(params any) any {
 	o := jsonx.AsObj(params)
 	if o == nil {
-		return jsonx.ObjOf("type", "object", "properties", jsonx.ObjOf())
-	}
-	if jsonx.AsStr(o["type"]) == "object" {
-		if _, has := o["properties"]; !has {
-			clone := jsonx.Clone(o).(map[string]any)
-			clone["properties"] = jsonx.ObjOf()
-			return clone
+		if !jsonx.Truthy(params) {
+			return jsonx.ObjOf("type", "object", "properties", jsonx.ObjOf())
 		}
+		return params // truthy but not an object (array) — passthrough
+	}
+	if jsonx.AsStr(o["type"]) == "object" && !jsonx.Truthy(o["properties"]) {
+		clone := jsonx.Clone(o).(map[string]any)
+		clone["properties"] = jsonx.ObjOf()
+		return clone
 	}
 	return params
 }
 
 // ChatRequestToResponsesRequest ports openaiToOpenAIResponsesRequest: Chat
-// Completions request → Responses request. Bodies already carrying `input`
-// pass through with max_tokens remapped.
+// Completions request → Responses request. Bodies already carrying a truthy
+// `input` pass through with max_tokens remapped.
 func ChatRequestToResponsesRequest(model string, body map[string]any) map[string]any {
 	if body == nil {
 		return nil
 	}
-	if _, has := body["input"]; has {
+	// JS `if (body.input)` (openai-responses.js:323) — truthiness: a falsy
+	// input (""/0/false/null) is NOT an already-Responses body; the full
+	// chat translation runs instead.
+	if jsonx.Truthy(body["input"]) {
 		out := jsonx.Clone(body).(map[string]any)
 		out["model"] = model
 		out["stream"] = true
@@ -441,12 +499,21 @@ func ChatRequestToResponsesRequest(model string, body map[string]any) map[string
 					case ItemInputImage:
 						content = append(content, part)
 					default:
-						text := any(part["text"])
-						if s, isStr := text.(string); !isStr || s == "" {
-							text = any(part["content"])
-							if _, isStr := text.(string); !isStr {
-								text = jsonStringify(part)
-							}
+						// JS `const text = c.text || c.content ||
+						// JSON.stringify(c)` then `typeof text === "string" ?
+						// text : JSON.stringify(text)` (openai-responses.js:381-382)
+						// — truthy chains keeping raw values; a truthy
+						// non-string text (number, object) stringifies alone,
+						// not the whole block.
+						text := part["text"]
+						if !jsonx.Truthy(text) {
+							text = part["content"]
+						}
+						if !jsonx.Truthy(text) {
+							text = jsonStringify(part)
+						}
+						if _, isStr := text.(string); !isStr {
+							text = jsonStringify(text)
 						}
 						content = append(content, jsonx.ObjOf("type", contentType, "text", text))
 					}
@@ -553,8 +620,9 @@ func ChatRequestToResponsesRequest(model string, body map[string]any) map[string
 	return result
 }
 
-// extractInstructionsText pulls plain text from a system/developer message;
-// array content parts join with "\n", everything else degrades to "".
+// extractInstructionsText pulls plain text from a system/developer message
+// (openai-responses.js:260-270); array content parts join with "\n" after
+// JS `.filter(Boolean)` drops the empty ones, everything else degrades to "".
 func extractInstructionsText(content any) string {
 	switch c := content.(type) {
 	case string:
@@ -567,10 +635,12 @@ func extractInstructionsText(content any) string {
 				continue
 			}
 			if s, isStr := o["text"].(string); isStr {
-				parts = append(parts, s)
+				if s != "" { // filter(Boolean)
+					parts = append(parts, s)
+				}
 				continue
 			}
-			if s, isStr := o["content"].(string); isStr {
+			if s, isStr := o["content"].(string); isStr && s != "" {
 				parts = append(parts, s)
 			}
 		}

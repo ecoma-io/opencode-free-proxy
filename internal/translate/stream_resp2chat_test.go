@@ -198,6 +198,11 @@ func TestRespToChatReasoningSummaryDelta(t *testing.T) {
 	if got := feedResp(t, st, `{"type":"response.reasoning_summary_text.delta","data":{"delta":""}}`); len(got) != 0 {
 		t.Fatalf("empty reasoning delta must be ignored: %s", js(got))
 	}
+
+	// Same truthiness gate as text deltas (:599-600) — a truthy non-string
+	// delta rides reasoning_content raw (reasoning.js:4-8 returns it as-is).
+	rawChunks := feedResp(t, st, `{"type":"response.reasoning_summary_text.delta","data":{"delta":true}}`)
+	eq(t, "raw delta", dig(t, rawChunks[0], "choices", 0, "delta", "reasoning_content"), true)
 }
 
 func TestRespToChatCompleted(t *testing.T) {
@@ -271,6 +276,72 @@ func TestRespToChatCompleted(t *testing.T) {
 	})
 }
 
+func TestRespToChatUsageRawValues(t *testing.T) {
+	// `responseUsage && typeof responseUsage === "object"` (:545) + the
+	// `a || b || 0` chains (:546-550) keep RAW truthy values: numeric-string
+	// counts flow through as strings, the total is JS `inputTokens +
+	// outputTokens` (+), and only buildUsage's `> 0` detail gates coerce.
+	t.Run("numeric-string tokens concat, not add", func(t *testing.T) {
+		st := newRespState("m")
+		chunks := feedResp(t, st, `{
+			"type":"response.completed",
+			"data":{"response":{"usage":{"input_tokens":"5","output_tokens":30}}}
+		}`)
+		eq(t, "usage", dig(t, chunks[0], "usage"), jb(t, `{
+			"prompt_tokens":"5","completion_tokens":30,"total_tokens":"530"
+		}`))
+	})
+
+	t.Run("zero input_tokens falls through to prompt_tokens", func(t *testing.T) {
+		st := newRespState("m")
+		chunks := feedResp(t, st, `{
+			"type":"response.completed",
+			"data":{"response":{"usage":{"input_tokens":0,"prompt_tokens":9}}}
+		}`)
+		eq(t, "usage", dig(t, chunks[0], "usage"), jb(t, `{
+			"prompt_tokens":9,"completion_tokens":0,"total_tokens":9
+		}`))
+	})
+
+	t.Run("numeric-string cached_tokens passes the > 0 gate verbatim", func(t *testing.T) {
+		st := newRespState("m")
+		chunks := feedResp(t, st, `{
+			"type":"response.completed",
+			"data":{"response":{"usage":{"input_tokens":120,"output_tokens":5,
+				"input_tokens_details":{"cached_tokens":"80"}}}}
+		}`)
+		eq(t, "usage", dig(t, chunks[0], "usage"), jb(t, `{
+			"prompt_tokens":120,"completion_tokens":5,"total_tokens":125,
+			"prompt_tokens_details":{"cached_tokens":"80"}
+		}`))
+	})
+
+	t.Run("array usage passes the typeof-object gate and reads as zero", func(t *testing.T) {
+		// typeof [] === "object" — the gate passes, every field read off an
+		// array is undefined, and the || chains land on 0.
+		st := newRespState("m")
+		chunks := feedResp(t, st, `{
+			"type":"response.completed",
+			"data":{"response":{"usage":[]}}
+		}`)
+		eq(t, "usage", dig(t, chunks[0], "usage"), jb(t, `{
+			"prompt_tokens":0,"completion_tokens":0,"total_tokens":0
+		}`))
+	})
+
+	t.Run("non-object usage never opens the block", func(t *testing.T) {
+		// typeof "42" === "string" — the gate fails, no usage object at all.
+		st := newRespState("m")
+		chunks := feedResp(t, st, `{
+			"type":"response.completed",
+			"data":{"response":{"usage":"42"}}
+		}`)
+		if _, has := chunks[0]["usage"]; has {
+			t.Fatalf("usage must be absent: %s", js(chunks[0]))
+		}
+	})
+}
+
 func TestRespToChatErrorEvents(t *testing.T) {
 	t.Run("error event surfaces as an [Error] content chunk with finish stop", func(t *testing.T) {
 		st := newRespState("m")
@@ -297,12 +368,132 @@ func TestRespToChatErrorEvents(t *testing.T) {
 		eq(t, "content", dig(t, chunks[0], "choices", 0, "delta", "content"), "[Error] nope")
 	})
 
-	t.Run("error event without an error object is ignored", func(t *testing.T) {
-		st := newRespState("m")
-		if got := feedResp(t, st, `{"type":"error","data":{}}`); len(got) != 0 {
-			t.Fatalf("must be ignored: %s", js(got))
+	t.Run("falsy error payloads are ignored", func(t *testing.T) {
+		// JS `if (error)` (openai-responses.js:584) — truthiness, not shape.
+		for _, raw := range []string{
+			`{"type":"error","data":{}}`,
+			`{"type":"error","data":{"error":null}}`,
+			`{"type":"error","data":{"error":""}}`,
+			`{"type":"error","data":{"error":0}}`,
+			`{"type":"error","data":{"error":false}}`,
+			`{"type":"response.failed","data":{"response":{}}}`,
+		} {
+			st := newRespState("m")
+			if got := feedResp(t, st, raw); len(got) != 0 {
+				t.Fatalf("%s must be ignored: %s", raw, js(got))
+			}
 		}
 	})
+
+	t.Run("truthy non-object error payloads surface too", func(t *testing.T) {
+		// `const error = data.error || data.response?.error; if (error)`
+		// (:582-584) — a string/number error passes the gate and renders
+		// through the JSON.stringify fallback of `[Error] ${error.message ||
+		// JSON.stringify(error)}` (:590).
+		cases := []struct{ name, raw, wantContent string }{
+			{"string in data", `{"type":"error","data":{"error":"rate limited"}}`, `[Error] "rate limited"`},
+			{"bare string (chunk.data || chunk)", `{"type":"error","error":"model overloaded"}`, `[Error] "model overloaded"`},
+			{"number", `{"type":"error","data":{"error":429}}`, `[Error] 429`},
+			{"object without message", `{"type":"error","data":{"error":{"code":500}}}`, `[Error] {"code":500}`},
+			{"truthy numeric message", `{"type":"error","data":{"error":{"message":429}}}`, `[Error] 429`},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				st := newRespState("m")
+				chunks := feedResp(t, st, tc.raw)
+				if len(chunks) != 1 {
+					t.Fatalf("want 1 chunk, got %d (%s)", len(chunks), js(chunks))
+				}
+				eq(t, "content", dig(t, chunks[0], "choices", 0, "delta", "content"), tc.wantContent)
+				eq(t, "finish", dig(t, chunks[0], "choices", 0, "finish_reason"), "stop")
+			})
+		}
+	})
+}
+
+func TestRespToChatDeltaTruthiness(t *testing.T) {
+	// `const delta = data.delta || ""; if (!delta) return null`
+	// (openai-responses.js:460-461, args variant :508-509) — truthiness, not
+	// stringiness: a truthy non-string delta streams through RAW as the
+	// content / arguments value.
+	t.Run("output_text truthy non-string delta rides content raw", func(t *testing.T) {
+		st := newRespState("m")
+		chunks := feedResp(t, st,
+			`{"type":"response.output_text.delta","data":{"delta":true}}`,
+			`{"type":"response.output_text.delta","data":{"delta":5}}`,
+		)
+		eq(t, "true", dig(t, chunks[0], "choices", 0, "delta", "content"), true)
+		eq(t, "5", dig(t, chunks[1], "choices", 0, "delta", "content"), float64(5))
+	})
+
+	t.Run("output_text falsy deltas are dropped", func(t *testing.T) {
+		st := newRespState("m")
+		for _, raw := range []string{
+			`{"type":"response.output_text.delta","data":{"delta":0}}`,
+			`{"type":"response.output_text.delta","data":{"delta":false}}`,
+			`{"type":"response.output_text.delta","data":{"delta":""}}`,
+			`{"type":"response.output_text.delta","data":{}}`,
+		} {
+			if got := st.Convert(jb(t, raw)); got != nil {
+				t.Fatalf("%s must be ignored: %s", raw, js(got))
+			}
+		}
+	})
+
+	t.Run("args delta truthy non-string rides function.arguments raw", func(t *testing.T) {
+		st := newRespState("m")
+		chunks := feedResp(t, st,
+			`{"type":"response.output_item.added","data":{"item":{"id":"fc_1","type":"function_call","call_id":"call_a","name":"f"}}}`,
+			`{"type":"response.function_call_arguments.delta","data":{"item_id":"fc_1","delta":5}}`,
+		)
+		eq(t, "args", dig(t, chunks[1], "choices", 0, "delta", "tool_calls", 0, "function", "arguments"), float64(5))
+	})
+}
+
+func TestRespToChatItemIDMapKeepsTypeIdentity(t *testing.T) {
+	// state.respToolChatIndex is a JS Map (:453) — SameValueZero keys, no
+	// string coercion: numeric id 5 and string id "5" are DIFFERENT entries.
+	t.Run("numeric id and numeric item_id correlate", func(t *testing.T) {
+		st := newRespState("m")
+		chunks := feedResp(t, st,
+			`{"type":"response.output_item.added","data":{"item":{"id":5,"type":"function_call","call_id":"call_a","name":"f"}}}`,
+			`{"type":"response.function_call_arguments.delta","data":{"item_id":5,"delta":"x"}}`,
+		)
+		eq(t, "delta lands on the announced index",
+			dig(t, chunks[1], "choices", 0, "delta", "tool_calls", 0, "index"), float64(0))
+	})
+
+	t.Run("numeric id vs string item_id miss the map", func(t *testing.T) {
+		st := newRespState("m")
+		feedResp(t, st,
+			`{"type":"response.output_item.added","data":{"item":{"id":5,"type":"function_call","call_id":"call_a","name":"f"}}}`,
+			`{"type":"response.output_item.added","data":{"item":{"id":"fc_9","type":"function_call","call_id":"call_b","name":"g"}}}`,
+		)
+		// get("5") misses the 5 entry → known ?? fallback → last assigned
+		// index (toolCallIndex 2 - 1 = 1).
+		chunks := feedResp(t, st, `{"type":"response.function_call_arguments.delta","data":{"item_id":"5","delta":"x"}}`)
+		eq(t, "fallback index", dig(t, chunks[0], "choices", 0, "delta", "tool_calls", 0, "index"), float64(1))
+	})
+}
+
+func TestRespToChatDoneFalsyKeySurvivesNullish(t *testing.T) {
+	// `(key && map.get(key)) ?? fallback` (:526) — ?? rescues only
+	// undefined/null, so a falsy-but-present key ("" | 0 | false) IS the
+	// emitted chunk index.
+	for _, raw := range []string{
+		`{"type":"response.output_item.done","data":{"item":{"id":"","type":"function_call","arguments":"{}"},"item_id":""}}`,
+		`{"type":"response.output_item.done","data":{"item":{"id":false,"type":"function_call","arguments":"{}"},"item_id":false}}`,
+	} {
+		st := newRespState("m")
+		chunks := feedResp(t, st, raw)
+		if len(chunks) != 1 {
+			t.Fatalf("%s must emit once, got %d", raw, len(chunks))
+		}
+		idx := dig(t, chunks[0], "choices", 0, "delta", "tool_calls", 0, "index")
+		if idx == nil || jsonx.Truthy(idx) {
+			t.Fatalf("%s: chunk index must be the falsy key verbatim, got %v", raw, idx)
+		}
+	}
 }
 
 func TestRespToChatUnknownEventsIgnored(t *testing.T) {

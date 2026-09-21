@@ -477,10 +477,13 @@ func TestChatToRespChunkWithoutChoicesIgnored(t *testing.T) {
 	}
 }
 
-func TestChatToRespParallelToolCallsFinishOrderIsUnspecified(t *testing.T) {
-	// Both calls must close and complete; the JS source iterates object keys
-	// (ascending) while Go's finish path ranges over a map — see
-	// known parity bug #7 in the report. Here we only assert set completeness.
+func TestChatToRespParallelToolCallsFinishOrderIsAscending(t *testing.T) {
+	// openai-responses.js:111-114 — the finish path closes items with
+	// `for (const i in state.msgItemAdded)` / `for (const i in
+	// state.funcCallIds)`, which walks integer property keys ASCENDING. Go
+	// ranges over maps in random order, so the loops must sort (the former
+	// known parity bug #7). Announced call_b (index 1) before call_a (index 0)
+	// — the finish path still closes call_a first.
 	st := newChatRespState()
 	evs := feedChat(t, st,
 		`{"choices":[{"index":0,"delta":{"tool_calls":[
@@ -489,16 +492,125 @@ func TestChatToRespParallelToolCallsFinishOrderIsUnspecified(t *testing.T) {
 		]}}]}`,
 		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
 	)
-	closed := map[string]bool{}
+	var closedInOrder []string
 	for _, e := range evs {
 		if e.Event == "response.output_item.done" {
-			closed[jsonx.AsStr(dig(t, e.Data, "item", "call_id"))] = true
+			if item := jsonx.AsObj(e.Data["item"]); item != nil && jsonx.AsStr(item["type"]) == "function_call" {
+				closedInOrder = append(closedInOrder, jsonx.AsStr(item["call_id"]))
+			}
 		}
 	}
-	if !closed["call_a"] || !closed["call_b"] {
-		t.Fatalf("both tool calls must close: %v (%s)", closed, strings.Join(names(evs), ","))
+	if len(closedInOrder) != 2 || closedInOrder[0] != "call_a" || closedInOrder[1] != "call_b" {
+		t.Fatalf("calls must close ascending (call_a then call_b), got %v (%s)",
+			closedInOrder, strings.Join(names(evs), ","))
 	}
 	if last := evs[len(evs)-1]; last.Event != "response.completed" {
 		t.Fatalf("stream must end with response.completed, got %s", last.Event)
 	}
+}
+
+func TestChatToRespFinishReasonTruthiness(t *testing.T) {
+	// JS `if (choice.finish_reason)` (openai-responses.js:111) — truthiness,
+	// not stringiness: any truthy value completes; ""/0/false/null do not.
+	t.Run("truthy non-string finish_reason completes", func(t *testing.T) {
+		st := newChatRespState()
+		evs := feedChat(t, st, `{"choices":[{"index":0,"delta":{},"finish_reason":true}]}`)
+		if names := names(evs); names[len(names)-1] != "response.completed" {
+			t.Fatalf("must complete, got %s", strings.Join(names, ", "))
+		}
+	})
+
+	t.Run("falsy finish_reason does not complete", func(t *testing.T) {
+		for _, raw := range []string{
+			`{"choices":[{"index":0,"delta":{},"finish_reason":""}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":0}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":null}]}`,
+			`{"choices":[{"index":0,"delta":{}}]}`,
+		} {
+			st := newChatRespState()
+			for _, e := range feedChat(t, st, raw) {
+				if e.Event == "response.completed" {
+					t.Fatalf("%s must not complete the response", raw)
+				}
+			}
+		}
+	})
+}
+
+func TestChatToRespNumericStringIndices(t *testing.T) {
+	// JS plain-object property keys coerce: index "5" and 5 share one map slot
+	// (initState's msg*/func* objects, index.js:252-263), while `output_index:
+	// idx` emits the RAW value and `msg_${id}_${idx}` stringifies it.
+	t.Run("choice index \"2\" announces raw and closes coerced", func(t *testing.T) {
+		st := newChatRespState()
+		evs := feedChat(t, st,
+			`{"choices":[{"index":"2","delta":{"content":"hi"}}]}`,
+			`{"choices":[{"index":"2","delta":{},"finish_reason":"stop"}]}`,
+		)
+		added := first(t, evs, "response.output_item.added")
+		eq(t, "added output_index raw", dig(t, added, "output_index"), "2")
+		eq(t, "item id coerced", dig(t, added, "item", "id"), "msg_resp_1700000000000_2")
+		done := first(t, evs, "response.output_item.done")
+		eq(t, "done output_index coerced", dig(t, done, "output_index"), float64(2))
+	})
+
+	t.Run("tool_call index \"5\" routes deltas by the coerced slot", func(t *testing.T) {
+		st := newChatRespState()
+		evs := feedChat(t, st,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[
+				{"index":"5","id":"call_s","function":{"name":"f"}}
+			]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[
+				{"index":"5","function":{"arguments":"{}"}}
+			]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		)
+		added := first(t, evs, "response.output_item.added")
+		eq(t, "added output_index raw", dig(t, added, "output_index"), "5")
+		eq(t, "delta routes to the same slot",
+			dig(t, first(t, evs, "response.function_call_arguments.delta"), "output_index"), "5")
+		eq(t, "close coerces",
+			dig(t, first(t, evs, "response.function_call_arguments.done"), "output_index"), float64(5))
+	})
+
+	t.Run("tool_call index null is nullish-coerced to 0", func(t *testing.T) {
+		// `tc.index ?? 0` (openai-responses.js:275) — null/undefined only.
+		st := newChatRespState()
+		evs := feedChat(t, st, `{"choices":[{"index":0,"delta":{"tool_calls":[
+			{"index":null,"id":"call_n","function":{"name":"f"}}
+		]}}]}`)
+		eq(t, "output_index", dig(t, first(t, evs, "response.output_item.added"), "output_index"), float64(0))
+	})
+}
+
+func TestChatToRespArgumentsTruthiness(t *testing.T) {
+	// JS `if (tc.function?.arguments)` (openai-responses.js:305) — truthiness:
+	// the raw value rides the delta and the buffer accumulates String(v)
+	// (`state.funcArgsBuf[tcIdx] += tc.function.arguments`, :318).
+	t.Run("numeric arguments delta raw, close coerced", func(t *testing.T) {
+		st := newChatRespState()
+		evs := feedChat(t, st,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[
+				{"index":0,"id":"call_n","function":{"name":"f"}}
+			]}}]}`,
+			`{"choices":[{"index":0,"delta":{"tool_calls":[
+				{"index":0,"function":{"arguments":5}}
+			]}}]}`,
+			`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		)
+		eq(t, "delta raw", dig(t, first(t, evs, "response.function_call_arguments.delta"), "delta"), float64(5))
+		eq(t, "close coerces via +=", dig(t, first(t, evs, "response.function_call_arguments.done"), "arguments"), "5")
+	})
+
+	t.Run("empty-string arguments emit no delta", func(t *testing.T) {
+		st := newChatRespState()
+		evs := feedChat(t, st, `{"choices":[{"index":0,"delta":{"tool_calls":[
+			{"index":0,"id":"call_n","function":{"name":"f","arguments":""}}
+		]}}]}`)
+		for _, e := range evs {
+			if e.Event == "response.function_call_arguments.delta" {
+				t.Fatalf("falsy arguments must not emit a delta: %s", js(e.Data))
+			}
+		}
+	})
 }

@@ -147,6 +147,27 @@ func TestEnsureToolCallIDs(t *testing.T) {
 		eq(t, "arguments", dig(t, body, "messages", 0, "tool_calls", 0, "function", "arguments"), "")
 	})
 
+	t.Run("falsy non-string arguments stay as-is, truthy ones stringify", func(t *testing.T) {
+		// JS `tc.function?.arguments && typeof tc.function.arguments !==
+		// "string"` (concerns/toolCall.js:44) — truthiness: 0/false/null are
+		// falsy and pass through untouched ({} and [] are TRUTHY objects and
+		// stringify).
+		body := jb(t, `{"messages":[{"role":"assistant","tool_calls":[
+			{"id":"a1","function":{"name":"f","arguments":0}},
+			{"id":"b2","function":{"name":"f","arguments":false}},
+			{"id":"c3","function":{"name":"f","arguments":null}},
+			{"id":"d4","function":{"name":"f","arguments":{}}},
+			{"id":"e5","function":{"name":"f","arguments":[]}}
+		]}]}`)
+		EnsureToolCallIDs(body)
+		calls := dig(t, body, "messages", 0, "tool_calls").([]any)
+		eq(t, "0 stays", dig(t, calls[0], "function", "arguments"), float64(0))
+		eq(t, "false stays", dig(t, calls[1], "function", "arguments"), false)
+		eq(t, "null stays", dig(t, calls[2], "function", "arguments"), nil)
+		eq(t, "{} stringifies", dig(t, calls[3], "function", "arguments"), "{}")
+		eq(t, "[] stringifies", dig(t, calls[4], "function", "arguments"), "[]")
+	})
+
 	t.Run("valid id and type untouched", func(t *testing.T) {
 		body := jb(t, `{"messages":[{"role":"assistant","tool_calls":[
 			{"id":"call_123-abc_X","type":"function","function":{"name":"f","arguments":"{}"}}
@@ -289,13 +310,24 @@ func TestFixMissingToolResponses(t *testing.T) {
 		eq(t, "messages unchanged", body["messages"], ja(t, want))
 	})
 
-	t.Run("dangling tool_calls at end of conversation", func(t *testing.T) {
-		// KNOWN PARITY BUG #1 (prenorm.go:240): JS guards with
-		// `nextMsg && !hasToolResults(nextMsg, ids)` — no next message means no
-		// insert, so a final assistant tool_calls turn is forwarded as-is. Go
-		// flips the guard and fabricates an empty tool message. Repro lives in
-		// parity_known_bugs_test.go (build tag parityfails).
-		t.Skip("known parity bug #1: Go inserts a tool message for a dangling end-of-conversation tool call, JS inserts nothing")
+	t.Run("dangling tool_calls at end of conversation inserts nothing", func(t *testing.T) {
+		// JS guards with `nextMsg && !hasToolResults(nextMsg, toolCallIds)` —
+		// no next message means nothing to repair; never fabricate a dangling
+		// tool response at the end of the conversation. (Formerly known parity
+		// bug #1; the repro also lives in parity_known_bugs_test.go.)
+		body := jb(t, `{
+			"messages":[
+				{"role":"user","content":"q"},
+				{"role":"assistant","tool_calls":[
+					{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}
+				]}
+			]
+		}`)
+		FixMissingToolResponses(body)
+		if got := len(msgs(t, body)); got != 2 {
+			t.Fatalf("JS inserts nothing for a dangling end-of-conversation tool call: got %d messages\nmessages: %s",
+				got, js(body["messages"]))
+		}
 	})
 
 	t.Run("missing messages and nil body are no-ops", func(t *testing.T) {
@@ -371,6 +403,39 @@ func TestFilterToOpenAIFormat(t *testing.T) {
 		eq(t, "messages", body["messages"], ja(t, `[{"role":"assistant","content":[
 			{"type":"thinking","thinking":"m"}
 		],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]}]`))
+	})
+
+	t.Run("tool_calls null falls through to the content filter and may drop the message", func(t *testing.T) {
+		// JS `msg.role === ROLE.ASSISTANT && msg.tool_calls`
+		// (formats/openai.js:27/:68) — truthiness: null is not a tool-call
+		// turn, so the whitespace-content drop applies to it.
+		body := jb(t, `{"messages":[
+			{"role":"assistant","tool_calls":null,"content":"   "},
+			{"role":"user","content":"kept"}
+		]}`)
+		FilterToOpenAIFormat(body)
+		eq(t, "messages", body["messages"], ja(t, `[{"role":"user","content":"kept"}]`))
+	})
+
+	t.Run("tool_calls empty array is truthy and kept verbatim", func(t *testing.T) {
+		body := jb(t, `{"messages":[
+			{"role":"assistant","tool_calls":[],"content":"   "}
+		]}`)
+		FilterToOpenAIFormat(body)
+		eq(t, "messages", body["messages"], ja(t, `[{"role":"assistant","tool_calls":[],"content":"   "}]`))
+	})
+
+	t.Run("function null tool falls through to the Claude conversion", func(t *testing.T) {
+		// JS `tool.type === OPENAI_BLOCK.FUNCTION && tool.function`
+		// (formats/openai.js:89) — truthiness: a null function is not
+		// already-OpenAI shape.
+		body := jb(t, `{"messages":[{"role":"user","content":"hi"}],"tools":[
+			{"type":"function","function":null,"name":"flat","description":"d"}
+		]}`)
+		FilterToOpenAIFormat(body)
+		eq(t, "tools", body["tools"], ja(t, `[{"type":"function","function":{
+			"name":"flat","description":"d","parameters":{"type":"object","properties":{}}
+		}}]`))
 	})
 
 	t.Run("tool messages always kept", func(t *testing.T) {

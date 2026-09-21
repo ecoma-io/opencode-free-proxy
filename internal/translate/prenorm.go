@@ -100,7 +100,11 @@ func EnsureToolCallIDs(body map[string]any) {
 					}
 					fn := jsonx.AsObj(tc["function"])
 					if fn != nil {
-						if args, has := fn["arguments"]; has && args != nil {
+						// JS `tc.function?.arguments && typeof ... !== "string"`
+						// (concerns/toolCall.js:44) — truthiness: falsy
+						// non-string arguments (0, false, null) stay as-is;
+						// only truthy non-strings are stringified.
+						if args, has := fn["arguments"]; has && jsonx.Truthy(args) {
 							if _, isStr := args.(string); !isStr {
 								b, err := json.Marshal(args)
 								if err == nil {
@@ -321,7 +325,12 @@ func FilterToOpenAIFormat(body map[string]any) {
 			mapped = append(mapped, msg)
 			continue
 		case "assistant":
-			if _, has := msg["tool_calls"]; has {
+			// JS `msg.role === ROLE.ASSISTANT && msg.tool_calls`
+			// (formats/openai.js:27) — truthiness: `tool_calls: null` is NOT
+			// a tool-call turn and falls through to the content filter
+			// (possibly dropping the message); `[]` IS truthy and stays
+			// verbatim.
+			if jsonx.Truthy(msg["tool_calls"]) {
 				mapped = append(mapped, msg)
 				continue
 			}
@@ -380,7 +389,8 @@ func FilterToOpenAIFormat(body map[string]any) {
 			kept = append(kept, msg)
 			continue
 		case "assistant":
-			if _, has := msg["tool_calls"]; has {
+			// Same truthiness gate as the map pass (formats/openai.js:68).
+			if jsonx.Truthy(msg["tool_calls"]) {
 				kept = append(kept, msg)
 				continue
 			}
@@ -429,7 +439,11 @@ func FilterToOpenAIFormat(body map[string]any) {
 				continue
 			}
 			if jsonx.AsStr(tool["type"]) == "function" {
-				if _, has := tool["function"]; has {
+				// JS `tool.type === OPENAI_BLOCK.FUNCTION && tool.function`
+				// (formats/openai.js:89) — truthiness: `function: null` is
+				// not already-OpenAI shape and falls through to the Claude
+				// conversion below.
+				if jsonx.Truthy(tool["function"]) {
 					norm = append(norm, tool)
 					continue
 				}

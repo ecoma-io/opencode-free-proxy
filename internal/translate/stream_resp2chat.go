@@ -1,7 +1,6 @@
 package translate
 
 import (
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,21 +10,27 @@ import (
 // RespToChatState carries openaiResponsesToOpenAIResponse's accumulator across
 // SSE events (Responses upstream → Chat client).
 type RespToChatState struct {
-	Started         bool
-	ChatID          string
-	Created         int64
-	Model           string
-	ToolCallIndex   int
-	CurrentToolCall any // sticky: string call id or nil
+	Started       bool
+	ChatID        string
+	Created       int64
+	Model         string
+	ToolCallIndex int
+	// CurrentToolCall is sticky: the RAW truthy call id (:481
+	// `item.call_id || fallbackToolCallId()`), or nil.
+	CurrentToolCall any
 	// item_id → chat tool_calls index; deltas key on item_id so parallel calls
-	// stay separate when upstream emits all addeds before dones.
+	// stay separate when upstream emits all addeds before dones. JS keys a
+	// `new Map()` (openai-responses.js:453) — SameValueZero, no string
+	// coercion, hence mapKeyOf's type-tagged keys.
 	RespToolChatIndex   map[string]int
-	RespToolArgsEmitted map[int]bool
+	RespToolArgsEmitted map[string]bool
 	FinishReasonSent    bool
 	FinishReason        string
 	Usage               map[string]any
-	Error               map[string]any
-	now                 func() time.Time
+	// Error mirrors JS state.error — whatever truthy payload the event
+	// carried, any shape (:584 `state.error = error`).
+	Error any
+	now   func() time.Time
 }
 
 // NewRespToChatState seeds a translator state (stream.js createStreamState).
@@ -104,8 +109,12 @@ func (s *RespToChatState) Convert(chunk map[string]any) map[string]any {
 
 	switch eventType {
 	case "response.output_text.delta":
-		delta := jsonx.AsStr(data["delta"])
-		if delta == "" {
+		// JS `const delta = data.delta || ""; if (!delta) return null`
+		// (openai-responses.js:460-461) — truthiness, not stringiness: a
+		// truthy non-string delta (true, 5, {}) streams through as the
+		// content value; falsy ones are dropped.
+		delta := data["delta"]
+		if !jsonx.Truthy(delta) {
 			return nil
 		}
 		return s.chunk(map[string]any{"content": delta}, nil)
@@ -119,33 +128,34 @@ func (s *RespToChatState) Convert(chunk map[string]any) map[string]any {
 		if itemType != ItemFunctionCall && itemType != "custom_tool_call" {
 			return nil
 		}
-		callID := jsonx.AsStr(jsonx.Get(item, "call_id"))
-		if callID != "" {
+		// JS `item.call_id || fallbackToolCallId()` (:481) — truthiness; the
+		// raw truthy value becomes the chunk's tool_call id.
+		callID := jsonx.Get(item, "call_id")
+		if jsonx.Truthy(callID) {
 			s.CurrentToolCall = callID
 		} else {
 			s.CurrentToolCall = FallbackToolCallID()
 		}
-		key := jsonx.AsStr(jsonx.Get(item, "id"))
-		if key == "" {
-			key = jsonx.AsStr(data["item_id"])
+		// JS `item.id || data.item_id || state.currentToolCallId` (:483) —
+		// raw values through truthy || chains; the Map key keeps type
+		// identity (mapKeyOf).
+		key := jsonx.Get(item, "id")
+		if !jsonx.Truthy(key) {
+			key = data["item_id"]
 		}
-		if key == "" {
-			if id, is := s.CurrentToolCall.(string); is {
-				key = id
-			}
+		if !jsonx.Truthy(key) {
+			key = s.CurrentToolCall
 		}
-		var idx int
 		if s.RespToolChatIndex == nil {
 			s.RespToolChatIndex = map[string]int{}
 		}
-		if prev, seen := s.RespToolChatIndex[key]; key != "" && seen {
+		var idx int
+		if prev, seen := s.RespToolChatIndex[mapKeyOf(key)]; seen {
 			idx = prev // duplicate added (retry) — reuse
 		} else {
 			idx = s.ToolCallIndex
 			s.ToolCallIndex++
-			if key != "" {
-				s.RespToolChatIndex[key] = idx
-			}
+			s.RespToolChatIndex[mapKeyOf(key)] = idx
 		}
 		name := jsonx.AsStr(jsonx.Get(item, "name"))
 		return s.chunk(map[string]any{
@@ -157,24 +167,25 @@ func (s *RespToChatState) Convert(chunk map[string]any) map[string]any {
 		}, nil)
 
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-		argsDelta := jsonx.AsStr(data["delta"])
-		if argsDelta == "" {
+		// Same truthiness gate as the text delta (:508-509) — the raw value
+		// rides the chunk's function.arguments.
+		argsDelta := data["delta"]
+		if !jsonx.Truthy(argsDelta) {
 			return nil
 		}
-		idx := 0
-		if itemID := jsonx.AsStr(data["item_id"]); itemID != "" {
-			if known, ok := s.RespToolChatIndex[itemID]; ok {
+		// JS `data.item_id ? map.get(item_id) : undefined` + `known ??
+		// fallback` (:511-512) — truthiness gate on the raw key, nullish
+		// rescue only for a miss.
+		idx := maxInt(0, s.ToolCallIndex-1)
+		if itemID := data["item_id"]; jsonx.Truthy(itemID) {
+			if known, ok := s.RespToolChatIndex[mapKeyOf(itemID)]; ok {
 				idx = known
-			} else {
-				idx = maxInt(0, s.ToolCallIndex-1)
 			}
-		} else {
-			idx = maxInt(0, s.ToolCallIndex-1)
 		}
 		if s.RespToolArgsEmitted == nil {
-			s.RespToolArgsEmitted = map[int]bool{}
+			s.RespToolArgsEmitted = map[string]bool{}
 		}
-		s.RespToolArgsEmitted[idx] = true
+		s.RespToolArgsEmitted[mapKeyOf(idx)] = true
 		return s.chunk(map[string]any{
 			"tool_calls": jsonx.ArrOf(jsonx.ObjOf(
 				"index", idx,
@@ -187,21 +198,35 @@ func (s *RespToChatState) Convert(chunk map[string]any) map[string]any {
 		if itemType != ItemFunctionCall && itemType != "custom_tool_call" {
 			return nil
 		}
-		key := jsonx.AsStr(jsonx.Get(item, "id"))
-		if key == "" {
-			key = jsonx.AsStr(data["item_id"])
+		// JS `const key = data.item?.id || data.item_id` (:525) — truthy
+		// chain keeping the raw value; `const idx = (key && map.get(key))
+		// ?? fallback` (:526): nullish coalescing rescues only
+		// undefined/null, so a falsy-but-present key ("" | 0 | false)
+		// survives as the chunk index itself.
+		key := jsonx.Get(item, "id")
+		if !jsonx.Truthy(key) {
+			key = data["item_id"]
 		}
-		idx := maxInt(0, s.ToolCallIndex-1)
-		if known, ok := s.RespToolChatIndex[key]; ok {
-			idx = known
+		var idx any
+		switch {
+		case key == nil:
+			idx = maxInt(0, s.ToolCallIndex-1) // undefined/null ?? fallback
+		case jsonx.Truthy(key):
+			if known, ok := s.RespToolChatIndex[mapKeyOf(key)]; ok {
+				idx = known
+			} else {
+				idx = maxInt(0, s.ToolCallIndex-1) // get() miss ?? fallback
+			}
+		default:
+			idx = key // ""/0/false are non-nullish — they stay the index
 		}
 		fullArgs, isStr := jsonx.Get(item, "arguments").(string)
 		if isStr && fullArgs != "" {
 			if s.RespToolArgsEmitted == nil {
-				s.RespToolArgsEmitted = map[int]bool{}
+				s.RespToolArgsEmitted = map[string]bool{}
 			}
-			if !s.RespToolArgsEmitted[idx] {
-				s.RespToolArgsEmitted[idx] = true
+			if !s.RespToolArgsEmitted[mapKeyOf(idx)] {
+				s.RespToolArgsEmitted[mapKeyOf(idx)] = true
 				return s.chunk(map[string]any{
 					"tool_calls": jsonx.ArrOf(jsonx.ObjOf(
 						"index", idx,
@@ -213,21 +238,41 @@ func (s *RespToChatState) Convert(chunk map[string]any) map[string]any {
 
 	case "response.completed", "response.done":
 		resp := jsonx.AsObj(data["response"])
-		respUsage := jsonx.AsObj(jsonx.Get(resp, "usage"))
+		// JS gate `responseUsage && typeof responseUsage === "object"`
+		// (:545) — typeof [] is "object" too, so arrays pass; strings,
+		// numbers and bools do not. Field reads off an array yield undefined
+		// (jsonx.Get returns nil for non-objects), matching JS.
+		var respUsage any
+		switch v := jsonx.Get(resp, "usage").(type) {
+		case map[string]any, []any:
+			respUsage = v
+		}
 		if respUsage != nil {
-			inputTokens := jsonx.AsF64(respUsage["input_tokens"])
-			if inputTokens == 0 {
-				inputTokens = jsonx.AsF64(respUsage["prompt_tokens"])
+			// `a || b || 0` chains (:546-550) keep the RAW truthy value — a
+			// numeric-string token count flows through as a string and only
+			// the buildUsage gates coerce numerically.
+			inputTokens := jsonx.Get(respUsage, "input_tokens")
+			if !jsonx.Truthy(inputTokens) {
+				inputTokens = jsonx.Get(respUsage, "prompt_tokens")
 			}
-			outputTokens := jsonx.AsF64(respUsage["output_tokens"])
-			if outputTokens == 0 {
-				outputTokens = jsonx.AsF64(respUsage["completion_tokens"])
+			if !jsonx.Truthy(inputTokens) {
+				inputTokens = float64(0)
 			}
-			cacheRead := jsonx.AsF64(jsonx.Get(respUsage["input_tokens_details"], "cached_tokens"))
-			if cacheRead == 0 {
-				cacheRead = jsonx.AsF64(respUsage["cache_read_input_tokens"])
+			outputTokens := jsonx.Get(respUsage, "output_tokens")
+			if !jsonx.Truthy(outputTokens) {
+				outputTokens = jsonx.Get(respUsage, "completion_tokens")
 			}
-			s.Usage = BuildUsage(inputTokens, outputTokens, inputTokens+outputTokens, cacheRead, 0, 0)
+			if !jsonx.Truthy(outputTokens) {
+				outputTokens = float64(0)
+			}
+			cacheRead := jsonx.Get(jsonx.Get(respUsage, "input_tokens_details"), "cached_tokens")
+			if !jsonx.Truthy(cacheRead) {
+				cacheRead = jsonx.Get(respUsage, "cache_read_input_tokens")
+			}
+			if !jsonx.Truthy(cacheRead) {
+				cacheRead = float64(0)
+			}
+			s.Usage = BuildUsage(inputTokens, outputTokens, jsAdd(inputTokens, outputTokens), cacheRead, 0, 0)
 		}
 		if !s.FinishReasonSent {
 			return s.finalChunk()
@@ -238,19 +283,28 @@ func (s *RespToChatState) Convert(chunk map[string]any) map[string]any {
 		if s.FinishReasonSent {
 			return nil
 		}
-		errObj := jsonx.AsObj(data["error"])
-		if errObj == nil {
-			errObj = jsonx.AsObj(jsonx.Get(data["response"], "error"))
+		// JS `const error = data.error || data.response?.error; if (error)`
+		// (openai-responses.js:582-584) — truthiness, not shape: string,
+		// number and bool payloads surface too; only falsy ones are dropped.
+		errVal := data["error"]
+		if !jsonx.Truthy(errVal) {
+			errVal = jsonx.Get(data["response"], "error")
 		}
-		if errObj == nil {
+		if !jsonx.Truthy(errVal) {
 			return nil
 		}
-		s.Error = errObj
+		s.Error = errVal
 		s.FinishReasonSent = true
-		msg := jsonx.AsStr(errObj["message"])
-		if msg == "" {
-			b, _ := json.Marshal(errObj)
-			msg = string(b)
+		// `[Error] ${error.message || JSON.stringify(error)}` (:590) — the
+		// `||` keeps the RAW truthy message (a numeric 429 renders "429" via
+		// template-literal ToString, not the whole-error stringify); only a
+		// falsy/missing message falls back to JSON.stringify of the payload,
+		// so a string error renders quoted ("\"rate limited\"").
+		msg := ""
+		if m := jsonx.Get(errVal, "message"); jsonx.Truthy(m) {
+			msg = jsStringOf(m)
+		} else {
+			msg = jsonStringifyOf(errVal)
 		}
 		id := s.ChatID
 		if id == "" {
@@ -264,8 +318,10 @@ func (s *RespToChatState) Convert(chunk map[string]any) map[string]any {
 			map[string]any{"content": "[Error] " + msg}, "stop")
 
 	case "response.reasoning_summary_text.delta":
-		delta := jsonx.AsStr(data["delta"])
-		if delta == "" {
+		// Same `data.delta || ""` + `!delta` gate (:599-600); reasoningDelta
+		// embeds the raw value (concerns/reasoning.js:4-8).
+		delta := data["delta"]
+		if !jsonx.Truthy(delta) {
 			return nil
 		}
 		return s.chunk(ReasoningDelta(delta), nil)

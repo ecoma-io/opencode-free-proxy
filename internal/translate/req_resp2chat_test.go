@@ -591,3 +591,254 @@ func TestChatRequestToResponsesRequestParams(t *testing.T) {
 		}`))
 	})
 }
+
+func TestResponsesToChatRequestInputGateTruthiness(t *testing.T) {
+	// JS `if (!body.input) return body` (openai-responses.js:23) — truthiness,
+	// not key presence: every falsy input value leaves the body untranslated.
+	for _, in := range []string{`""`, `0`, `false`, `null`} {
+		t.Run("falsy input "+in+" passes through", func(t *testing.T) {
+			body := jb(t, `{"model":"m","input":`+in+`}`)
+			got := ResponsesToChatRequest(body)
+			if got == nil {
+				t.Fatal("want the body back")
+			}
+			if key(got, "messages") {
+				t.Fatalf("no translation may run: %s", js(got))
+			}
+			eq(t, "input kept", got["input"], jb(t, `{"v":`+in+`}`)["v"])
+		})
+	}
+
+	t.Run("truthy non-string input still attempts normalization", func(t *testing.T) {
+		// `{"input":true}` is truthy → translation starts, the input shape is
+		// invalid → the original body escapes (JS `if (!inputItems) return
+		// body`).
+		body := jb(t, `{"input":true,"model":"m"}`)
+		got := ResponsesToChatRequest(body)
+		if got == nil {
+			t.Fatal("want the body back")
+		}
+		if key(got, "messages") {
+			t.Fatalf("invalid input shape must not add messages: %s", js(got))
+		}
+	})
+}
+
+func TestChatRequestToResponsesInputGateTruthiness(t *testing.T) {
+	// JS `if (body.input)` (openai-responses.js:323) — truthiness: only a
+	// TRUTHY input marks an already-Responses body. `input: ""` alongside
+	// chat messages runs the full translation.
+	got := ChatRequestToResponsesRequest("m", jb(t, `{
+		"input":"",
+		"messages":[{"role":"user","content":"q"}]
+	}`))
+	eq(t, "input rebuilt from messages", got["input"], ja(t, `[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"q"}]}
+	]`))
+}
+
+func TestResponsesToChatRequestTruthyRawValues(t *testing.T) {
+	t.Run("truthy non-string instructions become the system content", func(t *testing.T) {
+		// JS `if (body.instructions)` (:29) — the raw value is the content.
+		got := ResponsesToChatRequest(jb(t, `{"input":"hi","instructions":5}`))
+		eq(t, "system content", dig(t, got, "messages", 0, "role"), "system")
+		eq(t, "content", dig(t, got, "messages", 0, "content"), float64(5))
+	})
+
+	t.Run("truthy non-string type and empty role match no branch", func(t *testing.T) {
+		// JS `item.type || (item.role ? MESSAGE : null)` (:67) — type 5 is
+		// truthy so the role fallback never runs, and 5 matches no item
+		// branch; an empty role is falsy and promotes nothing.
+		got := ResponsesToChatRequest(jb(t, `{"input":[{"role":""},{"type":5,"role":"user"}]}`))
+		eq(t, "messages", got["messages"], ja(t, `[]`))
+	})
+
+	t.Run("input_image url/detail keep raw truthy values", func(t *testing.T) {
+		// JS `c.image_url || c.file_id || ""` / `c.detail || "auto"` (:89-90).
+		got := ResponsesToChatRequest(jb(t, `{"input":[{"type":"message","role":"user","content":[
+			{"type":"input_image","image_url":5,"detail":7},
+			{"type":"input_image","image_url":0,"file_id":"file_9"},
+			{"type":"input_image"}
+		]}]}`))
+		eq(t, "parts", dig(t, got, "messages", 0, "content"), ja(t, `[
+			{"type":"image_url","image_url":{"url":5,"detail":7}},
+			{"type":"image_url","image_url":{"url":"file_9","detail":"auto"}},
+			{"type":"image_url","image_url":{"url":"","detail":"auto"}}
+		]`))
+	})
+}
+
+func TestResponsesToChatRequestToolCallPayloads(t *testing.T) {
+	t.Run("custom_tool_call input null wraps as the two-character empty string", func(t *testing.T) {
+		// JS `{ input: typeof item.input === "string" ? item.input :
+		// JSON.stringify(item.input ?? "") }` (:117-118) — null ?? "" is "",
+		// and JSON.stringify("") is the two-char string `""`.
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":[{"type":"custom_tool_call","call_id":"call_c","name":"edit","input":null}]
+		}`))
+		eq(t, "arguments", dig(t, got, "messages", 0, "tool_calls", 0, "function", "arguments"),
+			`{"input":"\"\""}`)
+	})
+
+	t.Run("custom_tool_call non-string input stringifies as JSON", func(t *testing.T) {
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":[{"type":"custom_tool_call","call_id":"call_c","name":"edit","input":{"k":1}}]
+		}`))
+		eq(t, "arguments", dig(t, got, "messages", 0, "tool_calls", 0, "function", "arguments"),
+			`{"input":"{\"k\":1}"}`)
+	})
+
+	t.Run("function_call null and absent arguments coerce to {}", func(t *testing.T) {
+		// JS `JSON.stringify(toolInput ?? {})` (:125) — null becomes {},
+		// never "null".
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":[
+				{"type":"function_call","call_id":"c1","name":"f","arguments":null},
+				{"type":"function_call","call_id":"c2","name":"g"}
+			]
+		}`))
+		eq(t, "null arguments", dig(t, got, "messages", 0, "tool_calls", 0, "function", "arguments"), "{}")
+		eq(t, "absent arguments", dig(t, got, "messages", 0, "tool_calls", 1, "function", "arguments"), "{}")
+	})
+
+	t.Run("padded names are gated on trim but pushed raw and registered raw", func(t *testing.T) {
+		// JS skips on the trimmed name (:115) but pushes `item.name` raw
+		// (:124) and registers it raw — trimming would desynchronize the call
+		// from its tool declaration.
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":[
+				{"type":"function_call","call_id":"c1","name":" f ","arguments":"{}"},
+				{"type":"custom_tool_call","call_id":"c2","name":" padded ","input":"x"}
+			]
+		}`))
+		eq(t, "function_call name raw", dig(t, got, "messages", 0, "tool_calls", 0, "function", "name"), " f ")
+		eq(t, "custom name raw", dig(t, got, "messages", 0, "tool_calls", 1, "function", "name"), " padded ")
+		setOf(t, "_customToolNames", jsonx.AsArr(got["_customToolNames"]), " padded ")
+	})
+
+	t.Run("absent output drops the content key, explicit null keeps \"null\"", func(t *testing.T) {
+		// JS `typeof item.output === "string" ? item.output :
+		// JSON.stringify(item.output)` (:146) — an absent output is
+		// JSON.stringify(undefined) = undefined (key vanishes on the wire);
+		// null keeps "null".
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":[
+				{"type":"function_call_output","call_id":"c1"},
+				{"type":"function_call_output","call_id":"c2","output":null}
+			]
+		}`))
+		first := dig(t, got, "messages", 0).(map[string]any)
+		if _, has := first["content"]; has {
+			t.Fatalf("absent output must not create a content key: %s", js(first))
+		}
+		eq(t, "null output", dig(t, got, "messages", 1, "content"), "null")
+	})
+}
+
+func TestNormalizeToolParametersTruthiness(t *testing.T) {
+	// JS (openai-responses.js:275-278):
+	//   - falsy parameters → default object schema (null/0/false/"");
+	//   - a TRUTHY array passes through verbatim (truthiness is blind to shape);
+	//   - type "object" with falsy properties → properties injected as {}.
+	defaults := jb(t, `{"type":"object","properties":{}}`)
+
+	t.Run("responses→chat tools", func(t *testing.T) {
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":"hi",
+			"tools":[
+				{"type":"function","name":"a","parameters":{"type":"object","properties":null}},
+				{"type":"function","name":"b","parameters":[]},
+				{"type":"function","name":"c","parameters":0},
+				{"type":"function","name":"d","parameters":""}
+			]
+		}`))
+		eq(t, "falsy properties injected", dig(t, got, "tools", 0, "function", "parameters"), defaults)
+		eq(t, "truthy array verbatim", dig(t, got, "tools", 1, "function", "parameters"), ja(t, `[]`))
+		eq(t, "falsy 0 default", dig(t, got, "tools", 2, "function", "parameters"), defaults)
+		eq(t, "falsy empty string default", dig(t, got, "tools", 3, "function", "parameters"), defaults)
+	})
+
+	t.Run("chat→responses tools", func(t *testing.T) {
+		got := ChatRequestToResponsesRequest("m", jb(t, `{
+			"messages":[{"role":"user","content":"q"}],
+			"tools":[
+				{"type":"function","function":{"name":"a","parameters":{"type":"object","properties":null}}},
+				{"type":"function","function":{"name":"b","parameters":[]}},
+				{"type":"function","function":{"name":"c","parameters":false}}
+			]
+		}`))
+		eq(t, "falsy properties injected", dig(t, got, "tools", 0, "parameters"), defaults)
+		eq(t, "truthy array verbatim", dig(t, got, "tools", 1, "parameters"), ja(t, `[]`))
+		eq(t, "falsy false default", dig(t, got, "tools", 2, "parameters"), defaults)
+	})
+}
+
+func TestResponsesToChatRequestToolFunctionTruthiness(t *testing.T) {
+	// JS `if (tool.function) return tool` (openai-responses.js:189) —
+	// truthiness: null falls through to the Responses-tool conversion, while
+	// a truthy array (also not chat shape) passes verbatim.
+	t.Run("null function converts as a flat Responses tool", func(t *testing.T) {
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":"hi",
+			"tools":[{"type":"function","function":null,"name":"flat","description":"d"}]
+		}`))
+		eq(t, "tool", dig(t, got, "tools", 0), jb(t, `{
+			"type":"function",
+			"function":{"name":"flat","description":"d","parameters":{"type":"object","properties":{}}}
+		}`))
+	})
+
+	t.Run("truthy array function passes through verbatim", func(t *testing.T) {
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":"hi",
+			"tools":[{"type":"function","function":[],"name":"flat"}]
+		}`))
+		eq(t, "tool", dig(t, got, "tools", 0), jb(t, `{
+			"type":"function","function":[],"name":"flat"
+		}`))
+	})
+
+	t.Run("custom-tool format hint and description coerce like String()", func(t *testing.T) {
+		// JS `[syntax, definition].filter(Boolean).join("\n")` (:198) —
+		// truthy non-strings stringify through join; `String(tool.description
+		// || "")` (:203) coerces numerics.
+		got := ResponsesToChatRequest(jb(t, `{
+			"input":"hi",
+			"tools":[{"type":"custom","name":"edit","description":7,
+				"format":{"syntax":5,"definition":null}}]
+		}`))
+		eq(t, "description", dig(t, got, "tools", 0, "function", "description"), "7\n\n5")
+	})
+}
+
+func TestChatRequestToResponsesContentPartTruthiness(t *testing.T) {
+	// JS `const text = c.text || c.content || JSON.stringify(c)` then
+	// `typeof text === "string" ? text : JSON.stringify(text)`
+	// (openai-responses.js:381-382) — truthy chains keeping raw values.
+	got := ChatRequestToResponsesRequest("m", jb(t, `{
+		"messages":[{"role":"user","content":[
+			{"type":"weird","text":5},
+			{"type":"weird","text":"","content":true},
+			{"type":"weird"},
+			{"type":"weird","text":false,"content":0}
+		]}]
+	}`))
+	parts := dig(t, got, "input", 0, "content").([]any)
+	eq(t, "numeric text", dig(t, parts[0], "text"), "5")
+	eq(t, "truthy bool content", dig(t, parts[1], "text"), "true")
+	eq(t, "all falsy stringify whole part", dig(t, parts[2], "text"), `{"type":"weird"}`)
+	eq(t, "explicit falsy values stringify whole part", dig(t, parts[3], "text"), `{"content":0,"text":false,"type":"weird"}`)
+}
+
+func TestChatRequestToResponsesInstructionsFilterBoolean(t *testing.T) {
+	// JS extractInstructionsText: `.filter(Boolean).join("\n")`
+	// (openai-responses.js:260-270) — empty texts drop out instead of
+	// contributing blank lines.
+	got := ChatRequestToResponsesRequest("m", jb(t, `{
+		"messages":[
+			{"role":"system","content":[{"type":"text","text":""},{"type":"text","text":"a"},{"type":"text","text":""}]},
+			{"role":"user","content":"q"}
+		]
+	}`))
+	eq(t, "instructions", got["instructions"], "a")
+}

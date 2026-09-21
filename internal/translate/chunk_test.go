@@ -27,35 +27,40 @@ func TestBuildChunk(t *testing.T) {
 }
 
 func TestBuildUsage(t *testing.T) {
+	// Counters arrive as decoded JSON numbers (float64) or the JS `|| 0`
+	// fallback; BuildUsage embeds them verbatim and only the detail gates
+	// coerce numerically.
+	f := func(n int) any { return float64(n) }
+
 	t.Run("bare counters only when every detail is zero", func(t *testing.T) {
-		eq(t, "usage", BuildUsage(10, 5, 15, 0, 0, 0), jb(t, `{
+		eq(t, "usage", BuildUsage(f(10), f(5), f(15), f(0), f(0), f(0)), jb(t, `{
 			"prompt_tokens":10,"completion_tokens":5,"total_tokens":15
 		}`))
 	})
 
 	t.Run("cached tokens produce prompt_tokens_details.cached_tokens", func(t *testing.T) {
-		eq(t, "usage", BuildUsage(120, 5, 125, 80, 0, 0), jb(t, `{
+		eq(t, "usage", BuildUsage(f(120), f(5), f(125), f(80), f(0), f(0)), jb(t, `{
 			"prompt_tokens":120,"completion_tokens":5,"total_tokens":125,
 			"prompt_tokens_details":{"cached_tokens":80}
 		}`))
 	})
 
 	t.Run("cache creation tokens share the prompt details block", func(t *testing.T) {
-		eq(t, "usage", BuildUsage(120, 5, 125, 0, 7, 0), jb(t, `{
+		eq(t, "usage", BuildUsage(f(120), f(5), f(125), f(0), f(7), f(0)), jb(t, `{
 			"prompt_tokens":120,"completion_tokens":5,"total_tokens":125,
 			"prompt_tokens_details":{"cache_creation_tokens":7}
 		}`))
 	})
 
 	t.Run("cached and cache creation combine", func(t *testing.T) {
-		eq(t, "usage", BuildUsage(120, 5, 125, 80, 7, 0), jb(t, `{
+		eq(t, "usage", BuildUsage(f(120), f(5), f(125), f(80), f(7), f(0)), jb(t, `{
 			"prompt_tokens":120,"completion_tokens":5,"total_tokens":125,
 			"prompt_tokens_details":{"cached_tokens":80,"cache_creation_tokens":7}
 		}`))
 	})
 
 	t.Run("reasoning tokens produce completion_tokens_details", func(t *testing.T) {
-		eq(t, "usage", BuildUsage(10, 30, 40, 0, 0, 9), jb(t, `{
+		eq(t, "usage", BuildUsage(f(10), f(30), f(40), f(0), f(0), f(9)), jb(t, `{
 			"prompt_tokens":10,"completion_tokens":30,"total_tokens":40,
 			"completion_tokens_details":{"reasoning_tokens":9}
 		}`))
@@ -63,8 +68,25 @@ func TestBuildUsage(t *testing.T) {
 
 	t.Run("zero reasoning adds no details block", func(t *testing.T) {
 		// JS: `if (reasoningTokens > 0)` — 0 stays absent.
-		got := BuildUsage(10, 30, 40, 0, 0, 0)
+		got := BuildUsage(f(10), f(30), f(40), f(0), f(0), f(0))
 		if _, has := got["completion_tokens_details"]; has {
+			t.Fatalf("no details block expected: %s", js(got))
+		}
+	})
+
+	t.Run("numeric-string counters keep their type and pass the > 0 gate", func(t *testing.T) {
+		// JS buildUsage embeds the raw value (usage.js:4) and only the
+		// detail gates coerce: "80" > 0 is numerically true.
+		eq(t, "usage", BuildUsage("120", f(5), "125", "80", f(0), f(0)), jb(t, `{
+			"prompt_tokens":"120","completion_tokens":5,"total_tokens":"125",
+			"prompt_tokens_details":{"cached_tokens":"80"}
+		}`))
+	})
+
+	t.Run("non-numeric strings never open a details block", func(t *testing.T) {
+		// JS `"abc" > 0` is NaN > 0 → false.
+		got := BuildUsage("abc", f(5), "abc5", "abc", f(0), f(0))
+		if _, has := got["prompt_tokens_details"]; has {
 			t.Fatalf("no details block expected: %s", js(got))
 		}
 	})

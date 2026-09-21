@@ -138,6 +138,19 @@ func TestStripOpenAIKeepsNonArrayContentAndStringContent(t *testing.T) {
 	}
 }
 
+func TestStripOpenAINonArrayImagesSurvives(t *testing.T) {
+	// modality.js:66 deletes msg.images only when `Array.isArray(msg.images)`
+	// — a non-array images value is not attachments metadata and survives the
+	// vision strip untouched.
+	body := jb(t, `{"messages":[{"role":"user","content":"hi","images":"not-a-list"}]}`)
+	StripUnsupportedModalities(body, false, caps.Modality{})
+	eq(t, "non-array images kept", msgAt(t, body, 0)["images"], "not-a-list")
+
+	objBody := jb(t, `{"messages":[{"role":"user","content":"hi","images":{"url":"https://x/1.png"}}]}`)
+	StripUnsupportedModalities(objBody, false, caps.Modality{})
+	eq(t, "object images kept", msgAt(t, objBody, 0)["images"], jb(t, `{"url":"https://x/1.png"}`))
+}
+
 func TestStripResponsesInput(t *testing.T) {
 	// modality.js:96-109 — input[].content[] with input_image/input_file.
 	body := jb(t, `{"input":[

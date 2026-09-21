@@ -142,7 +142,12 @@ func stripOpenAIMessages(body map[string]any, m caps.Modality) {
 		}
 		if !m.Vision {
 			// modality.js:65-77 — key deletions/filters gated on vision only.
-			delete(msg, "images") // :66 (the JS Array.isArray guard is a no-op filter)
+			// :66 deletes msg.images only when it IS an array
+			// (`Array.isArray(msg.images)`) — a non-array images value is
+			// not attachments metadata and survives the strip.
+			if jsonx.AsArr(msg["images"]) != nil {
+				delete(msg, "images")
+			}
 			stripImageAttachments(msg, "experimental_attachments")
 			stripImageAttachments(msg, "attachments")
 		}
