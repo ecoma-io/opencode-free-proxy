@@ -6,13 +6,17 @@ package router
 // untouched (the raw id still travels to the provider, byte for byte).
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+
+	"opencode-free-proxy/internal/logging"
 )
 
 // TestRelayModelIDCannotForgeLogLines drives a model id containing a raw
@@ -92,5 +96,52 @@ routes:
 	}
 	if !found {
 		t.Fatalf("no completion line quotes the escaped model id %q; logs: %v", want, logs)
+	}
+}
+
+// TestUpstreamErrorMessageCannotForgeLogLines extends the guard to the
+// evidence layer: an upstream error body carrying CRLF (the second
+// attacker-controlled text source after the model id) must reach the
+// upstream_error event sanitized — control bytes gone, message intact.
+func TestUpstreamErrorMessageCannotForgeLogLines(t *testing.T) {
+	hostile := "rate limited\r\nFAKE log line: egress=ghost status=200"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"error":{"message":%q}}`, hostile))
+	}))
+	defer up.Close()
+
+	var buf bytes.Buffer
+	_, mux := evidenceRouter(t, logging.New(&buf), fmt.Sprintf(`
+upstream:
+  base: %q
+egress:
+  - {id: a}
+routes:
+  - {id: default, egress: [a]}
+`, up.URL))
+
+	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if strings.ContainsAny(line, "\r") {
+			t.Fatalf("log line contains a raw CR (forgeable): %q", line)
+		}
+		// Every line must parse as exactly one JSON object: a forged line
+		// injected via the message would break the framing.
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unparsable (possibly forged) log line: %q: %v", line, err)
+		}
+	}
+	errs := eventsWith(decodeEvents(t, &buf), "upstream_error")
+	if len(errs) != 1 {
+		t.Fatalf("upstream_error events = %d, want 1", len(errs))
+	}
+	if got := errs[0]["message"]; got != "rate limited FAKE log line: egress=ghost status=200" {
+		t.Fatalf("message = %v, want the sanitized text with control bytes folded", got)
 	}
 }

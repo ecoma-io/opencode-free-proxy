@@ -3,11 +3,13 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"opencode-free-proxy/internal/cloak"
 	"opencode-free-proxy/internal/config"
@@ -40,11 +42,17 @@ const maxNonSSEBodyBytes = 1 << 20
 // upstream formats differ, passthrough otherwise. Responses passthrough
 // synthesizes response.failed + [DONE] when the stream aborts or stalls
 // before a terminal event (buildAbortedResponsesTerminalBytes).
-func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Response, cancelUpstream context.CancelFunc, sourceFormat, targetFormat relay.Format, body map[string]any, upstreamModel string, customToolNames map[string]bool, intent *cloak.ThinkingCfg) {
+//
+// ev/egID exist for the evidence layer: a stream that dies after headers is
+// recorded as a response_started phase row (never an HTTP verdict —
+// commitment was made when the executor returned the live response; no
+// fallback, no health mark).
+func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Response, cancelUpstream context.CancelFunc, ev *evidenceLog, egID string, sourceFormat, targetFormat relay.Format, body map[string]any, upstreamModel string, customToolNames map[string]bool, intent *cloak.ThinkingCfg) {
 	defer cancelUpstream()
 	// Retry/error/forced paths close explicitly; this covers the relay paths
 	// (base.js consumes or cancels the body either way).
 	defer func() { _ = resp.Body.Close() }()
+	started := time.Now()
 
 	// Non-SSE upstream body (Cloudflare 5xx HTML page): return a clean JSON
 	// error instead of piping garbage through the SSE path
@@ -56,6 +64,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	if ct != "" && !strings.Contains(ct, "text/event-stream") && !strings.Contains(ct, "application/json") {
 		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxNonSSEBodyBytes))
 		short := shortHTMLMessage(string(bodyText), ct)
+		ev.StreamAbort(egID, resp.StatusCode, "non_sse_body", time.Since(started).Milliseconds())
 		writeBareStreamError(w, resp.StatusCode, fmt.Sprintf("[%d]: %s", resp.StatusCode, short))
 		return
 	}
@@ -77,6 +86,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	// ctx cancellation releases the upstream connection on stall/teardown.
 	lineErr := upstream.ScanLines(r.Context(), resp.Body, config.StreamStall, streamRelay.ProcessLine, streamRelay.ProcessTail)
 	if lineErr != nil {
+		ev.StreamAbort(egID, resp.StatusCode, streamAbortReason(r.Context(), lineErr), time.Since(started).Milliseconds())
 		// Stall, transport failure, or client disconnect mid-stream: a
 		// Responses passthrough client still needs a parseable terminal.
 		if isResponsesPassthrough {
@@ -89,6 +99,20 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	if err := streamRelay.Flush(); err != nil {
 		_ = resp.Body.Close()
 	}
+}
+
+// streamAbortReason reduces a ScanLines failure to its bounded phase label:
+// the request context died (client disconnected), the stall watchdog fired
+// (ScanLines' "stream stalled:" sentinel), or the body read itself errored.
+// A label, never a message — the raw error text can carry topology.
+func streamAbortReason(ctx context.Context, err error) string {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return "client_disconnect"
+	}
+	if strings.HasPrefix(err.Error(), "stream stalled:") {
+		return "stall"
+	}
+	return "read_error"
 }
 
 // shortHTMLMessage sanitizes an upstream HTML error page into a short

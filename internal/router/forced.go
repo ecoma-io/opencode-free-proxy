@@ -42,8 +42,9 @@ func forcedUpstreamIsSSE(resp *http.Response) bool {
 // site (forcedUpstreamIsSSE above); reaching this function with a non-SSE
 // body is the JS parse-failure case, which answers 502 below
 // (sseToJsonHandler.js "Failed to convert streaming response to JSON").
-func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *http.Response, sourceFormat, targetFormat relay.Format, model string, customToolNames map[string]bool, reqBody map[string]any, upstreamModel string, intent *cloak.ThinkingCfg) {
+func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *http.Response, ev *evidenceLog, egID string, sourceFormat, targetFormat relay.Format, model string, customToolNames map[string]bool, reqBody map[string]any, upstreamModel string, intent *cloak.ThinkingCfg) {
 	defer func() { _ = resp.Body.Close() }()
+	started := time.Now()
 
 	// The read is bounded BOTH ways (hardening with no JS counterpart —
 	// sseToJsonHandler.js:306 `await providerResponse.text()` leans on
@@ -54,12 +55,10 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	// indefinitely) and a total byte cap (config.MaxForcedSSEBytes). Either
 	// bound answers the same 502 envelope as any other forced-conversion
 	// failure (sseToJsonHandler.js:308-313, 373-376); the specific reason goes
-	// to the log only.
+	// to the evidence stream only.
 	raw, err := readBoundedSSE(r.Context(), resp.Body, config.MaxForcedSSEBytes, config.StreamStall)
 	if err != nil {
-		if errors.Is(err, errForcedSSEStall) || errors.Is(err, errForcedSSETooLarge) {
-			s.log.Warn().Err(err).Msg("forced SSE→JSON aborted")
-		}
+		ev.ForcedAbort(egID, forcedAbortReason(r, err), time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, "Failed to convert streaming response to JSON")
 		return
 	}
@@ -84,10 +83,14 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	// Standard Chat Completions SSE path.
 	parsed, errBody, ok := relay.ParseSSEToOpenAIResponse(string(raw), model)
 	if !ok {
+		ev.ForcedAbort(egID, "convert", time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, "Invalid SSE response for non-streaming request")
 		return
 	}
 	if errBody != nil {
+		// The stream itself carried an error frame — an upstream failure that
+		// began mid-stream (after the 200 headers), recorded as such.
+		ev.ForcedAbort(egID, "sse_error_frame", time.Since(started).Milliseconds())
 		msg, _ := errBody["message"].(string)
 		if msg == "" {
 			msg = "Upstream SSE stream failed"
@@ -127,11 +130,28 @@ func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
 
 // errForcedSSEStall / errForcedSSETooLarge are the two bounded-read
 // violations. Both surface to the client as the generic forced-conversion 502;
-// they are distinguished only in the log (the client never learns internals).
+// they are distinguished only in the evidence stream (the client never learns
+// internals).
 var (
 	errForcedSSEStall    = errors.New("upstream SSE stalled: no bytes within the stall deadline")
 	errForcedSSETooLarge = errors.New("upstream SSE response exceeded the forced-conversion size cap")
 )
+
+// forcedAbortReason reduces a bounded-read failure to its phase label:
+// stall, size cap, client cancel (the request context died), or a read error
+// from the body itself.
+func forcedAbortReason(r *http.Request, err error) string {
+	switch {
+	case errors.Is(err, errForcedSSEStall):
+		return "stall"
+	case errors.Is(err, errForcedSSETooLarge):
+		return "too_large"
+	case r.Context().Err() != nil || errors.Is(err, context.Canceled):
+		return "cancel"
+	default:
+		return "read"
+	}
+}
 
 // readBoundedSSE drains an upstream SSE body under three abort conditions:
 //
