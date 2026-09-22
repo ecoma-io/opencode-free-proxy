@@ -676,20 +676,30 @@ func TestAllTransportsCarryIdleConnTimeout(t *testing.T) {
 	check(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://127.0.0.1:9"})), "NewClientFor(socks5)")
 }
 
-// TestDirectPathsBoundDialAndTLS is the structural pin for
-// config.DialTimeout / config.TLSHandshakeTimeout: every transport that
-// dials or handshakes ITSELF must carry both bounds — before them, only
-// ResponseHeaderTimeout was set, so a blackholed dial or origin TLS
-// handshake hung with no phase bound at all (the JS fetch bounds all phases
-// with one abort signal; see the constants' doc). A behavioral blackhole
-// test would need the full 60 s budget per phase, so the pin is structural.
+// TestDirectPathsBoundDialAndTLS is the structural pin for the per-transport
+// dial/handshake ownership table (issue #48 reshaped it):
 //
-// The tunneled CONNECT transport is the deliberate exception: its
-// DialTLSContext owns dial + CONNECT + origin TLS under one conn deadline
-// (connect.go), so it must carry DialTLSContext and neither stdlib dial
-// field.
+//   - direct (NewClient + NewClientFor(nil)) and socks5: DialContext bounds
+//     the TCP/SOCKS dial (config.DialTimeout / socks5.go's own deadline);
+//     DialTLSContext performs the origin handshake in the official client's
+//     hello (hello.go) under originTLSDialer's own 60s budget. stdlib never
+//     dials or handshakes on these transports, so TLSHandshakeTimeout and
+//     ForceAttemptHTTP2 must be ABSENT — dead config lies (pre-parity these
+//     carried config.TLSHandshakeTimeout, bounding a stdlib handshake that
+//     DialTLSContext had already replaced).
+//   - http-origin-via-proxy (viaProxy): stdlib still owns the TCP dial and
+//     the TLS hop to an https PROXY ENDPOINT (origin TLS never rides this
+//     transport — attempt/redirect pick the tunneled one for https), so both
+//     stdlib fields stay.
+//   - the tunneled CONNECT transport: DialTLSContext owns dial + CONNECT +
+//     origin TLS under one conn deadline (connect.go); no stdlib dial field.
+//
+// A behavioral blackhole test would need the full 60 s budget per phase, so
+// the pin is structural.
 func TestDirectPathsBoundDialAndTLS(t *testing.T) {
-	selfDialing := func(c *Client, which string) {
+	// utls-backed origin dial: raw dial bound, origin TLS owned by
+	// DialTLSContext, stdlib TLS fields absent.
+	utlsDialing := func(c *Client, which string) {
 		t.Helper()
 		tr, ok := c.HTTP.Transport.(*http.Transport)
 		if !ok {
@@ -698,24 +708,43 @@ func TestDirectPathsBoundDialAndTLS(t *testing.T) {
 		if tr.DialContext == nil {
 			t.Errorf("%s: DialContext is nil — the TCP dial is unbounded", which)
 		}
-		if tr.TLSHandshakeTimeout != config.TLSHandshakeTimeout {
-			t.Errorf("%s: TLSHandshakeTimeout = %v, want %v", which, tr.TLSHandshakeTimeout, config.TLSHandshakeTimeout)
+		if tr.DialTLSContext == nil {
+			t.Errorf("%s: DialTLSContext is nil — the origin handshake is not the official client's hello (hello.go)", which)
+		}
+		if tr.TLSHandshakeTimeout != 0 {
+			t.Errorf("%s: TLSHandshakeTimeout = %v — stdlib never handshakes here (DialTLSContext does); dead config", which, tr.TLSHandshakeTimeout)
+		}
+		if tr.ForceAttemptHTTP2 {
+			t.Errorf("%s: ForceAttemptHTTP2 set — the official client offers http/1.1 only and stdlib never upgrades a non-*tls.Conn; dead config", which)
 		}
 	}
-	selfDialing(NewClient(), "NewClient")
-	selfDialing(noSleepClient(NewClientFor(nil)), "NewClientFor(direct)")
-	selfDialing(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: "http://127.0.0.1:9"})), "NewClientFor(http)")
-	selfDialing(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://127.0.0.1:9"})), "NewClientFor(socks5)")
+	utlsDialing(NewClient(), "NewClient")
+	utlsDialing(noSleepClient(NewClientFor(nil)), "NewClientFor(direct)")
+	utlsDialing(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://127.0.0.1:9"})), "NewClientFor(socks5)")
 
+	// The http-origin transport through an HTTP(S) proxy: stdlib owns the
+	// dial and the PROXY-hop TLS (https proxy endpoints), so both stdlib
+	// bounds stay — this is the one transport where they are live.
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: "http://127.0.0.1:9"}))
-	tr, ok := c.tunneled.Transport.(*http.Transport)
+	tr, ok := c.HTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("NewClientFor(http): transport is %T, want *http.Transport", c.HTTP.Transport)
+	}
+	if tr.DialContext == nil {
+		t.Error("NewClientFor(http): DialContext is nil — the proxy dial is unbounded")
+	}
+	if tr.TLSHandshakeTimeout != config.TLSHandshakeTimeout {
+		t.Errorf("NewClientFor(http): TLSHandshakeTimeout = %v, want %v (bounds the stdlib-owned https-proxy-endpoint hop)", tr.TLSHandshakeTimeout, config.TLSHandshakeTimeout)
+	}
+
+	tun, ok := c.tunneled.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("tunneled: transport is %T, want *http.Transport", c.tunneled.Transport)
 	}
-	if tr.DialTLSContext == nil {
+	if tun.DialTLSContext == nil {
 		t.Error("tunneled: DialTLSContext is nil — the CONNECT boundary (connect.go) must own the dial")
 	}
-	if tr.DialContext != nil || tr.TLSHandshakeTimeout != 0 {
-		t.Errorf("tunneled: carries stdlib dial fields (DialContext=%v TLSHandshakeTimeout=%v); DialTLSContext makes them dead config", tr.DialContext != nil, tr.TLSHandshakeTimeout)
+	if tun.DialContext != nil || tun.TLSHandshakeTimeout != 0 || tun.ForceAttemptHTTP2 {
+		t.Errorf("tunneled: carries stdlib dial fields (DialContext=%v TLSHandshakeTimeout=%v ForceAttemptHTTP2=%v); DialTLSContext makes them dead config", tun.DialContext != nil, tun.TLSHandshakeTimeout, tun.ForceAttemptHTTP2)
 	}
 }

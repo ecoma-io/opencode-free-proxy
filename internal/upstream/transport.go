@@ -42,12 +42,19 @@ import (
 func NewClientFor(p *config.Proxy) (*Client, error) {
 	c := &Client{Sleep: time.Sleep, Now: time.Now, followRedirects: true}
 	if p == nil {
+		// Issue #48: the origin handshake speaks the official client's
+		// ClientHello (hello.go) via DialTLSContext. Deliberately NO
+		// TLSHandshakeTimeout — stdlib never handshakes here;
+		// originTLSDialer bounds the handshake with the same 60s budget
+		// config.TLSHandshakeTimeout carries — and NO ForceAttemptHTTP2:
+		// the official client offers http/1.1 only, and stdlib never
+		// upgrades a non-*tls.Conn anyway (dead config lies).
+		dialer := &net.Dialer{Timeout: config.DialTimeout}
 		tr := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
-			DialContext:           (&net.Dialer{Timeout: config.DialTimeout}).DialContext,
-			TLSHandshakeTimeout:   config.TLSHandshakeTimeout,
-			ForceAttemptHTTP2:     true,
+			DialContext:           dialer.DialContext,
+			DialTLSContext:        originTLSDialer(dialer.DialContext, func() *tls.Config { return c.TLSConfig }),
 		}
 		c.HTTP = &http.Client{Transport: tr}
 		return c, nil
@@ -83,29 +90,35 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		// dialer closure, not the transport. Deliberately NO DialContext
 		// and NO TLSHandshakeTimeout here: this transport never dials or
 		// handshakes itself — DialTLSContext does both (dial to proxy +
-		// CONNECT + origin TLS) under the single conn deadline connect.go
-		// arms, and an extra dialer on this transport could never fire.
+		// CONNECT + origin TLS in the official client's hello, hello.go)
+		// under the single conn deadline connect.go arms, and an extra
+		// dialer on this transport could never fire. No ForceAttemptHTTP2
+		// either: the dialer returns a non-*tls.Conn that never negotiates
+		// h2 (ALPN parity with the official client — issue #48), and
+		// stdlib's h2 dispatch never fires off a non-*tls.Conn regardless.
 		tunneled := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
-			ForceAttemptHTTP2:     true,
 			DialTLSContext:        newConnectDialer(u, func() *tls.Config { return c.TLSConfig }).DialTLSContext,
 		}
 		c.HTTP = &http.Client{Transport: viaProxy}
 		c.tunneled = &http.Client{Transport: tunneled}
 	case config.ProxySOCKS5:
 		// The socks5 dialer bounds its own TCP dial + SOCKS handshake under
-		// one conn deadline (socks5.go); TLSHandshakeTimeout here bounds the
-		// ORIGIN TLS handshake the transport performs on the returned conn —
-		// before this, an https origin whose tunnel came up but whose TLS
-		// handshake blackholed hung with no bound at all (only
-		// ResponseHeaderTimeout was set, and it starts after the handshake).
+		// one conn deadline (socks5.go). Both schemes ride the SAME dialer:
+		// http origins through DialContext, https origins through
+		// DialTLSContext, which adds the origin TLS handshake in the
+		// official client's hello (hello.go, issue #48) — bounded by
+		// originTLSDialer's own conn deadline (the pre-parity gap this
+		// branch closed, an https origin whose tunnel came up but whose TLS
+		// handshake blackholed, stays closed). No TLSHandshakeTimeout /
+		// ForceAttemptHTTP2: stdlib never handshakes or upgrades here.
+		socks := newSocks5Dialer(u)
 		tr := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
-			TLSHandshakeTimeout:   config.TLSHandshakeTimeout,
-			ForceAttemptHTTP2:     true,
-			DialContext:           newSocks5Dialer(u).DialContext,
+			DialContext:           socks.DialContext,
+			DialTLSContext:        originTLSDialer(socks.DialContext, func() *tls.Config { return c.TLSConfig }),
 		}
 		c.HTTP = &http.Client{Transport: tr}
 	default:

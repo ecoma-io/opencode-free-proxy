@@ -308,11 +308,12 @@ func newProxyAuthFixture(t *testing.T) *proxyAuthFixture {
 		t.Fatal(err)
 	}
 	a.Sleep = func(time.Duration) {}
-	// b is DIRECT, so its origin trust rides the transport's TLSClientConfig
-	// (Client.TLSConfig only feeds the tunneled CONNECT boundary).
+	// b is DIRECT; since issue #48 the Client.TLSConfig seam feeds EVERY
+	// origin handshake (direct, socks5, tunneled CONNECT alike), so the
+	// root pool rides the same seam the router uses in production.
 	b := NewClient()
 	b.Sleep = func(time.Duration) {}
-	b.HTTP.Transport.(*http.Transport).TLSClientConfig = &tls.Config{RootCAs: pool}
+	b.TLSConfig = &tls.Config{RootCAs: pool}
 	clients := map[string]*Client{"a": a, "b": b}
 
 	rt := fixtureRuntime(map[string]int{"a": 200, "b": 200})

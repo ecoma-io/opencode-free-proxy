@@ -39,8 +39,9 @@ const maxConnectHeaderBytes = 10 << 20
 //	other non-200  → plain error                (ClassConnectionError)
 //	200            → TLS to the ORIGIN over the tunnel
 //
-// The returned conn is a handshaken *tls.Conn so the transport reads
-// ConnectionState for HTTP/2 negotiation (ForceAttemptHTTP2). The whole
+// The returned conn is a handshaken *utls.UConn speaking the official
+// client's origin hello (hello.go, issue #48); the transport speaks HTTP/1.1
+// over it — ALPN parity with the official client, never h2. The whole
 // dial+CONNECT+TLS sequence is bounded by one conn deadline — mirroring
 // socks5.go, whose handshake has exactly the same stranding hazard.
 //
@@ -110,14 +111,17 @@ func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net
 		return nil, err
 	}
 
-	// Origin TLS through the tunnel. ServerName comes from the dial addr
-	// (the transport cannot know it — from its view this is a direct
-	// connection); h2 is offered so the negotiated protocol flows through
-	// ConnectionState like a direct https dial.
-	cfg := d.originTLSConfig(addr)
-	tlsConn := tls.Client(conn, cfg)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = conn.Close()
+	// Origin TLS through the tunnel, in the official client's hello
+	// (hello.go, issue #48): ServerName from the dial addr (the transport
+	// cannot know it — from its view this is a direct connection), ALPN
+	// http/1.1 only. handshakeOrigin closes the conn itself on failure, so
+	// unlike the hops above there is no explicit Close on this error path.
+	var base *tls.Config
+	if d.tlsConfig != nil {
+		base = d.tlsConfig()
+	}
+	tlsConn, err := handshakeOrigin(ctx, conn, originTLSConfig(base, addr))
+	if err != nil {
 		return nil, fmt.Errorf("proxy tunnel: origin tls %s: %w", addr, err)
 	}
 	_ = conn.SetDeadline(time.Time{}) // caller owns the conn from here
@@ -207,30 +211,6 @@ func (d *connectDialer) proxyTLSConfig() *tls.Config {
 			cfg.ServerName = d.proxy.Hostname()
 		}
 		floorTLS(cfg)
-	}
-	return cfg
-}
-
-// originTLSConfig clones the client TLS settings for the origin hop,
-// pinning ServerName to the dialed host, offering h2 + http/1.1, and
-// flooring the minimum on the literal and on every injected clone.
-func (d *connectDialer) originTLSConfig(addr string) *tls.Config {
-	cfg := &tls.Config{NextProtos: []string{"h2", "http/1.1"}, MinVersion: tlsMinVersion}
-	if d.tlsConfig != nil {
-		if base := d.tlsConfig(); base != nil {
-			cfg = base.Clone()
-			if cfg.ServerName == "" {
-				if host, _, err := net.SplitHostPort(addr); err == nil {
-					cfg.ServerName = host
-				}
-			}
-			if len(cfg.NextProtos) == 0 {
-				cfg.NextProtos = []string{"h2", "http/1.1"}
-			}
-			floorTLS(cfg)
-		}
-	} else if host, _, err := net.SplitHostPort(addr); err == nil {
-		cfg.ServerName = host
 	}
 	return cfg
 }

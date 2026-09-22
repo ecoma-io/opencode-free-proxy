@@ -79,10 +79,11 @@ type Client struct {
 	// Set by NewClientFor; NewClient leaves it false so stdlib follows.
 	followRedirects bool
 
-	// TLSConfig holds the ORIGIN TLS settings for the tunneled CONNECT
-	// transport (and, cloned in, the proxy hop when the proxy endpoint is
-	// itself https). Tests inject a root pool for self-signed fixtures;
-	// production leaves it nil (system roots). Set before first use.
+	// TLSConfig holds the ORIGIN TLS settings for every origin handshake
+	// (direct, SOCKS5-tunneled, and CONNECT-tunneled; cloned in, also the
+	// proxy hop when the proxy endpoint is itself https). Tests inject a
+	// root pool for self-signed fixtures; production leaves it nil (system
+	// roots). Set before first use.
 	TLSConfig *tls.Config
 }
 
@@ -91,23 +92,23 @@ type Client struct {
 // headers; the SSE body itself streams unbounded). The direct transport: no
 // proxy, no credentials. IdleConnTimeout is on every transport for the reason
 // config.IdleConnTimeout states (no GC finalizer ever reaps a pooled conn);
-// DialTimeout/TLSHandshakeTimeout bound the phases ResponseHeaderTimeout
-// cannot reach (see their doc in internal/config — the JS fetch bounds all
-// phases with one abort signal).
+// DialTimeout bounds the phase ResponseHeaderTimeout cannot reach (see its
+// doc in internal/config — the JS fetch bounds all phases with one abort
+// signal), and the origin TLS handshake speaks the official client's hello
+// under its own 60s budget (hello.go, issue #48) — stdlib never handshakes
+// here, so TLSHandshakeTimeout/ForceAttemptHTTP2 would be dead config.
 func NewClient() *Client {
-	return &Client{
-		HTTP: &http.Client{
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: config.ConnectTimeout,
-				IdleConnTimeout:       config.IdleConnTimeout,
-				DialContext:           (&net.Dialer{Timeout: config.DialTimeout}).DialContext,
-				TLSHandshakeTimeout:   config.TLSHandshakeTimeout,
-				ForceAttemptHTTP2:     true,
-			},
+	c := &Client{Sleep: time.Sleep, Now: time.Now}
+	dialer := &net.Dialer{Timeout: config.DialTimeout}
+	c.HTTP = &http.Client{
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: config.ConnectTimeout,
+			IdleConnTimeout:       config.IdleConnTimeout,
+			DialContext:           dialer.DialContext,
+			DialTLSContext:        originTLSDialer(dialer.DialContext, func() *tls.Config { return c.TLSConfig }),
 		},
-		Sleep: time.Sleep,
-		Now:   time.Now,
 	}
+	return c
 }
 
 // UpstreamError is the client-facing failure after parsing an upstream error
