@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.7.0...v0.8.0) (2026-09-22)
+
+
+### Features
+
+* **upstream:** origin TLS ClientHello parity with the official opencode client ([#49](https://github.com/ecoma-io/opencode-free-proxy/issues/49)) ([6d169e4](https://github.com/ecoma-io/opencode-free-proxy/commit/6d169e489909e5ac918d073d31c1bfc2ac98f3da))
+
 ## [0.7.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.6.0...v0.7.0) (2026-09-22)
 
 
