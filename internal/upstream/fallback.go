@@ -83,6 +83,25 @@ func (b *slotReleaseBody) Close() error {
 	return err
 }
 func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy) (*http.Response, string, int, Class, *UpstreamError) {
+	return x.ExecuteObserved(ctx, url, buildHeaders, bodyJSON, plan, policy, nil)
+}
+
+// ExecuteObserved is Execute plus the evidence recorder — behaviorally
+// identical, rec strictly observational (nil = off). The executor is the only
+// place attempt-level facts exist, so it owns three row kinds:
+//
+//   - skip rows: a plan entry passed over without dialing (scheduling fact,
+//     never a failure);
+//   - dial rows: captured inside DoClassifiedObserved, then ANNOTATED here
+//     with egress id/type, attempt number, and in-flight occupancy — the
+//     client layer dials a transport and cannot know them;
+//   - decisions: the LAST row of a failed attempt receives the health and
+//     retry/fallback decisions the executor just made, AFTER they were made
+//     (a row never claims a decision before it exists).
+//
+// Ordering is therefore exactly: response → capture → classify → health →
+// retry/fallback decision → (later, at the router) emit.
+func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy, rec *Recorder) (*http.Response, string, int, Class, *UpstreamError) {
 	budget := policy.MaxAttempts
 	if !policy.FallbackEnabled || budget < 1 {
 		budget = 1
@@ -91,6 +110,9 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 	lastID := ""
 	lastClass := ClassConnectionError
 	var lastErr *UpstreamError
+	// lastStartRow is the recorder index the most recent FAILED attempt began
+	// at — used after the loop to correct that attempt's terminal row (below).
+	lastStartRow := 0
 	// The budget is checked exactly once per dial, at the continue guard
 	// below — attempts only grows after a dial and every post-dial path
 	// either returns or re-checks the budget before continuing, so no
@@ -104,6 +126,7 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 		// scheduler; a nil slot only happens if a head left the snapshot
 		// between Plan and here — skip, not failure.
 		if i >= len(plan.Egresses) || plan.Egresses[i] == nil {
+			rec.Append(Row{Phase: PhaseSkip, Egress: id, Reason: SkipUnknownEgress})
 			if !policy.FallbackEnabled {
 				break
 			}
@@ -112,12 +135,14 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 		eg := plan.Egresses[i]
 		client, ok := x.clientFor(eg)
 		if !ok {
+			rec.Append(Row{Phase: PhaseSkip, Egress: id, EgressType: proxyTypeName(eg), Reason: SkipTransportBuild})
 			if !policy.FallbackEnabled {
 				break // transport build failed and no fallback: nothing else to try
 			}
 			continue // transport build failed: skip, not failure
 		}
 		if x.slots != nil && !x.slots.Acquire(id, policy.MaxConcurrency[id]) {
+			rec.Append(Row{Phase: PhaseSkip, Egress: id, EgressType: proxyTypeName(eg), Reason: SkipSlotFull})
 			if !policy.FallbackEnabled {
 				break // head's slot full and no fallback: nothing else to try
 			}
@@ -125,25 +150,46 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 		}
 		attempts++
 		lastID = id
-		resp, uerr, class := client.DoClassified(ctx, url, buildHeaders, bodyJSON)
+		// In-flight occupancy INCLUDING this dial, captured at acquire time —
+		// the concurrency snapshot the failure correlation wants. Only capped
+		// egresses are tracked (the limiter does not count uncapped ones).
+		inFlight := 0
+		if x.slots != nil && policy.MaxConcurrency[id] > 0 {
+			inFlight = x.slots.InFlight(id)
+		}
+		startRow := rec.Len()
+		resp, uerr, class := client.DoClassifiedObserved(ctx, url, buildHeaders, bodyJSON, rec)
 		lastClass = class
+		// Identity annotation for every row this attempt captured.
+		rec.Annotate(startRow, func(row *Row) {
+			row.Egress = id
+			row.EgressType = proxyTypeName(eg)
+			row.Attempt = attempts
+			row.InFlight = inFlight
+		})
 		if uerr != nil {
 			lastErr = uerr
+			lastStartRow = startRow
 			if x.slots != nil {
 				x.slots.Release(id)
 			}
 			if class == ClassContextCanceled {
+				x.annotateDecision(rec, startRow, HealthNeutral, RetryStop)
 				return nil, id, attempts, class, uerr
 			}
+			health := HealthNeutral
 			if class.MarksHealth() && x.health != nil {
 				// State identity is id+transport (eg.HealthKey) so a policy-
 				// only reload keeps history while a transport swap starts
 				// clean; the POLICY is this request's snapshot.
 				x.health.Observe(eg.HealthKey(), false, policy.HealthPolicy)
+				health = HealthMarked
 			}
 			if !class.FallbackAllowed() || attempts >= budget {
+				x.annotateDecision(rec, startRow, health, RetryStop)
 				return nil, id, attempts, class, uerr
 			}
+			x.annotateDecision(rec, startRow, health, RetryFallback)
 			continue
 		}
 		if x.health != nil {
@@ -178,10 +224,61 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 	// plan entry skipped (slot-full / unknown egress / transport build) or an
 	// empty plan; attempts==0 marks that case in the log.
 	if lastErr != nil {
+		// A row annotated `fallback` above was the DECISION at the dial; if the
+		// loop then ran out of plan entries (no fallback target existed), the
+		// request in fact STOPPED here. The terminal row must say what the
+		// request did — otherwise the log ends with "fallback" and no attempt
+		// following it, which reads as evidence loss. Rows of earlier attempts
+		// keep their fallback label (a later attempt did follow them).
+		// A row annotated `fallback` above was the DECISION at the dial; if the
+		// loop then ran out of plan entries (no fallback target existed), the
+		// request in fact STOPPED here. The terminal row must say what the
+		// request did — otherwise the log ends with "fallback" and no attempt
+		// following it, which reads as evidence loss. Rows of earlier attempts
+		// keep their fallback label (a later attempt did follow them).
+		x.annotateRetry(rec, lastStartRow, RetryStop)
 		return nil, lastID, attempts, lastClass, lastErr
 	}
 	return nil, lastID, attempts, lastClass, &UpstreamError{
 		Status:  http.StatusBadGateway,
 		Message: "none of the eligible egresses could serve the request",
 	}
+}
+
+// proxyTypeName reduces an egress to its safe transport kind for evidence
+// rows: the configured proxy type, or "direct" for the host's own network.
+// The proxy URL itself is NEVER used — it can carry credentials.
+func proxyTypeName(eg *config.Egress) string {
+	if eg == nil || eg.Proxy == nil {
+		return "direct"
+	}
+	return string(eg.Proxy.Type)
+}
+
+// annotateRetry overwrites ONLY the retry disposition of the last row of the
+// attempt starting at startRow — used post-loop when a fallback decision was
+// superseded by plan exhaustion. The startRow guard keeps it from touching an
+// earlier attempt's rows when the cap dropped the terminal row.
+func (x *Executor) annotateRetry(rec *Recorder, startRow int, retry string) {
+	last := rec.Len() - 1
+	if last < startRow {
+		return
+	}
+	rec.Annotate(last, func(row *Row) { row.RetryDecision = retry })
+}
+
+// annotateDecision stamps the executor's just-made health and retry/fallback
+// decisions onto the LAST row of the failed attempt that starts at startRow.
+// Retried (non-terminal) rows keep their retry_same_egress decision — only
+// the terminal dial's row carries the attempt disposition. The startRow guard
+// keeps a cap-dropped terminal row from mislabeling an earlier attempt's row.
+func (x *Executor) annotateDecision(rec *Recorder, startRow int, health, retry string) {
+	last := rec.Len() - 1
+	if last < startRow {
+		return
+	}
+	rec.Annotate(last, func(row *Row) {
+		row.HealthDecision = health
+		row.RetryDecision = retry
+	})
 }

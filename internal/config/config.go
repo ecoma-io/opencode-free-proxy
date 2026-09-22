@@ -218,6 +218,28 @@ const (
 	IdleTimeout = 120 * time.Second
 )
 
+// Upstream-error evidence bounds (internal/upstream/evidence.go). These cap
+// the observational forensics layer — a hostile upstream (or a hostile error
+// body) must never be able to grow log-line or recorder memory without limit.
+// The row cap covers the worst real chain (3 egresses × full retry matrices
+// plus scheduling skips) so a legitimate chain is never silently dropped.
+const (
+	// EvidenceMaxRows bounds the rows one request's recorder keeps; beyond it
+	// appends are counted in a dropped counter instead of stored.
+	EvidenceMaxRows = 16
+	// EvidenceMessageBytes clamps a sanitized upstream/transport error
+	// message inside one row.
+	EvidenceMessageBytes = 512
+	// EvidencePeekBytes clamps the raw error-body peek (the same capped slice
+	// parseUpstreamError already read — never a second body read).
+	EvidencePeekBytes = 256
+	// EvidenceRateLimitEntries bounds how many rate-limit-ish response
+	// headers one row records; EvidenceRateLimitValueBytes clamps each
+	// header value (and the Retry-After echo).
+	EvidenceRateLimitEntries    = 8
+	EvidenceRateLimitValueBytes = 64
+)
+
 // Client-facing OpenAI-compatible error typing (config/errorConfig.js).
 type ErrorInfo struct{ Type, Code string }
 

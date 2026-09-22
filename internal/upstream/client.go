@@ -136,10 +136,28 @@ func (c *Client) Do(ctx context.Context, url string, buildHeaders func() map[str
 }
 
 // DoClassified is Do plus the failure taxonomy (failure.go) the executor
-// needs for fallback/health decisions. The retry matrix is identical — the
-// classification only sharpens the terminal branches: transport errors get
-// their real class instead of a 502 guess, and 429 keeps its own class so
-// the executor can fall back without poisoning health.
+// needs for fallback/health decisions. It is the nil-recorder shape of
+// DoClassifiedObserved — identical behavior, no evidence collection.
+func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte) (*http.Response, *UpstreamError, Class) {
+	return c.DoClassifiedObserved(ctx, url, buildHeaders, bodyJSON, nil)
+}
+
+// DoClassifiedObserved is DoClassified plus the evidence recorder. The retry
+// matrix, classification, and every decision are IDENTICAL — rec is strictly
+// observational (nil turns it off). Row phasing inside one dial, in order:
+//
+//  1. verdict — attempt() returns; the row's response/transport facts are
+//     built from the verdict BEFORE classification reduces it (the terminal
+//     >=400 branch extracts evidence from the same capped raw slice
+//     parseUpstreamError reads; the retry matrix's drain cannot destroy what
+//     was already captured);
+//  2. classification — the row receives the class the retry logic computed;
+//  3. retry disposition — Retried/RetryDelayMS are only set once tryRetry
+//     decided, so a row never claims a retry before the matrix made it.
+//
+// Rows are appended only for FAILED dials; the successful dial that finally
+// serves the request produces no row (the router's completion line owns
+// success telemetry).
 //
 // Classification PRECEDES the retry decision (issue #6): a typed proxy-auth
 // failure returns after ONE attempt without touching the shared budget — the
@@ -147,7 +165,7 @@ func (c *Client) Do(ctx context.Context, url string, buildHeaders func() map[str
 // generic matrix would only add deterministic no-hope dials. The executor
 // still sees FallbackAllowed() and moves to the next egress. Every other
 // transport class keeps the base.js retry semantics.
-func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte) (*http.Response, *UpstreamError, Class) {
+func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, rec *Recorder) (*http.Response, *UpstreamError, Class) {
 	// base.js:104 `const retryAttemptsByUrl = {}` — ONE counter per URL shared
 	// by every retryable status and network errors alike. tryRetry checks
 	// `retryAttemptsByUrl[urlIndex] >= attempts` where `attempts` is the CAP OF
@@ -155,9 +173,13 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 	// same budget: alternating 502/503 gives up after the first rule's cap on
 	// combined attempts, not after each status's own cap.
 	used := 0
+	dial := 0
 	for {
 		headers := buildHeaders()
+		dial++
+		started := c.Now()
 		resp, netErr := c.attempt(ctx, url, headers, bodyJSON)
+		dur := c.Now().Sub(started)
 		if netErr != nil {
 			// Network/fetch exceptions map to the 502 retry rule
 			// (base.js:173 tryRetry(urlIndex, BAD_GATEWAY, `network …`)). The
@@ -173,26 +195,34 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 				// Deliberate divergence from the JS matrix (documented in
 				// issue #6): proxy-auth is terminal for THIS egress — one
 				// dial, no budget consumption, immediate executor fallback.
+				appendTransportRow(rec, dial, dur, used, false, 0, class, netErr)
 				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 			}
-			if !c.tryRetry(ctx, &used, config.RetryRules[502]) {
-				// Surfacing the raw transport text is PARITY, topology
-				// exposure included: base.js:179 rethrows the raw fetch
-				// error, chatCore.js:373-375 hands it to formatProviderError,
-				// and utils/error.js:139-147 deliberately renders
-				// `[502]: ${error.message}${cause}` with the comment "Expose
-				// low-level cause (e.g. UND_ERR_SOCKET, ECONNRESET, ETIMEDOUT)
-				// for diagnosing fetch failures" — so the JS client envelope
-				// carries the dial address exactly as this message carries the
-				// (credential-redacted) egress host:port. Accepted parity.
-				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
+			if c.tryRetry(ctx, &used, config.RetryRules[502]) {
+				appendTransportRow(rec, dial, dur, used, true, config.RetryRules[502].Delay, class, netErr)
+				continue
 			}
-			continue
+			// Surfacing the raw transport text is PARITY, topology
+			// exposure included: base.js:179 rethrows the raw fetch
+			// error, chatCore.js:373-375 hands it to formatProviderError,
+			// and utils/error.js:139-147 deliberately renders
+			// `[502]: ${error.message}${cause}` with the comment "Expose
+			// low-level cause (e.g. UND_ERR_SOCKET, ECONNRESET, ETIMEDOUT)
+			// for diagnosing fetch failures" — so the JS client envelope
+			// carries the dial address exactly as this message carries the
+			// (credential-redacted) egress host:port. Accepted parity.
+			appendTransportRow(rec, dial, dur, used, false, 0, class, netErr)
+			return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 		}
 		if rule, retryable := config.RetryRules[resp.StatusCode]; retryable && rule.Attempts > 0 {
 			// Unconfigured statuses resolve to attempts 0 (resolveRetryEntry
 			// returns {attempts:0} for a missing key) and never retry.
 			if c.tryRetry(ctx, &used, rule) {
+				// The retried verdict is captured BEFORE drainAndClose
+				// destroys it — headers-only: the body is about to be drained
+				// unread, and re-reading it for a row the terminal dial will
+				// out-detail is not worth the second pass over the wire.
+				appendResponseRow(rec, dial, dur, used, true, rule.Delay, resp.StatusCode, resp.Header, nil, nil, classifyStatusFor(resp.StatusCode))
 				drainAndClose(resp)
 				continue
 			}
@@ -210,7 +240,14 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 		if resp.StatusCode >= 400 {
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 			_ = resp.Body.Close()
-			return nil, parseUpstreamError(resp.StatusCode, raw), classifyStatusFor(resp.StatusCode)
+			// Evidence capture precedes classification: the row's facts are
+			// extracted from the untouched verdict first, so classification
+			// (and the error envelope reduction that follows) can never be
+			// the place upstream information is lost.
+			uerr := parseUpstreamError(resp.StatusCode, raw)
+			class := classifyStatusFor(resp.StatusCode)
+			appendResponseRow(rec, dial, dur, used, false, 0, resp.StatusCode, resp.Header, raw, uerr, class)
+			return nil, uerr, class
 		}
 		return resp, nil, ClassSuccess
 	}

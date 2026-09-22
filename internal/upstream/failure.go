@@ -39,14 +39,15 @@ const (
 	// itself was rejected; another egress would repeat the 400) and never
 	// marks health.
 	ClassClientError
-	// ClassResponseStarted: reserved for the mid-stream commitment boundary —
-	// upstream died after the first downstream write; no fallback is
-	// possible and the relay synthesizes the abort. No code produces it
-	// TODAY: stream.go aborts without a class, and health is observed at
-	// response-headers time (fallback.go), so a stream that dies after a 200
-	// start neither falls back (the commitment) nor marks health. The
-	// constant keeps the taxonomy total for that boundary should a producer
-	// land; do not cite it as a live classification.
+	// ClassResponseStarted: the mid-stream commitment boundary — upstream
+	// died after a live response was already delivered downstream; no
+	// fallback is possible and the relay synthesizes the abort. It is a
+	// LOGGING classification only, produced exclusively by the router's
+	// evidence rows (stream.go / forced.go phase failures): the executor
+	// never sees it, so it neither falls back (the commitment stands) nor
+	// marks health (MarksHealth/FallbackAllowed are false below, pinned by
+	// test) — a stream that dies after a 200 start leaves the egress's health
+	// exactly as the header-time success observation left it.
 	ClassResponseStarted
 	// ClassContextCanceled: downstream disconnected. No fallback (nothing
 	// to deliver to) and no health mark (the egress did nothing wrong).

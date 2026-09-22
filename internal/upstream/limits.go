@@ -49,3 +49,13 @@ func (l *Limiter) Release(id string) {
 		l.cur[id]--
 	}
 }
+
+// InFlight reports the current occupancy for id. Only meaningful for capped
+// egresses — Acquire does not count uncapped (max <= 0) traffic — so the
+// evidence layer records it solely when a cap is configured. Read-only
+// snapshot under the same mutex; no reservation.
+func (l *Limiter) InFlight(id string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.cur[id]
+}
