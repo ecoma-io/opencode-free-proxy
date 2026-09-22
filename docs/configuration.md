@@ -192,6 +192,21 @@ final content.
   `zerolog.SetGlobalLevel` for it, so the very next event after a swap obeys
   the new threshold.
 
+### Log volume per level
+
+Upstream-failure forensics (`upstream_error` events — see
+[architecture.md](architecture.md#upstream-error-evidence-forensics)) are
+shaped so the default level is already investigative:
+
+- **info (default)** — one completion line per request, plus one warn
+  `upstream_error` event per failed upstream interaction (dial, stream
+  death, forced-conversion failure) with rate limits, classification,
+  health and retry decisions. Successful requests emit nothing extra.
+- **debug** — adds `egress_skipped` diagnostics (slot-full / transport
+  build / unknown-egress pass-overs), which can be frequent under load.
+- **warn / error** — silences the completion lines; failure evidence
+  stays visible at warn.
+
 ## Validation errors
 
 `File.Validate` (`internal/config/file.go`) applies the structural +

@@ -92,6 +92,23 @@ local listeners and a real CONNECT proxy:
   a policy-only reload (same proxy URL) keeps the armed cooldown
   (`TestPolicyOnlyReloadKeepsHealthState`)
 
+### Upstream-error evidence (`evidence_test.go`)
+
+The spawned server's JSON log stream must let an operator reconstruct a
+failure from the log alone (issue #45):
+
+- 429 → fallback: exactly one warn `upstream_error` event for attempt 1,
+  correlated to the completion line by `request_id` / `attempt_id`
+  (`reqID/1`), carrying the rate-limit observation (`retry_after`,
+  `x-ratelimit-*`), `class=upstream_429`, `health_decision=neutral`,
+  `retry_decision=fallback`, the session pseudonym and body hash — and no
+  credential material anywhere in the log
+  (`TestEvidence429FallbackReconstructsFromLogs`)
+- mid-stream upstream death after a 200 start: a `response_started`
+  STREAM row (`phase=stream`, `reason=read_error`, status stays 200) —
+  never reclassified into an HTTP verdict, no attempt id, no health or
+  retry decision (`TestEvidenceStreamDeathIsPhaseNotVerdict`)
+
 ### Tool pipeline & client personas (`tools_test.go`)
 
 Cross-interface checks — clients with different tool shapes must all reach

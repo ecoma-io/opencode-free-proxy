@@ -147,6 +147,68 @@ AGENTS.md for the porting discipline):
    upstream actually answered SSE — otherwise the stream path handles it,
    exactly like the JS fall-through).
 
+## Upstream error evidence (forensics)
+
+Every failed upstream interaction leaves one structured log event, so a
+request's log alone reconstructs **request → attempts → dials → egress →
+verdict → classification → health → fallback → outcome**. The layer is
+strictly observational: nothing it records influences routing, retry,
+fallback, health or streaming behavior, and the successful dial that
+serves a request produces no event at all (the completion line owns
+success telemetry — happy-path log volume is unchanged).
+
+- **Capture happens where facts become known, before classification
+  reduces them** — ordering is response → capture → classify → health →
+  retry/fallback decision → emit. A 4xx/5xx row is extracted from the
+  same capped body slice `parseUpstreamError` reads (never a second
+  read); a verdict the retry matrix is about to drain is captured
+  headers-only first, so rate-limit headers and structured
+  `error.type`/`error.code` survive the reduction.
+- **One warn `upstream_error` event per row** (`internal/router/evidence_log.go`
+  is the only emit boundary); skipped plan entries (`slot_full`,
+  `transport_build`, `unknown_egress`) render at debug as
+  `egress_skipped` — scheduling diagnostics stay out of the info stream.
+- **Correlation**: every event carries `request_id`; a dial row carries
+  `attempt_id` = `request_id/N` (cross-egress attempt N) or
+  `request_id/N.M` (retry-matrix dial M inside attempt N). Stream-phase
+  rows have no attempt id — the attempt already committed and returned.
+- **Phases, not re-classification**: `response` (an HTTP verdict ≥ 400),
+  `transport` (no HTTP response exists), `stream`/`forced` (a live
+  response died or failed conversion after headers). Stream/forced rows
+  carry class `response_started` — the reserved logging-only
+  classification: the delivered status stays the delivered status, no
+  health observation, no fallback (streaming commitment untouched).
+- **429 is not an outage**: 429/4xx rows carry `health_decision:
+neutral`; only connection/timeout/proxy-auth/5xx rows say `marked`.
+  A rate-limit observation never poisons an egress — regression-pinned.
+- **What a row may never contain**: request bodies, tool arguments,
+  authorization/cookie headers, proxy URLs (transport rows carry the
+  proxy _type_ only), raw session ids. The session travels as
+  `session_fp` = sha256(session id)[:16] — a stable **pseudonym for
+  correlation, not anonymization** (an operator with known ids could
+  brute-force it); the request body as `request_body_sha256`[:16],
+  computed lazily only when evidence is emitted.
+- **Fingerprints** (`error_fingerprint`, FNV-1a over
+  status|type|code|normalized message) group the same logical error
+  across attempts/egresses/requests: digit runs fold ("retry in 17s" ≡
+  "retry in 31s") and address tokens strip (the same refusal through any
+  egress matches). They are equality keys for humans — never inputs to
+  behavior.
+- **Bounds**: 16 rows per request (past that, a `dropped` counter rides
+  the last event), 512 B messages, 256 B body peeks, 8 rate-limit
+  entries, 64 B header values. A hostile upstream cannot grow memory or
+  log volume through this layer. SSE is never buffered for evidence —
+  stream rows record labels and timing only.
+- **All text is sanitized** (control bytes folded, whitespace collapsed,
+  rune-safe clamps) and `%q`-quoted in the rendered line (CWE-117).
+- **Present/absent semantics**: absent information is an absent field —
+  missing rate-limit headers, an uncapped egress's in-flight, a headerless
+  retried verdict. Nothing fakes a default.
+
+Logs are the analysis surface for upstream failures by design: the
+proxy has no metrics subsystem, so nothing here can introduce
+high-cardinality metric labels.
+
 ## Endpoints
 
 - `POST /v1/chat/completions` — OpenAI Chat Completions (SSE or JSON).
@@ -162,20 +224,20 @@ upstream and are translated transparently for chat clients.
 
 ## Package layout
 
-| Package              | Role                                                                                                                                                         |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                      |
-| `internal/logging`   | zerolog construction + the compatibility adapter at constructor edges; centralized `time`/`level`/`msg` field names                                          |
-| `internal/config`    | every runtime constant + bootstrap env vars; multi-egress YAML model, interpolation, redaction, hot-reload store, the immutable `Runtime` snapshot           |
-| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                             |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                  |
-| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration + the per-request snapshot capture       |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                           |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                         |
-| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging |
-| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                 |
-| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                       |
-| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                           |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                      |
-| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                     |
-| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                         |
+| Package              | Role                                                                                                                                                                                      |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                   |
+| `internal/logging`   | zerolog construction + the compatibility adapter at constructor edges; centralized `time`/`level`/`msg` field names                                                                       |
+| `internal/config`    | every runtime constant + bootstrap env vars; multi-egress YAML model, interpolation, redaction, hot-reload store, the immutable `Runtime` snapshot                                        |
+| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                          |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                               |
+| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration + the per-request snapshot capture + the evidence emit boundary       |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                        |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                      |
+| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging, the error-evidence recorder |
+| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                              |
+| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                    |
+| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                        |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                   |
+| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                  |
+| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                      |
