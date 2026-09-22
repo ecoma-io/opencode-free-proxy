@@ -221,8 +221,10 @@ const (
 // Upstream-error evidence bounds (internal/upstream/evidence.go). These cap
 // the observational forensics layer — a hostile upstream (or a hostile error
 // body) must never be able to grow log-line or recorder memory without limit.
-// The row cap covers the worst real chain (3 egresses × full retry matrices
-// plus scheduling skips) so a legitimate chain is never silently dropped.
+// The row cap is sized for the default budget (3 egresses × full retry
+// matrices plus scheduling skips); an operator-raised fallback budget can
+// outgrow it, and overflow then lands in the dropped counter surfaced on the
+// last event — bounded by design, visible when it happens.
 const (
 	// EvidenceMaxRows bounds the rows one request's recorder keeps; beyond it
 	// appends are counted in a dropped counter instead of stored.

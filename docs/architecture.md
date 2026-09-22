@@ -164,8 +164,10 @@ success telemetry — happy-path log volume is unchanged).
   read); a verdict the retry matrix is about to drain is captured
   headers-only first, so rate-limit headers and structured
   `error.type`/`error.code` survive the reduction.
-- **One warn `upstream_error` event per row** (`internal/router/evidence_log.go`
-  is the only emit boundary); skipped plan entries (`slot_full`,
+- **One warn `upstream_error` event per row, emitted exactly once**
+  (`internal/router/evidence_log.go` is the only emit boundary — a
+  post-header abort renders only its own new row, never re-rendering what
+  the post-Execute pass already logged); skipped plan entries (`slot_full`,
   `transport_build`, `unknown_egress`) render at debug as
   `egress_skipped` — scheduling diagnostics stay out of the info stream.
 - **Correlation**: every event carries `request_id`; a dial row carries
@@ -177,7 +179,11 @@ success telemetry — happy-path log volume is unchanged).
   response died or failed conversion after headers). Stream/forced rows
   carry class `response_started` — the reserved logging-only
   classification: the delivered status stays the delivered status, no
-  health observation, no fallback (streaming commitment untouched).
+  health observation, no fallback (streaming commitment untouched). The
+  `status` field records what the UPSTREAM did — the status the response
+  started with — never the synthesized client 502 a forced-conversion
+  failure writes downstream (that is the error-write path's fact, visible
+  in the completion line).
 - **429 is not an outage**: 429/4xx rows carry `health_decision:
 neutral`; only connection/timeout/proxy-auth/5xx rows say `marked`.
   A rate-limit observation never poisons an egress — regression-pinned.
@@ -191,9 +197,17 @@ neutral`; only connection/timeout/proxy-auth/5xx rows say `marked`.
 - **Fingerprints** (`error_fingerprint`, FNV-1a over
   status|type|code|normalized message) group the same logical error
   across attempts/egresses/requests: digit runs fold ("retry in 17s" ≡
-  "retry in 31s") and address tokens strip (the same refusal through any
-  egress matches). They are equality keys for humans — never inputs to
-  behavior.
+  "retry in 31s"), and address-shaped tokens strip (host:port — the shape
+  that varies across egresses — plus dotted numeric hosts), while dotted
+  identifiers ("config.yaml" vs "secrets.env") keep distinguishing.
+  Grouping is deliberately coarse where shapes coincide ("file.go:42"
+  folds like host:port; version numbers fold with any digits) — the
+  `message` field disambiguates within a group. Two shapes inside one
+  retry-matrix chain hash differently BY DESIGN: retried (headers-only)
+  dials key on status alone — the body they never buffered is unknown to
+  them, and a fingerprint never fakes unseen fields — while the terminal
+  dial carries the full key. They are equality keys for humans — never
+  inputs to behavior.
 - **Bounds**: 16 rows per request (past that, a `dropped` counter rides
   the last event), 512 B messages, 256 B body peeks, 8 rate-limit
   entries, 64 B header values. A hostile upstream cannot grow memory or

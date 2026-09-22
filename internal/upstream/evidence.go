@@ -81,8 +81,12 @@ type Row struct {
 	// Reason carries the skip reason or the stream/forced failure phase
 	// (stall/read_error/client_disconnect/too_large/…); empty for dial rows.
 	Reason string
-	// Status is the upstream HTTP status; 0 when no HTTP response exists
-	// (transport/skip phases) and the delivered status for stream rows.
+	// Status is the upstream HTTP status the interaction reached: the
+	// verdict status for response rows, 0 when no HTTP response exists
+	// (transport/skip phases), and the status the response STARTED with for
+	// stream/forced rows. A phase row never rewrites it into the
+	// client-facing synthesized status — that is the error-write path's
+	// fact (visible in the completion line), never an upstream verdict.
 	Status int
 	Class  string // Class.String(); stream rows use ClassResponseStarted
 
@@ -191,6 +195,22 @@ func (r *Recorder) Annotate(from int, f func(*Row)) {
 	}
 }
 
+// AnnotateAt applies f to rows[i] alone — the executor's post-loop
+// correction of one specific row (the terminal row a decision already
+// stamped). Out-of-range indices are no-ops, so a stale index can never
+// panic or mislabel a neighbor.
+func (r *Recorder) AnnotateAt(i int, f func(*Row)) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i < 0 || i >= len(r.rows) {
+		return
+	}
+	f(&r.rows[i])
+}
+
 // Rows returns a snapshot copy.
 func (r *Recorder) Rows() []Row {
 	if r == nil {
@@ -219,6 +239,13 @@ func (r *Recorder) Dropped() int {
 // clamped to limit bytes without splitting a UTF-8 sequence (backing off to a
 // rune boundary, then trimming a trailing partial escape-free prefix).
 func sanitizeEvidence(s string, limit int) string {
+	// Clamp the input BEFORE scanning: callers hand over already-read error
+	// bodies, and the scan must never walk (let alone build) more than the
+	// bytes that can survive anyway. The byte cut may split a UTF-8 sequence;
+	// the boundary repair below fixes that.
+	if len(s) > limit {
+		s = s[:limit]
+	}
 	var b strings.Builder
 	b.Grow(len(s))
 	space := false
@@ -240,18 +267,20 @@ func sanitizeEvidence(s string, limit int) string {
 	out := b.String()
 	if len(out) > limit {
 		out = out[:limit]
-		// Never emit a partial rune: back off over invalid trailing encodings
-		// (dangling continuation bytes of a cut sequence AND a leading byte
-		// left without its sequence — DecodeLastRuneInString flags both as
-		// RuneError with size 1). A mid-rune cut would otherwise smuggle
-		// invalid UTF-8 into the JSON log.
-		for len(out) > 0 {
-			r, size := utf8.DecodeLastRuneInString(out)
-			if r != utf8.RuneError || size > 1 {
-				break
-			}
-			out = out[:len(out)-1]
+	}
+	// Never emit a partial rune: back off over invalid trailing encodings
+	// (dangling continuation bytes of a cut sequence AND a leading byte left
+	// without its sequence — DecodeLastRuneInString flags both as RuneError
+	// with size 1). A mid-rune cut would otherwise smuggle invalid UTF-8
+	// into the JSON log. Unconditional because the cut can come from the
+	// input clamp above just as from the output clamp; for already-valid
+	// text it costs one DecodeLastRune that breaks immediately.
+	for len(out) > 0 {
+		r, size := utf8.DecodeLastRuneInString(out)
+		if r != utf8.RuneError || size > 1 {
+			break
 		}
+		out = out[:len(out)-1]
 	}
 	return strings.TrimSpace(out)
 }
@@ -265,10 +294,24 @@ func isAddressByte(c byte) bool {
 }
 
 // looksLikeAddressToken reports whether a (digit-folded, lowercased) token
-// looks like a host address the fingerprint must not depend on: a dotted
-// hostname or IPv4 literal, optionally with a folded :# port, or an IPv6-ish
-// token (brackets / '::'). Words like "connect:" or "tcp" never match — no
-// dotted host part and no '::'.
+// looks like a host address the fingerprint must not depend on. Two shapes
+// count:
+//
+//   - host:port with a numeric (folded '#') port. This is the shape that
+//     actually varies across egresses — Go transport errors name the dialed
+//     proxy as host:port, IP or hostname alike — so any address-safe host
+//     matches. Accepted residual coarseness: a "file.go:42" token is also
+//     name:number and folds with it; the fingerprint is a grouping key,
+//     never proof, and the message field disambiguates.
+//   - a dotted host with at least one all-numeric (folded) dot-segment —
+//     IPv4 literals and version-ish tokens. A dotted token whose every
+//     segment is alphabetic ("config.yaml", "parser.go") is an identifier,
+//     not an address: it KEEPS fingerprinting, because stripping it would
+//     merge "failed parsing config.yaml" with "failed parsing secrets.env"
+//     into one logical error.
+//
+// IPv6-ish tokens (a '::') always match. Words like "connect:" or "tcp"
+// never do — no numeric port, no dot.
 func looksLikeAddressToken(tok string) bool {
 	if strings.Contains(tok, "::") {
 		return true
@@ -279,15 +322,38 @@ func looksLikeAddressToken(tok string) bool {
 			return false
 		}
 	}
-	if !strings.Contains(host, ".") {
-		return false
-	}
-	if !hasPort {
+	if hasPort {
+		if port == "" {
+			return false // "connect:" — a word with a colon, not host:port
+		}
+		for i := 0; i < len(port); i++ {
+			if port[i] != '#' {
+				return false
+			}
+		}
 		return true
 	}
-	// The port must have folded to '#' runs ("host:#+").
-	for i := 0; i < len(port); i++ {
-		if port[i] != '#' {
+	segs := strings.Split(host, ".")
+	if len(segs) < 2 {
+		return false
+	}
+	for _, seg := range segs {
+		if isFoldedNumber(seg) {
+			return true
+		}
+	}
+	return false
+}
+
+// isFoldedNumber reports whether s is one or more '#' digit-fold markers —
+// what a numeric run (IPv4 octet, port, version component) looks like after
+// NormalizeMessage folded it.
+func isFoldedNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != '#' {
 			return false
 		}
 	}
@@ -297,10 +363,10 @@ func looksLikeAddressToken(tok string) bool {
 // NormalizeMessage reduces a message to its stable semantic core for
 // fingerprinting: control-stripped, whitespace-collapsed, lowercased, digit
 // runs folded to '#' ("retry in 17 seconds" ≡ "retry in 31 seconds"), and
-// address-shaped tokens (IP literals, host:port, dotted hostnames) removed so
-// the SAME logical transport error yields the SAME fingerprint regardless of
-// which egress dialed it. Bounded to 256 bytes (after the fold; the caller
-// already sanitized the raw text).
+// address-shaped tokens (IP literals, host:port, dotted numeric hosts)
+// removed so the SAME logical transport error yields the SAME fingerprint
+// regardless of which egress dialed it. Bounded to 256 bytes (after the
+// fold; the caller already sanitized the raw text).
 func NormalizeMessage(s string) string {
 	s = strings.ToLower(sanitizeEvidence(s, 512))
 	var b strings.Builder
@@ -389,7 +455,30 @@ func ExtractRateLimit(h http.Header) *RateLimit {
 	if rl.RetryAfter == "" && len(rl.Entries) == 0 {
 		return nil
 	}
-	sort.Slice(rl.Entries, func(i, j int) bool { return rl.Entries[i].Name < rl.Entries[j].Name })
+	// Name then value: http.Header map iteration is randomized and the log
+	// output — including the merged values below — must be stable.
+	sort.Slice(rl.Entries, func(i, j int) bool {
+		if rl.Entries[i].Name != rl.Entries[j].Name {
+			return rl.Entries[i].Name < rl.Entries[j].Name
+		}
+		return rl.Entries[i].Value < rl.Entries[j].Value
+	})
+	// A header carried multiple times is several entries under one canonical
+	// name — merge them comma-separated (the wire form of a repeated header)
+	// so one name renders as exactly one JSON key. Duplicate keys would put
+	// two values on one field in a single JSON object (RFC 8259 §4: names
+	// SHOULD be unique): last-wins parsers silently drop evidence, strict
+	// consumers reject the line. The merged value re-clamps to the bound.
+	merged := make([]RateLimitEntry, 0, len(rl.Entries))
+	for _, ent := range rl.Entries {
+		if n := len(merged); n > 0 && merged[n-1].Name == ent.Name {
+			last := &merged[n-1]
+			last.Value = sanitizeEvidence(last.Value+", "+ent.Value, config.EvidenceRateLimitValueBytes)
+			continue
+		}
+		merged = append(merged, ent)
+	}
+	rl.Entries = merged
 	if len(rl.Entries) > config.EvidenceRateLimitEntries {
 		rl.Entries = rl.Entries[:config.EvidenceRateLimitEntries]
 	}
@@ -428,6 +517,13 @@ func appendTransportRow(rec *Recorder, dial int, dur time.Duration, draws int, r
 // capped slice the caller already read for parseUpstreamError — never a
 // second body read; it is nil for a retried verdict whose body went straight
 // to the drain (headers-only row, no message/peek), with uerr nil alongside.
+//
+// The two row shapes inside one retry-matrix chain fingerprint differently
+// BY DESIGN: a retried (headers-only) row hashes over status alone — the
+// body it must never buffer is unknown to it, and a fingerprint may not
+// fake fields it did not see — while the terminal dial carries the full
+// status|type|code|message key. Each shape's key is stable across requests,
+// so grouping works per shape; the message field disambiguates within it.
 func appendResponseRow(rec *Recorder, dial int, dur time.Duration, draws int, retried bool, delay time.Duration, status int, h http.Header, raw []byte, uerr *UpstreamError, class Class) {
 	if rec == nil {
 		return
@@ -463,7 +559,14 @@ func appendResponseRow(rec *Recorder, dial int, dur time.Duration, draws int, re
 		RetryDecision: decision,
 	}
 	if !retried {
-		row.BodyPeek = sanitizeEvidence(string(raw), config.EvidencePeekBytes)
+		// Byte-clamp BEFORE the string conversion: string(raw) copies the
+		// whole capped slice (≤1 MiB) for EvidencePeekBytes to survive it.
+		// The cut may split a rune; sanitizeEvidence repairs the boundary.
+		peek := raw
+		if len(peek) > config.EvidencePeekBytes {
+			peek = peek[:config.EvidencePeekBytes]
+		}
+		row.BodyPeek = sanitizeEvidence(string(peek), config.EvidencePeekBytes)
 	}
 	rec.Append(row)
 }

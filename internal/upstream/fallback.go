@@ -43,6 +43,16 @@ type AttemptPolicy struct {
 	HealthPolicy    health.Policy
 }
 
+// Budget is the attempt cap the executor enforces for this policy. It is
+// also what the evidence renderer reports as max_attempts — a method so the
+// reported number and the enforced one can never drift apart.
+func (p AttemptPolicy) Budget() int {
+	if !p.FallbackEnabled || p.MaxAttempts < 1 {
+		return 1
+	}
+	return p.MaxAttempts
+}
+
 // Execute walks the plan honoring the policy. Returns the live response
 // (commitment — the caller must not fall back after this), the winning
 // egress id, the attempts consumed, the last failure class, and the
@@ -102,17 +112,18 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 // Ordering is therefore exactly: response → capture → classify → health →
 // retry/fallback decision → (later, at the router) emit.
 func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy, rec *Recorder) (*http.Response, string, int, Class, *UpstreamError) {
-	budget := policy.MaxAttempts
-	if !policy.FallbackEnabled || budget < 1 {
-		budget = 1
-	}
+	budget := policy.Budget()
 	attempts := 0
 	lastID := ""
 	lastClass := ClassConnectionError
 	var lastErr *UpstreamError
-	// lastStartRow is the recorder index the most recent FAILED attempt began
-	// at — used after the loop to correct that attempt's terminal row (below).
-	lastStartRow := 0
+	// terminalRow is the recorder index of the row the most recent failed
+	// attempt's decisions were stamped on (-1 = none). The post-loop
+	// correction below targets exactly that row — computed when the decision
+	// was stamped, never "the last row now", because skip rows can be
+	// appended after a failed attempt and must never receive a retry
+	// disposition.
+	terminalRow := -1
 	// The budget is checked exactly once per dial, at the continue guard
 	// below — attempts only grows after a dial and every post-dial path
 	// either returns or re-checks the budget before continuing, so no
@@ -169,12 +180,11 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 		})
 		if uerr != nil {
 			lastErr = uerr
-			lastStartRow = startRow
 			if x.slots != nil {
 				x.slots.Release(id)
 			}
 			if class == ClassContextCanceled {
-				x.annotateDecision(rec, startRow, HealthNeutral, RetryStop)
+				annotateDecision(rec, startRow, HealthNeutral, RetryStop)
 				return nil, id, attempts, class, uerr
 			}
 			health := HealthNeutral
@@ -186,10 +196,13 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 				health = HealthMarked
 			}
 			if !class.FallbackAllowed() || attempts >= budget {
-				x.annotateDecision(rec, startRow, health, RetryStop)
+				annotateDecision(rec, startRow, health, RetryStop)
 				return nil, id, attempts, class, uerr
 			}
-			x.annotateDecision(rec, startRow, health, RetryFallback)
+			// Only the fallback branch's row can need the post-loop
+			// correction — the stop branches return before the loop can
+			// exhaust the plan.
+			terminalRow = annotateDecision(rec, startRow, health, RetryFallback)
 			continue
 		}
 		if x.health != nil {
@@ -224,19 +237,19 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 	// plan entry skipped (slot-full / unknown egress / transport build) or an
 	// empty plan; attempts==0 marks that case in the log.
 	if lastErr != nil {
-		// A row annotated `fallback` above was the DECISION at the dial; if the
-		// loop then ran out of plan entries (no fallback target existed), the
-		// request in fact STOPPED here. The terminal row must say what the
-		// request did — otherwise the log ends with "fallback" and no attempt
-		// following it, which reads as evidence loss. Rows of earlier attempts
-		// keep their fallback label (a later attempt did follow them).
-		// A row annotated `fallback` above was the DECISION at the dial; if the
-		// loop then ran out of plan entries (no fallback target existed), the
-		// request in fact STOPPED here. The terminal row must say what the
-		// request did — otherwise the log ends with "fallback" and no attempt
-		// following it, which reads as evidence loss. Rows of earlier attempts
-		// keep their fallback label (a later attempt did follow them).
-		x.annotateRetry(rec, lastStartRow, RetryStop)
+		// Plan exhaustion: a row annotated `fallback` at the dial was the
+		// decision THEN; with no plan entry left to fall back to, the request
+		// in fact STOPPED at that row, and the terminal row must say what the
+		// request did — a log ending in "fallback" with no following attempt
+		// reads as evidence loss. Correct exactly the row the decision
+		// stamped (terminalRow, captured when it was stamped): a skip row
+		// appended after the failed attempt never receives a retry
+		// disposition, and an earlier attempt's row keeps its fallback label
+		// (a later attempt did follow it). -1 means the cap dropped the
+		// attempt's rows — nothing to correct.
+		if terminalRow >= 0 {
+			rec.AnnotateAt(terminalRow, func(row *Row) { row.RetryDecision = RetryStop })
+		}
 		return nil, lastID, attempts, lastClass, lastErr
 	}
 	return nil, lastID, attempts, lastClass, &UpstreamError{
@@ -255,30 +268,20 @@ func proxyTypeName(eg *config.Egress) string {
 	return string(eg.Proxy.Type)
 }
 
-// annotateRetry overwrites ONLY the retry disposition of the last row of the
-// attempt starting at startRow — used post-loop when a fallback decision was
-// superseded by plan exhaustion. The startRow guard keeps it from touching an
-// earlier attempt's rows when the cap dropped the terminal row.
-func (x *Executor) annotateRetry(rec *Recorder, startRow int, retry string) {
-	last := rec.Len() - 1
-	if last < startRow {
-		return
-	}
-	rec.Annotate(last, func(row *Row) { row.RetryDecision = retry })
-}
-
 // annotateDecision stamps the executor's just-made health and retry/fallback
-// decisions onto the LAST row of the failed attempt that starts at startRow.
+// decisions onto the LAST row of the failed attempt that starts at startRow,
+// returning the row index it stamped (-1 when the startRow guard fired: the
+// cap dropped every row of the attempt, so there is nothing to stamp).
 // Retried (non-terminal) rows keep their retry_same_egress decision — only
-// the terminal dial's row carries the attempt disposition. The startRow guard
-// keeps a cap-dropped terminal row from mislabeling an earlier attempt's row.
-func (x *Executor) annotateDecision(rec *Recorder, startRow int, health, retry string) {
+// the terminal dial's row carries the attempt disposition.
+func annotateDecision(rec *Recorder, startRow int, health, retry string) int {
 	last := rec.Len() - 1
 	if last < startRow {
-		return
+		return -1
 	}
 	rec.Annotate(last, func(row *Row) {
 		row.HealthDecision = health
 		row.RetryDecision = retry
 	})
+	return last
 }

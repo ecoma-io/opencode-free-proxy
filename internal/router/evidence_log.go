@@ -49,6 +49,12 @@ type evidenceLog struct {
 	// so the happy path never pays for hashing.
 	bodyJSON []byte
 	bodySHA  string
+
+	// emitted counts the rows already rendered. Emit renders only rows
+	// stored since the last pass, so a post-header abort (which appends a
+	// row and emits again) never re-renders what the first pass already
+	// logged: one row is one event, ever.
+	emitted int
 }
 
 // newEvidenceLog builds the per-request renderer. sessionFP is a sha256
@@ -107,28 +113,35 @@ func (e *evidenceLog) bodyHash() string {
 	return e.bodySHA
 }
 
-// Emit renders every collected row: dial/stream/forced rows as warn
-// upstream_error events, skip rows as debug egress_skipped diagnostics. The
-// dropped counter (rows past the cap) rides the LAST event so truncation is
-// visible exactly where it happened.
+// Emit renders the rows collected so far and not yet rendered: dial and
+// skip rows once the executor's decisions are complete, and — when a
+// post-header phase later appends more (StreamAbort/ForcedAbort emit through
+// this same cursor) — just those new rows. Dial/stream/forced rows render as
+// warn upstream_error events, skip rows as debug egress_skipped diagnostics.
+// The dropped counter (rows past the cap) rides the LAST event of the pass —
+// whichever kind it is — so truncation is visible exactly where it happened.
 func (e *evidenceLog) Emit() {
 	rows := e.rec.Rows()
 	dropped := e.rec.Dropped()
-	for i, row := range rows {
-		last := i == len(rows)-1
-		if row.Phase == upstream.PhaseSkip {
-			e.emitSkip(row)
+	for i := e.emitted; i < len(rows); i++ {
+		var d int
+		if i == len(rows)-1 {
+			d = dropped
+		}
+		if rows[i].Phase == upstream.PhaseSkip {
+			e.emitSkip(rows[i], d)
 		} else {
-			e.emitError(row, last && dropped > 0, dropped)
+			e.emitError(rows[i], d)
 		}
 	}
+	e.emitted = len(rows)
 }
 
 // emitError renders one failed upstream interaction. Every field carrying
 // text is already sanitized upstream of here; the rendered Msgf quotes all
 // free text (%q) per the logforge discipline so nothing can forge a log line
 // (CWE-117).
-func (e *evidenceLog) emitError(row upstream.Row, withDropped bool, dropped int) {
+func (e *evidenceLog) emitError(row upstream.Row, dropped int) {
 	evt := e.log.Warn()
 	evt.Str("request_id", e.requestID)
 	if id := e.attemptID(row); id != "" {
@@ -193,9 +206,7 @@ func (e *evidenceLog) emitError(row upstream.Row, withDropped bool, dropped int)
 	if row.Retried {
 		evt.Bool("retried", true).Int64("retry_delay_ms", row.RetryDelayMS)
 	}
-	if row.DurationMS >= 0 {
-		evt.Int64("duration_ms", row.DurationMS)
-	}
+	evt.Int64("duration_ms", row.DurationMS)
 	if row.InFlight > 0 {
 		evt.Int("in_flight", row.InFlight)
 	}
@@ -205,7 +216,7 @@ func (e *evidenceLog) emitError(row upstream.Row, withDropped bool, dropped int)
 	if row.RetryDecision != "" {
 		evt.Str("retry_decision", row.RetryDecision)
 	}
-	if withDropped {
+	if dropped > 0 {
 		evt.Int("evidence_dropped", dropped)
 	}
 	evt.Msgf("upstream_error request_id=%s attempt=%q egress=%q phase=%s status=%d class=%s retry_decision=%s message=%q",
@@ -217,14 +228,20 @@ func (e *evidenceLog) emitError(row upstream.Row, withDropped bool, dropped int)
 // a plan entry that left the snapshot), not an upstream error, and slot-full
 // skips can be frequent under load: debug keeps them out of the info stream
 // while remaining available when an investigation raises the level.
-func (e *evidenceLog) emitSkip(row upstream.Row) {
-	e.log.Debug().
+func (e *evidenceLog) emitSkip(row upstream.Row, dropped int) {
+	evt := e.log.Debug().
 		Str("request_id", e.requestID).
 		Uint64("generation", e.generation).
 		Str("route", e.route).
-		Str("egress", row.Egress).
-		Str("reason", row.Reason).
-		Msgf("egress_skipped request_id=%s egress=%q reason=%s", e.requestID, row.Egress, row.Reason)
+		Str("egress", row.Egress)
+	if row.EgressType != "" {
+		evt.Str("egress_type", row.EgressType)
+	}
+	evt.Str("reason", row.Reason)
+	if dropped > 0 {
+		evt.Int("evidence_dropped", dropped)
+	}
+	evt.Msgf("egress_skipped request_id=%s egress=%q reason=%s", e.requestID, row.Egress, row.Reason)
 }
 
 // StreamAbort records a post-header stream death — the phase where a live
@@ -235,7 +252,7 @@ func (e *evidenceLog) emitSkip(row upstream.Row) {
 // observation, no fallback, and the already-delivered status is recorded as
 // status, never rewritten into a 4xx/5xx.
 func (e *evidenceLog) StreamAbort(egress string, deliveredStatus int, reason string, durMS int64) {
-	e.rec.Append(upstream.Row{
+	e.appendAndEmit(upstream.Row{
 		Phase:      upstream.PhaseStream,
 		Egress:     egress,
 		Status:     deliveredStatus,
@@ -243,20 +260,33 @@ func (e *evidenceLog) StreamAbort(egress string, deliveredStatus int, reason str
 		Reason:     reason,
 		DurationMS: durMS,
 	})
-	e.Emit()
 }
 
 // ForcedAbort records a failed forced SSE→JSON conversion (stall/size cap/
-// client cancel/read error/malformed stream). The client keeps seeing the
-// generic 502; the reason travels only here.
-func (e *evidenceLog) ForcedAbort(egress string, reason string, durMS int64) {
-	e.rec.Append(upstream.Row{
+// client cancel/read error/malformed stream). upstreamStatus is the status
+// the response STARTED with — the client keeps seeing the generic 502, but a
+// phase row records what the upstream did, never the synthesized client
+// verdict; the reason travels only here.
+func (e *evidenceLog) ForcedAbort(egress string, upstreamStatus int, reason string, durMS int64) {
+	e.appendAndEmit(upstream.Row{
 		Phase:      upstream.PhaseForced,
 		Egress:     egress,
-		Status:     502,
+		Status:     upstreamStatus,
 		Class:      upstream.ClassResponseStarted.String(),
 		Reason:     reason,
 		DurationMS: durMS,
 	})
-	e.Emit()
+}
+
+// appendAndEmit stores one post-header row and renders it — and only it —
+// immediately: the rows the executor collected were already rendered by the
+// first Emit, and re-rendering them would duplicate every event (one row is
+// one event, ever — the layer's emit contract). When the recorder refuses
+// the row (cap full) it still renders — the interaction happened and must
+// not vanish; the transient row is bounded like any other, and
+// evidence_dropped on the event says the recorder overflowed.
+func (e *evidenceLog) appendAndEmit(row upstream.Row) {
+	e.rec.Append(row)
+	e.emitted = e.rec.Len()
+	e.emitError(row, e.rec.Dropped())
 }

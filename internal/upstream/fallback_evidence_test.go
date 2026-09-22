@@ -103,6 +103,46 @@ func TestEvidenceTerminalVerdictStops(t *testing.T) {
 	}
 }
 
+// TestEvidenceTerminalStopAfterTrailingSkip: plan [a, b] where a fails
+// (fallback allowed) and b's slot fills between plan and dial. The post-loop
+// plan-exhaustion correction must hit the row the DECISION stamped — a's
+// terminal dial row (fallback → stop) — and never the skip row appended
+// after it: a skip is a scheduling fact and carries no retry disposition.
+func TestEvidenceTerminalStopAfterTrailingSkip(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 429, "b": 200})
+	defer f.Close()
+	f.slots.Acquire("b", 1) // b's only slot is busy: plan passes over it
+
+	rec := NewRecorder()
+	_, id, attempts, _, uerr := f.exec.ExecuteObserved(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), f.plan("r", "a", "b"),
+		AttemptPolicy{
+			FallbackEnabled: true,
+			MaxAttempts:     3,
+			MaxConcurrency:  map[string]int{"a": 1, "b": 1},
+			HealthPolicy:    testHealthPolicy,
+		}, rec)
+	if uerr == nil || uerr.Status != http.StatusTooManyRequests {
+		t.Fatalf("uerr = %v, want the terminal 429", uerr)
+	}
+	if id != "a" || attempts != 1 {
+		t.Fatalf("id=%q attempts=%d, want a/1", id, attempts)
+	}
+
+	rows := rec.Rows()
+	if len(rows) != 2 || rows[0].Phase != PhaseResponse || rows[1].Phase != PhaseSkip {
+		t.Fatalf("rows = %+v, want a 429 row then a b skip row", rows)
+	}
+	if rows[0].Egress != "a" || rows[0].RetryDecision != RetryStop {
+		t.Fatalf("terminal dial row = %+v, want stop (plan exhausted behind it)", rows[0])
+	}
+	if rows[1].Egress != "b" || rows[1].Reason != SkipSlotFull || rows[1].RetryDecision != "" {
+		t.Fatalf("skip row = %+v, want slot_full with NO retry disposition", rows[1])
+	}
+}
+
 // TestEvidenceRetriedMatrixSharesAttempt: a 502 that burns the whole matrix
 // inside ONE egress attempt yields 4 rows sharing attempt=1 with distinct dial
 // numbers — the attempt_id derivation input (reqID/1, reqID/1.2, …). Only the

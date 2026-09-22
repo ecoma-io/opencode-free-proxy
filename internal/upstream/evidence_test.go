@@ -26,6 +26,11 @@ func TestSanitizeEvidence(t *testing.T) {
 		if got != "日" {
 			t.Fatalf("clamp = %q, want %q (no partial rune)", got, "日")
 		}
+		// The input-side byte clamp can leave the same split — a limit that
+		// lands mid-rune must still back off to a rune boundary.
+		if got := sanitizeEvidence("日本語", 7); got != "日本" {
+			t.Fatalf("input-clamped sanitize = %q, want %q", got, "日本")
+		}
 	})
 	t.Run("leading and trailing whitespace is trimmed", func(t *testing.T) {
 		if got := sanitizeEvidence("  x  ", 512); got != "x" {
@@ -70,13 +75,25 @@ func TestNormalizeMessage(t *testing.T) {
 		}
 	})
 	t.Run("non-address words survive", func(t *testing.T) {
-		got := NormalizeMessage("connect: connection refused by api.example.com")
-		// "connect:" has no dotted host part; the dotted hostname IS stripped.
+		got := NormalizeMessage("connect: connection refused by api.example.com:443")
+		// "connect:" has no numeric port; the host:port (the shape that varies
+		// across egresses) IS stripped.
 		if !strings.Contains(got, "connect:") {
 			t.Fatalf("plain word folded away: %q", got)
 		}
 		if strings.Contains(got, "example.com") {
-			t.Fatalf("dotted hostname survived: %q", got)
+			t.Fatalf("host:port survived: %q", got)
+		}
+	})
+	t.Run("dotted identifiers are not addresses", func(t *testing.T) {
+		// "config.yaml" / "secrets.env" are filenames, not hosts: stripping
+		// them would merge two different logical errors into one fingerprint.
+		if NormalizeMessage("failed parsing config.yaml") == NormalizeMessage("failed parsing secrets.env") {
+			t.Fatal("dotted identifiers must keep distinguishing fingerprints")
+		}
+		// Dotted hosts WITH a numeric segment are still addresses.
+		if strings.Contains(NormalizeMessage("dial tcp 10.0.0.1 refused"), "10.") {
+			t.Fatal("dotted numeric host survived")
 		}
 	})
 }
@@ -194,6 +211,22 @@ func TestExtractRateLimit(t *testing.T) {
 			t.Fatalf("entries = %d, want capped at %d", len(rl.Entries), config.EvidenceRateLimitEntries)
 		}
 	})
+	t.Run("a header carried multiple times merges into one entry", func(t *testing.T) {
+		// One canonical name must render as ONE JSON key — duplicate keys in
+		// a single JSON object would let last-wins parsers drop evidence.
+		h := http.Header{}
+		h.Add("X-RateLimit-Remaining", "42")
+		h.Add("X-RateLimit-Remaining", "7")
+		rl := ExtractRateLimit(h)
+		if rl == nil || len(rl.Entries) != 1 {
+			t.Fatalf("entries = %+v, want a single merged entry", rl)
+		}
+		// Go canonicalizes the name (X-RateLimit → X-Ratelimit); values join
+		// in the sorted order the extractor pinned for determinism.
+		if rl.Entries[0].Name != "X-Ratelimit-Remaining" || rl.Entries[0].Value != "42, 7" {
+			t.Fatalf("merged entry = %+v, want %q: %q", rl.Entries[0], "X-Ratelimit-Remaining", "42, 7")
+		}
+	})
 }
 
 func TestRecorderBoundedAndNilSafe(t *testing.T) {
@@ -236,6 +269,23 @@ func TestRecorderBoundedAndNilSafe(t *testing.T) {
 		rec.Annotate(9, func(row *Row) { row.Egress = "touched-late" })
 		if got := rec.Rows()[0].Egress; got != "touched" {
 			t.Fatalf("clamped-negative annotate = %q, want touched", got)
+		}
+	})
+	t.Run("AnnotateAt touches exactly one row", func(t *testing.T) {
+		var nilRec *Recorder
+		nilRec.AnnotateAt(0, func(*Row) { t.Fatal("must not run on nil") })
+
+		rec := NewRecorder()
+		rec.Append(Row{Phase: PhaseSkip, Egress: "a"})
+		rec.Append(Row{Phase: PhaseResponse, Egress: "b"})
+		rec.AnnotateAt(1, func(row *Row) { row.RetryDecision = RetryStop })
+		rec.AnnotateAt(99, func(row *Row) { row.Message = "boom" }) // out of range: no-op
+		rows := rec.Rows()
+		if rows[0].RetryDecision != "" || rows[0].Message != "" {
+			t.Fatalf("AnnotateAt leaked past its row: %+v", rows[0])
+		}
+		if rows[1].RetryDecision != RetryStop || rows[1].Message != "" {
+			t.Fatalf("AnnotateAt missed its row: %+v", rows[1])
 		}
 	})
 }

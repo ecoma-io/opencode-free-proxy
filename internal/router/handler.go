@@ -346,7 +346,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// row's decisions are complete and before the completion line.
 	rec := upstream.NewRecorder()
 	ev := newEvidenceLog(s.log, rec, reqID, rt.Generation, plan.RouteID, cleanModel,
-		profile.Endpoint, clientRequestedStreaming, session, url, evidenceMaxAttempts(policy), len(bodyJSON), bodyJSON)
+		profile.Endpoint, clientRequestedStreaming, session, url, policy.Budget(), len(bodyJSON), bodyJSON)
 	resp, egID, attempts, class, uerr := s.Exec.ExecuteObserved(reqCtx, url, buildHeaders, bodyJSON, plan, policy, rec)
 	latency := time.Since(start)
 	ev.Emit()
@@ -388,16 +388,6 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		return
 	}
 	s.stream(w, r, resp, cancelUpstream, ev, egID, sourceFormat, targetFormat, body, upstreamModel, customToolNames, intent)
-}
-
-// evidenceMaxAttempts mirrors the executor's budget normalization (the cap it
-// actually enforces on distinct egress attempts) so the evidence events report
-// the same max_attempts the decisions were made under.
-func evidenceMaxAttempts(policy upstream.AttemptPolicy) int {
-	if !policy.FallbackEnabled || policy.MaxAttempts < 1 {
-		return 1
-	}
-	return policy.MaxAttempts
 }
 
 // captureDownstream collects the client headers the executor forwards.

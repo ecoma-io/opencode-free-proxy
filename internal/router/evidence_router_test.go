@@ -276,9 +276,105 @@ routes:
 	}
 }
 
+// TestUpstreamErrorNoReEmitOnPostHeaderAbort: the emit contract is ONE event
+// per row, ever. A request whose first egress 429s (row emitted at the
+// post-Execute pass) and whose fallback egress then dies mid-stream (a second
+// emit from StreamAbort) must yield exactly two upstream_error events — the
+// 429 row must NOT be rendered a second time by the stream-phase emit.
+func TestUpstreamErrorNoReEmitOnPostHeaderAbort(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n"))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler) // kill the connection mid-stream
+	}))
+	defer up.Close()
+
+	var buf bytes.Buffer
+	_, mux := evidenceRouter(t, logging.New(&buf), twoDirectEgressDoc(up.URL))
+
+	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
+	if !strings.Contains(rec.Body.String(), "Hel") {
+		t.Fatalf("the already-delivered delta must reach the client: %q", rec.Body.String())
+	}
+
+	events := decodeEvents(t, &buf)
+	errs := eventsWith(events, "upstream_error")
+	if len(errs) != 2 {
+		t.Fatalf("upstream_error events = %d, want exactly 2 (the 429 row once, the stream row once)", len(errs))
+	}
+	reqID := strField(t, errs[0], "request_id")
+	if errs[0]["phase"] != "response" || errs[0]["egress"] != "a" || errs[0]["retry_decision"] != "fallback" {
+		t.Fatalf("first event = %v, want egress a's 429 falling back", errs[0])
+	}
+	if errs[1]["phase"] != "stream" || errs[1]["egress"] != "b" {
+		t.Fatalf("second event = %v, want egress b's stream death", errs[1])
+	}
+	// The hard regression: no line may repeat the 429 attempt's id — a
+	// byte-identical duplicate would be indistinguishable from a second dial.
+	dupes := 0
+	for _, ev := range events {
+		if ev["attempt_id"] == reqID+"/1" {
+			dupes++
+		}
+	}
+	if dupes != 1 {
+		t.Fatalf("attempt_id %s/1 rendered %d times, want exactly 1", reqID, dupes)
+	}
+}
+
+// TestEvidenceDroppedCounterOnSkipLastRow: the dropped counter rides the LAST
+// event of an emit pass whichever kind it is — when the recorder's final
+// stored row is a skip, the truncation must surface on the debug egress_skipped
+// event (at info level that line is suppressed, but at debug — where an
+// investigation looks — the overflow is visible).
+func TestEvidenceDroppedCounterOnSkipLastRow(t *testing.T) {
+	rec := upstream.NewRecorder()
+	for i := 0; i < config.EvidenceMaxRows-1; i++ {
+		rec.Append(upstream.Row{Phase: upstream.PhaseResponse, Egress: "a", Status: 429, Class: upstream.ClassUpstream429.String()})
+	}
+	rec.Append(upstream.Row{Phase: upstream.PhaseSkip, Egress: "b", Reason: upstream.SkipSlotFull, EgressType: "direct"})
+	rec.Append(upstream.Row{Phase: upstream.PhaseResponse, Egress: "c"}) // past the cap: dropped
+	if rec.Dropped() != 1 {
+		t.Fatalf("dropped = %d, want 1", rec.Dropped())
+	}
+
+	var buf bytes.Buffer
+	ev := newEvidenceLog(logging.New(&buf).Level(zerolog.DebugLevel), rec, "req", 1, "default", "m", "chat", true, "ses_e2e", "http://up.invalid", 3, 2, nil)
+	ev.Emit()
+
+	skips := eventsWith(decodeEvents(t, &buf), "egress_skipped")
+	if len(skips) != 1 {
+		t.Fatalf("egress_skipped events = %d, want 1", len(skips))
+	}
+	if skips[0]["evidence_dropped"] != float64(1) {
+		t.Fatalf("skip event evidence_dropped = %v, want 1", skips[0]["evidence_dropped"])
+	}
+	if skips[0]["egress_type"] != "direct" {
+		t.Fatalf("skip event must carry the egress type: %v", skips[0])
+	}
+	errs := eventsWith(decodeEvents(t, &buf), "upstream_error")
+	if len(errs) != config.EvidenceMaxRows-1 {
+		t.Fatalf("upstream_error events = %d, want %d", len(errs), config.EvidenceMaxRows-1)
+	}
+	for _, e := range errs {
+		if _, has := e["evidence_dropped"]; has {
+			t.Fatal("only the LAST event of a pass may carry evidence_dropped")
+		}
+	}
+}
+
 // TestUpstreamErrorForcedConvertFailure: a non-streaming client behind an SSE
 // upstream whose stream never parses renders a forced-phase row with the
-// bounded reason, while the client keeps the generic 502.
+// bounded reason. The row's status is the status the upstream response
+// STARTED with (200) — a phase row never rewrites it into the synthesized
+// client 502 (that is the error-write path's fact).
 func TestUpstreamErrorForcedConvertFailure(t *testing.T) {
 	up := newScriptedUpstream(t, &upstreamRecorder{}, http.StatusOK, "text/event-stream", "event: ping\n\n")
 	defer up.Close()
@@ -308,7 +404,7 @@ routes:
 	for key, want := range map[string]any{
 		"phase":  "forced",
 		"class":  "response_started",
-		"status": float64(502),
+		"status": float64(200),
 		"reason": "convert",
 	} {
 		if errs[0][key] != want {

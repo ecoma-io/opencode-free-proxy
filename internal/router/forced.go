@@ -58,7 +58,7 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	// to the evidence stream only.
 	raw, err := readBoundedSSE(r.Context(), resp.Body, config.MaxForcedSSEBytes, config.StreamStall)
 	if err != nil {
-		ev.ForcedAbort(egID, forcedAbortReason(r, err), time.Since(started).Milliseconds())
+		ev.ForcedAbort(egID, resp.StatusCode, forcedAbortReason(r, err), time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, "Failed to convert streaming response to JSON")
 		return
 	}
@@ -83,14 +83,14 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	// Standard Chat Completions SSE path.
 	parsed, errBody, ok := relay.ParseSSEToOpenAIResponse(string(raw), model)
 	if !ok {
-		ev.ForcedAbort(egID, "convert", time.Since(started).Milliseconds())
+		ev.ForcedAbort(egID, resp.StatusCode, "convert", time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, "Invalid SSE response for non-streaming request")
 		return
 	}
 	if errBody != nil {
 		// The stream itself carried an error frame — an upstream failure that
 		// began mid-stream (after the 200 headers), recorded as such.
-		ev.ForcedAbort(egID, "sse_error_frame", time.Since(started).Milliseconds())
+		ev.ForcedAbort(egID, resp.StatusCode, "sse_error_frame", time.Since(started).Milliseconds())
 		msg, _ := errBody["message"].(string)
 		if msg == "" {
 			msg = "Upstream SSE stream failed"
