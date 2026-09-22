@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.6.0...v0.7.0) (2026-09-22)
+
+
+### Features
+
+* **upstream:** upstream error evidence / forensics layer ([#46](https://github.com/ecoma-io/opencode-free-proxy/issues/46)) ([95ce95e](https://github.com/ecoma-io/opencode-free-proxy/commit/95ce95edf46c6f124e2ef0bf15362649606ae25b))
+
 ## [0.6.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.5.0...v0.6.0) (2026-09-21)
 
 
