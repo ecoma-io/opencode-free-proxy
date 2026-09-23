@@ -3,8 +3,10 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -55,10 +57,35 @@ func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
 		// and the fail-open fallback would mask the skew. The base rides the
 		// current generation like every other request.
 		rt := s.runtime()
+		// The base is resolved (Resolve validated it), but Parse keeps the
+		// host comparison honest: a base URL whose parse fails would leave nil,
+		// and the check below must refuse every redirect rather than panic. The
+		// addressable failure (unbuildable request) is the fetch's own.
+		base, _ := url.Parse(rt.UpstreamBase())
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.UpstreamBase()+config.ZenModelsPath, nil)
 		if err == nil {
 			req.Header.Set("Authorization", "Bearer "+config.PublicBearer)
-			if resp, err := s.Upstream.HTTP.Do(req); err == nil {
+			// Redirect allow-list (GHSA-5472-vw5j-wjvg): the models fetch is
+			// the one direct-client flow whose target is the operator's
+			// upstream base (model list redirectable for self-hosting), so a
+			// hostile 3xx from that origin must not steer the fetch at a
+			// private network through the host's own network. The shared
+			// s.Upstream client cannot carry this permanently — the UA sync
+			// loop legitimately follows cross-host redirects (api.github.com →
+			// raw.githubusercontent.com → registry.npmjs.org) through the same
+			// client — so the follow policy is a per-request CLONE bound to
+			// the snapshot's base host. The Transport is shared, so pooling is
+			// unaffected; the CheckRedirect only constrains this request. A
+			// refused redirect fails the fetch and lands the fail-open static
+			// registry, never an internal address.
+			client := *s.Upstream.HTTP // copy: caller's CheckRedirect only, same Transport
+			client.CheckRedirect = func(next *http.Request, _ []*http.Request) error {
+				if base == nil || !strings.EqualFold(next.URL.Hostname(), base.Hostname()) {
+					return fmt.Errorf("redirect refused: %s leaves the upstream base", boundedHost(next.URL.Hostname()))
+				}
+				return nil
+			}
+			if resp, err := client.Do(req); err == nil {
 				raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 				_ = resp.Body.Close()
 				entries = parseUpstreamModels(raw)
@@ -163,4 +190,16 @@ func staticFreeModels() []modelsEntry {
 
 func sortModels(entries []modelsEntry) {
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+}
+
+// boundedHost caps the base-host echo in the redirect-refusal error: the host
+// may carry attacker-chosen characters and the refusal is a client-facing
+// message, so the echo stays short (the message itself never reaches a log —
+// it is the fail-open trigger, and the static fallback answered).
+func boundedHost(host string) string {
+	const max = 100
+	if len(host) > max {
+		return host[:max] + "…"
+	}
+	return host
 }

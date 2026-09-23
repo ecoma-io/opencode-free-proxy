@@ -929,13 +929,25 @@ func TestCrossSchemeRedirectStaysOnEgress(t *testing.T) {
 // dials). The issue #6 contract instead: exactly ONE CONNECT, typed
 // proxy-auth, immediate fallback eligibility.
 func TestCrossSchemeRedirect407IsTyped(t *testing.T) {
-	// The http origin: one POST, then a 302 to an unreachable https target —
-	// unreachable is fine, the proxy refuses the CONNECT before any origin
-	// dial.
+	// The http origin: one POST, then a 302 to an https target on the SAME
+	// loopback host. The cross-HOST form (origin2.invalid — reachable to
+	// nowhere) is refused earlier now by the redirect allow-list
+	// (GHSA-5472-vw5j-wjvg): a redirect may only stay on the host the call
+	// started on. The typed-CONNECT boundary therefore has to be exercised by
+	// a redirect the allow-list PERMITS — one that stays on the initial
+	// target's host, crossing only schemes. The proxy refuses the CONNECT with
+	// 407 before any origin dial, so the https target never needs to be
+	// reachable: the https URL on the origin's own host:port is enough for the
+	// CONNECT authority line.
+	//
+	// The origin's own host:port is captured before the server exists — the
+	// handler closure cannot read origin.Host (self-referential).
+	var originHost string
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Location", "https://origin2.invalid/zen/v1/chat/completions")
+		w.Header().Set("Location", "https://"+originHost+"/zen/v1/chat/completions")
 		w.WriteHeader(http.StatusFound)
 	}))
+	originHost = strings.TrimPrefix(origin.URL, "http://")
 	defer origin.Close()
 
 	pxy := newEgressProxy(t, true) // CONNECT arm answers 407

@@ -613,6 +613,89 @@ func TestRedirectFollowedLikeJSFetch(t *testing.T) {
 	}
 }
 
+// TestRedirectAllowlistFollowsSameHost (GHSA-5472-vw5j-wjvg): a redirect
+// that STAYS on the initial target's host is still followed — the cross-port
+// shape (same 127.0.0.1, different httptest port) is the legitimate case the
+// allow-list must not break.
+func TestRedirectAllowlistFollowsSameHost(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: allowed\n\n")
+	}))
+	defer target.Close()
+
+	moved := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL+"/zen/v1/chat/completions")
+		w.WriteHeader(http.StatusFound) // 302 → GET, but the host is the same
+	}))
+	defer moved.Close()
+
+	c := noSleepClient(NewClientFor(nil))
+	resp, uerr := c.Do(context.Background(), moved.URL+"/zen/v1/chat/completions", staticHeaders(), []byte(`{}`))
+	if uerr != nil {
+		t.Fatalf("same-host redirect must be followed, got %v", uerr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "data: allowed") {
+		t.Fatalf("status=%d body=%q, want the target's SSE", resp.StatusCode, body)
+	}
+}
+
+// TestRedirectAllowlistRefusesCrossHost (GHSA-5472-vw5j-wjvg) is the SSRF
+// pin: a redirect to a DIFFERENT host — the exact shape that would dial a
+// private network (169.254.169.254, loopback services, internal names)
+// through the trusted egress — is refused BEFORE any dial of the target. The
+// request is not re-sent anywhere; the refusal surfaces as the 502 envelope.
+//
+// The refusal is provably pre-dial: the target host is one this process could
+// never reach anyway (.invalid), so a successful bypass would surface as a
+// DIAL to that host — and the honest refusal reads as the allow-list text
+// instead. ReplaySafe is false because the redirecting server already
+// received (and answered) the request before the guard fired: refusing a hop
+// never authorises a re-send of a call that was already on the wire.
+func TestRedirectAllowlistRefusesCrossHost(t *testing.T) {
+	c := noSleepClient(NewClientFor(nil))
+
+	// NOTE: a redirect from a loopback test server to ANOTHER loopback port is
+	// same-host and legitimately followed (documented accepted consequence —
+	// same-host cross-port is not the SSRF shape; the trusted hostname is
+	// already the one the call started on). The genuinely hostile shapes are
+	// all CROSS-host: a link-local metadata gateway, an internal DNS name, a
+	// foreign public host.
+	for _, tc := range []struct {
+		loc  string
+		want string // substring the refusal must carry
+	}{
+		{"http://169.254.169.254/latest/meta-data/", "leaves the request host"},
+		{"http://internal-corp.example/zen/v1/chat/completions", "leaves the request host"},
+		{"https://example.com/zen/v1/chat/completions", "leaves the request host"},
+	} {
+		moved := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Location", tc.loc)
+			w.WriteHeader(http.StatusFound)
+		}))
+
+		resp, uerr, failure := c.DoClassified(context.Background(), moved.URL+"/zen/v1/chat/completions", staticHeaders(), []byte(`{}`))
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		if uerr == nil {
+			t.Fatalf("loc %q: expected the cross-host redirect refused, got a response", tc.loc)
+		}
+		if uerr.Status != http.StatusBadGateway {
+			t.Fatalf("loc %q: uerr = %+v, want 502", tc.loc, uerr)
+		}
+		if !strings.Contains(uerr.Message, tc.want) {
+			t.Fatalf("loc %q: error = %q, want %q", tc.loc, uerr.Message, tc.want)
+		}
+		if failure.ReplaySafe() {
+			t.Fatalf("loc %q: refusal reported replay-safe, but the redirecting server already received the request (3xx received)", tc.loc)
+		}
+		moved.Close()
+	}
+}
+
 // ---- Bounded terminal error body ----
 
 // TestTerminalErrorBodyReadIsBounded: a hostile upstream answering a

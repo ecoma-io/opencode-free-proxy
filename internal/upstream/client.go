@@ -406,6 +406,24 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 			drainAndClose(resp)
 			return nil, hop, path, fmt.Errorf("redirect: Location %q is not an HTTP(S) URL", loc)
 		}
+		// Redirect-host allow-list (GHSA-5472-vw5j-wjvg): a redirect may only
+		// stay on the host the logical call STARTED on — the configured
+		// upstream base (validated at config load), which is the one origin
+		// this proxy is authorized to reach. A hostile 3xx therefore cannot
+		// steer the request at a private network (169.254.169.254 metadata,
+		// loopback services, internal names) through the trusted egress. The
+		// comparison is on hostname, not host:port: same-host cross-port
+		// redirects are legitimate (opencode.ai:443 → opencode.ai:80 for an
+		// HTTP->HTTPS flip), and no additional trust is extended by allowing
+		// them — the host is already the trusted origin. Differs from
+		// undici/net-http, which follow cross-host redirects by default; this
+		// is the deliberate hardening that closes the SSRF. Note the refusal
+		// happens AFTER noteResponse above, so the failure the caller records
+		// inherits response_started/unknown — never not_sent.
+		if !sameRedirectHost(next.Hostname(), initialHostname) {
+			drainAndClose(resp)
+			return nil, hop, path, fmt.Errorf("redirect: Location %q leaves the request host (%s)", boundedLocation(loc), initialHostname)
+		}
 		hops++
 		if hops > config.MaxRedirects {
 			drainAndClose(resp)
@@ -533,6 +551,29 @@ func sameDomainOrSub(dest, parent string) bool {
 		return false
 	}
 	return strings.HasSuffix(dest, "."+parent)
+}
+
+// sameRedirectHost is the redirect allow-list predicate
+// (GHSA-5472-vw5j-wjvg): a redirect may only stay on the host the logical
+// call started on. Exact hostname equality, case-insensitive (hostnames are
+// case-insensitive); a trailing-dot FQDN form or an IDNA A-label counts as a
+// DIFFERENT host and is refused — the safe direction (over-refusing an exotic
+// redirect beats dialing a wrong host through the trusted egress).
+func sameRedirectHost(dest, initial string) bool {
+	return strings.EqualFold(dest, initial)
+}
+
+// boundedLocation limits the redirect-refusal error text: the Location header
+// is attacker-controlled, and the error surfaces to clients. The header is
+// already trimmed to a short cap; if it is longer the tail is dropped rather
+// than echoed in full (CWE-117 hygiene: the value rides the JSON error body,
+// never a log line, but a bounded echo keeps the message honest and small).
+func boundedLocation(loc string) string {
+	const max = 200
+	if len(loc) > max {
+		return loc[:max] + "…"
+	}
+	return loc
 }
 
 // There is deliberately no tryRetry here. base.js:104-125 spent a per-URL
