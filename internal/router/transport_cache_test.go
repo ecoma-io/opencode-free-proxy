@@ -206,8 +206,18 @@ func TestOldGenerationCanRebuildItsPinnedTransport(t *testing.T) {
 
 // TestPruneDoesNotCloseActiveConnection: CloseIdleConnections during the
 // generation prune spares the ACTIVE connection — the server side never sees
-// the conn torn down while the request is mid-flight, and the conn goes idle
-// (not closed) once the response completes.
+// the conn torn down while the request is mid-flight.
+//
+// The invariance is sampled while the request is provably ACTIVE (the handler
+// is blocked inside release), BEFORE the response completes, so no
+// completion-time transition can race the assertion. What happens AFTER the
+// response is deliberately not pinned as "idle": Go's CloseIdleConnections
+// latches a `closeIdle` flag that the next tryPutIdleConn observes, so a
+// bodyless response's pool handoff may legitimately close the conn as it would
+// have pooled (net/http transport.go, tryPutIdleConn: `if t.closeIdle {
+// return errCloseIdle }`). Closing it as it became idle is the transport
+// honoring "close newly idle conns" — the conn was still never torn down while
+// ACTIVE, which is the contract under test.
 func TestPruneDoesNotCloseActiveConnection(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -243,30 +253,35 @@ func TestPruneDoesNotCloseActiveConnection(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("request never reached the upstream handler")
 	}
+	addr, _ := remote.Load().(string)
+	if addr == "" {
+		t.Fatal("handler never recorded its conn address")
+	}
 
+	// The prune runs while the request is provably ACTIVE. CloseIdleConnections
+	// only ever closes conns that are ALREADY idle, so the in-flight one — and
+	// its server-side conn — must be untouched. Sampled before release: the
+	// assertion cannot race a completion-time transition.
 	pruneNow := func() {
 		s.clientMu.Lock()
 		s.pruneClientsLocked(map[string]struct{}{}) // evict EVERYTHING
 		s.clientMu.Unlock()
 	}
 	pruneNow()
+	if tracker.saw(addr, http.StateClosed) {
+		t.Fatal("the ACTIVE connection must not be closed by the prune")
+	}
 
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatalf("the active connection must survive the prune: %v", err)
 	}
-
-	addr, _ := remote.Load().(string)
-	if addr == "" {
-		t.Fatal("handler never recorded its conn address")
-	}
-	if tracker.saw(addr, http.StateClosed) {
-		t.Fatal("the active connection must not be closed by the prune")
-	}
-	waitUpTo(t, 2*time.Second, func() bool { return tracker.saw(addr, http.StateIdle) })
-	if !tracker.saw(addr, http.StateIdle) {
-		t.Fatal("the connection must return to the idle pool after the response")
-	}
+	// The request was served on the same conn. The conn may now go StateIdle
+	// (it outran the latched closeIdle and pooled) or StateClosed (the latched
+	// flag closed it as it became idle — the `TestTransportReplacementDoesNot-
+	// LeakIdleConnections` case, just for a conn that became idle here): both
+	// POST-response transitions are legal. The invariant that regressed before
+	// the fix is the ACTIVE window asserted above.
 }
 
 // TestTransportReplacementDoesNotLeakIdleConnections: a proxy swap evicts the

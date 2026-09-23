@@ -117,7 +117,11 @@ func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
 // rebuilt (self-healing — the next dial rebuilds — but needless conn churn).
 // In-flight requests hold their *Client by reference (the map is only a
 // lookup), so pruning cannot invalidate them; evicted clients close their
-// idle conns instead of waiting on GC. Health reclamation additionally
+// IDLE conns immediately (CloseIdleConnections), while a conn still busy
+// under an in-flight request returns to its transport's pool afterwards and
+// is reaped by the IdleConnTimeout every transport carries — net/http
+// registers no finalizer, so that timeout is the backstop that eventually
+// releases the returned conn (see config.IdleConnTimeout). Health reclamation additionally
 // spares every identity pinned by an in-flight request (health.Registry.Pin
 // at snapshot pin time), so state an old-generation request still observes
 // is never dropped under it; scheduler rotation state needs no such pin — a

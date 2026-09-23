@@ -403,6 +403,16 @@ routes:
 // event (at info level that line is suppressed, but at debug — where an
 // investigation looks — the overflow is visible).
 func TestEvidenceDroppedCounterOnSkipLastRow(t *testing.T) {
+	// The skip row renders at DEBUG, and zerolog's GlobalLevel() gates every
+	// event even when the logger has its own level (should(): `lvl < l.level ||
+	// lvl < GlobalLevel()`). A polling-store test that ran before this one
+	// leaves the global at info (tick → SetGlobalLevel, never restored), which
+	// would suppress the row this test asserts. Pin the global for the test's
+	// duration; defer restores the caller's value.
+	prev := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	defer zerolog.SetGlobalLevel(prev)
+
 	rec := upstream.NewRecorder()
 	for i := 0; i < config.EvidenceMaxRows-1; i++ {
 		rec.Append(upstream.Row{Phase: upstream.PhaseResponse, Egress: "a", Status: 429, Class: upstream.ClassUpstream429.String()})
@@ -485,6 +495,12 @@ routes:
 // rows are debug diagnostics, failure rows are warn — a logger at info never
 // emits the skip line (the volume guarantee), and success rows never exist.
 func TestEvidenceEmitLevelPolicy(t *testing.T) {
+	// Same global pin as TestEvidenceDroppedCounterOnSkipLastRow: the debug
+	// subtest must render debug rows no matter which polling-store test ran
+	// before (see that test's comment for the mechanism).
+	prev := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	defer zerolog.SetGlobalLevel(prev)
 	newLog := func(level zerolog.Level, buf *bytes.Buffer) zerolog.Logger {
 		return logging.New(buf).Level(level)
 	}

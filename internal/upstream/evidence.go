@@ -536,9 +536,11 @@ func appendTransportRow(rec *Recorder, dur time.Duration, failure Failure, err e
 // second body read.
 //
 // The fingerprint hashes over status|type|code|normalized message, so the same
-// logical verdict groups across attempts, egresses and requests. Both status
-// and provenance are what the provider said and what that proves: an HTTP
-// verdict is always upstream/response_started, which no policy may replay.
+// logical verdict groups across attempts, egresses and requests. The status is
+// what the answering peer wrote; the provenance is what the PATH proves about
+// that peer's authorship (issue #63): a direct hop is the provider's verdict,
+// a hop an HTTP intermediary carried is ambiguous, and a 4xx/5xx is never
+// replayable regardless of origin.
 func appendResponseRow(rec *Recorder, dur time.Duration, status int, h http.Header, raw []byte, uerr *UpstreamError, failure Failure) {
 	if rec == nil {
 		return
