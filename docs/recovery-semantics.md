@@ -270,6 +270,18 @@ wire protocol: OFP does not invent an RPC, and where a capability belongs to
 RPGW (selection policy, pool health) OFP does not reimplement it. See
 [Status](#status) for which side of this contract exists today.
 
+**Cross-repo dependency (recorded, not invented):** OFP's side of this seam is
+implemented today by `routing.PlanSelector`, which answers the two intents from
+the request's own pinned plan. A pool-backed selector — one that asks RPGW
+`ecoma-io/rotation-proxy-gateway` to pick the next egress — is the RPGW side of
+this contract and does not exist yet. When it lands, RPGW must implement, at
+minimum: accept a logical `normal` / `new-egress` request, never receive or
+return a raw proxy IP/id/pool internal, honour `new-egress` by not deliberately
+reusing the egress that served the previous attempt (returning its only member
+when no alternative exists is allowed), and let the pools' own health policy
+answer eligibility. OFP will not implement that side itself and will not infer
+an intent from a provider status in its place.
+
 ## What this contract deliberately excludes
 
 - **Proxy or IP identity is not cross-service semantics.** Neither the
@@ -293,18 +305,18 @@ RPGW (selection policy, pool health) OFP does not reimplement it. See
 
 ## Status
 
-| Contract element                                   | State                                                       |
-| -------------------------------------------------- | ----------------------------------------------------------- |
-| Provenance model (origin / phase / request_state)  | **in force** — recorded on every evidence row               |
-| Proof boundary at the transport layers             | **in force** — dial phases recorded by the dialers          |
-| `not_sent` never claimed without a dial            | **in force**, pinned by test                                |
-| Provider HTTP responses terminal at OFP            | **in force** — one logical upstream call per attempt        |
-| Safe-failover-only egress movement                 | **in force** — `Failure.ReplaySafe()` gates the move        |
-| Health = egress-path health only                   | **in force** — the same predicate gates the mark            |
-| Evidence vocabulary without retry-matrix fields    | **in force** — rows carry phase/origin/state/decisions      |
-| Inbound `X-OFP-*` stripped before any stage        | **in force**, pinned by test                                |
-| `failure_origin` on the internal response envelope | **in force** — `X-OFP-Failure-Origin/Phase`/`Request-State` |
-| OFP ↔ RPGW egress intent (`normal` / `new-egress`) | lands with the gateway/upstream split                       |
+| Contract element                                   | State                                                                                               |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Provenance model (origin / phase / request_state)  | **in force** — recorded on every evidence row                                                       |
+| Proof boundary at the transport layers             | **in force** — dial phases recorded by the dialers                                                  |
+| `not_sent` never claimed without a dial            | **in force**, pinned by test                                                                        |
+| Provider HTTP responses terminal at OFP            | **in force** — one logical upstream call per attempt                                                |
+| Safe-failover-only egress movement                 | **in force** — `Failure.ReplaySafe()` gates the move                                                |
+| Health = egress-path health only                   | **in force** — the same predicate gates the mark                                                    |
+| Evidence vocabulary without retry-matrix fields    | **in force** — rows carry phase/origin/state/decisions                                              |
+| Inbound `X-OFP-*` stripped before any stage        | **in force**, pinned by test                                                                        |
+| `failure_origin` on the internal response envelope | **in force** — `X-OFP-Failure-Origin/Phase`/`Request-State`                                         |
+| OFP ↔ RPGW egress intent                           | OFP side **in force** (selector seam + recorded intent); RPGW side a recorded cross-repo dependency |
 
 The revision that delivers each row is named in its pull request; this table
 is updated in the same commit as the behaviour it describes.

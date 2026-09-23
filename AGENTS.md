@@ -139,6 +139,19 @@ The semantics agents most often get wrong:
     of the pipeline, so no client can forge one. Pinned by
     `internal/router/provenance_header_test.go` and the black-box
     `e2e/provenance_test.go`.
+12. Egress selection is a **logical intent, not an index walk** (issue #56,
+    `internal/routing/intent.go`). The attempt loop asks `routing.Selector`
+    for the next egress under `normal` (no history) or `new-egress` (a
+    replay-safe failure invalidated the previous one); the in-process
+    `PlanSelector` walks the request's pinned plan, and a pool-backed
+    (RPGW) selector is a recorded cross-repo dependency, never invented
+    here. The intent is recorded on every evidence row (`egress_intent`),
+    never derived from a provider status (a 429 attempt stays `normal`),
+    and never accepted from the wire — inbound `X-OFP-*` is stripped before
+    any stage. `fallback.max_attempts` bounds DISTINCT egresses; one route
+    member is tried at most once per request. Pinned by
+    `internal/routing/intent_test.go`, `internal/upstream/intent_test.go`,
+    and `internal/router/intent_router_test.go`.
 
 ## Layout
 

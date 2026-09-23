@@ -160,6 +160,13 @@ func (e *evidenceLog) emitError(row upstream.Row, dropped int) {
 	if row.EgressType != "" {
 		evt.Str("egress_type", row.EgressType)
 	}
+	// The intent the attempt's egress was selected under (issue #56): the
+	// request asked for `normal` (first attempt) or `new-egress` (a
+	// replacement after a replay-safe failure). Recorded, never inferred from
+	// the status, and never taken from the wire.
+	if row.Intent != "" {
+		evt.Str("egress_intent", row.Intent)
+	}
 	if row.Status > 0 {
 		evt.Int("status", row.Status)
 	}
@@ -240,6 +247,9 @@ func (e *evidenceLog) emitSkip(row upstream.Row, dropped int) {
 		Str("egress", row.Egress)
 	if row.EgressType != "" {
 		evt.Str("egress_type", row.EgressType)
+	}
+	if row.Intent != "" {
+		evt.Str("egress_intent", row.Intent)
 	}
 	evt.Str("reason", row.Reason)
 	if dropped > 0 {
