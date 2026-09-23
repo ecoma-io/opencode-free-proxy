@@ -130,6 +130,18 @@ func setGatewayNotSent(h http.Header) {
 	h.Set(headerRequestState, upstream.RequestStateNotSent.String())
 }
 
+// setGatewayResponseStarted labels a gateway-generated error produced AFTER
+// an upstream response had already been received on this logical call (issue
+// #72). The 502 is this process's own, and the state header records the fact
+// that forbids a re-send: a response existed before this process failed.
+// Called where the forced SSE→JSON path synthesizes a 502 over a live 2xx
+// stream — the label the success-path header (upstream/ambiguous) would
+// otherwise have left on the wire.
+func setGatewayResponseStarted(h http.Header) {
+	h.Set(headerFailureOrigin, originGateway)
+	h.Set(headerRequestState, upstream.RequestStateResponseStarted.String())
+}
+
 // stripInternalHeaders removes every inbound X-OFP-* header.
 //
 // Defence in depth today, a hard requirement the moment one of these headers
