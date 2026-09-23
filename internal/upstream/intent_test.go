@@ -82,6 +82,46 @@ func TestProviderVerdictProducesNoNewEgressIntent(t *testing.T) {
 	}
 }
 
+// TestFailedEgressIsNeverRedialedThroughTheHandle (issue #64): the replacement
+// request carries the HANDLE of the selection that just failed, not its id, and
+// the selector is the one that decodes it. The observable consequence is the
+// same as before the seam changed — the failed egress is never dialed twice —
+// and this is the plan shape where it has real work to do: a repeated egress,
+// which config validation rejects in production, so the exclusion is the only
+// thing standing between the plan and a second dial of the same egress.
+//
+// The budget is 2, so the budget is NOT what stops this: if the handle were
+// ignored the executor would dial a again. One dial, one row, and the row's
+// decision corrected to `stop` (the request ended when the plan ran out, not
+// because it found a second egress).
+func TestFailedEgressIsNeverRedialedThroughTheHandle(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 200})
+	defer f.Close()
+	f.deadEgress(t, "a")
+
+	rec := NewRecorder()
+	resp, id, attempts, _, uerr := f.exec.ExecuteObserved(
+		context.Background(), f.servers["a"].URL,
+		func() map[string]string { return map[string]string{} },
+		[]byte(`{}`), f.plan("r", "a", "a"), policy(true, 2), rec)
+	if resp != nil || uerr == nil {
+		t.Fatalf("resp=%v uerr=%v, want the transport failure surfaced", resp, uerr)
+	}
+	if id != "a" || attempts != 1 {
+		t.Fatalf("id=%q attempts=%d, want a/1 — the failed egress must not be dialed twice, the budget would allow it", id, attempts)
+	}
+	rows := rec.Rows()
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1 (one selection, one dial):\n%+v", len(rows), rows)
+	}
+	if rows[0].Intent != "normal" {
+		t.Fatalf("intent = %q, want normal — the selection that was made, never a replacement that did not happen", rows[0].Intent)
+	}
+	if rows[0].FallbackDecision != FallbackStop {
+		t.Fatalf("fallback = %q, want stop: the plan was exhausted, so the request stopped at this row", rows[0].FallbackDecision)
+	}
+}
+
 // TestSkippedSelectionKeepsItsIntent: a pass-over is a scheduling fact, not a
 // failure, so a plan skipped over before the first dial never turns the next
 // selection into a replacement request. The first DIALED attempt is still

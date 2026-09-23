@@ -173,18 +173,25 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 	// Selection goes through routing.Selector rather than the plan's index:
 	// the request asks for its FIRST egress with intent `normal`, and for
 	// every egress after a replay-safe failure with `new-egress` plus the
-	// egress that just failed. The in-process implementation walks this
-	// request's pinned plan; a pool-backed (RPGW) selector would answer the
-	// same two questions from the pool. The intent is never derived from a
-	// provider status and never accepted from the wire (routing/intent.go).
+	// handle of the selection that just failed. The in-process implementation
+	// walks this request's pinned plan; a pool-backed (RPGW) selector would
+	// answer the same two questions from the pool. The intent is never derived
+	// from a provider status and never accepted from the wire; the handle is
+	// never built here, only echoed back (routing/intent.go).
 	selector := routing.NewPlanSelector(plan)
 	intent := routing.IntentNormal
-	exclude := ""
+	// prev is the LAST selection this loop made — the zero Selection on the
+	// first pass, and thereafter the handle the executor received from the
+	// selector itself. `new-egress` therefore means "not the egress this
+	// selection resolved to", which is the most the caller can honestly say;
+	// the identity stays on the selector's side of the seam.
+	var prev routing.Selection
 	for {
-		id, eg, selected := selector.Next(intent, exclude)
+		sel, selected := selector.Next(intent, prev)
 		if !selected {
 			break
 		}
+		id, eg, _ := sel.Resolve()
 		// selIntent is the intent THIS selection was made under, captured
 		// before any branch can change `intent` for the next one.
 		selIntent := intent
@@ -286,10 +293,11 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 			// exhaust the plan.
 			terminalRow = annotateDecision(rec, startRow, health, FallbackYes)
 			// The next selection is a REPLACEMENT request: `new-egress`,
-			// excluding the egress that just failed. Nothing else can set
-			// this — a provider verdict and an unprovable failure both
-			// returned above (issue #56).
-			intent, exclude = routing.IntentNewEgress, id
+			// carrying back the handle of the selection that just failed (not
+			// its id — the identity never leaves the selector's side of the
+			// seam, issue #64). Nothing else can set this — a provider verdict
+			// and an unprovable failure both returned above (issue #56).
+			intent, prev = routing.IntentNewEgress, sel
 			continue
 		}
 		if x.health != nil {

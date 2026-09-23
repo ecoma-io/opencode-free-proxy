@@ -159,17 +159,26 @@ The semantics agents most often get wrong:
     of the pipeline, so no client can forge one. Pinned by
     `internal/router/provenance_header_test.go` and the black-box
     `e2e/provenance_test.go`.
-12. Egress selection is a **logical intent, not an index walk** (issue #56,
-    `internal/routing/intent.go`). The attempt loop asks `routing.Selector`
-    for the next egress under `normal` (no history) or `new-egress` (a
-    replay-safe failure invalidated the previous one); the in-process
-    `PlanSelector` walks the request's pinned plan, and a pool-backed
-    (RPGW) selector is a recorded cross-repo dependency, never invented
-    here. The intent is recorded on every evidence row (`egress_intent`),
-    never derived from a provider status (a 429 attempt stays `normal`),
-    and never accepted from the wire — inbound `X-OFP-*` is stripped before
-    any stage. `fallback.max_attempts` bounds DISTINCT egresses; one route
-    member is tried at most once per request. Pinned by
+12. Egress selection is a **logical intent, not an index walk** (issues #56,
+    #64, `internal/routing/intent.go`). The attempt loop asks
+    `routing.Selector` for the next egress under `normal` (no history) or
+    `new-egress` (a replay-safe failure invalidated the previous one), and
+    the currency across that seam is an **opaque `Selection` handle**, never
+    an egress identity: `Next(intent Intent, prev Selection) (Selection,
+bool)`, with `Selection.Resolve()` telling the caller only what to dial.
+    A caller cannot request a named egress, exclude one by name, or read an
+    identity out of a selection — `prev` means "the egress that served the
+    previous attempt" without the caller spelling it, which is what lets a
+    pool-backed selector define its own handles. `new-egress` is not a
+    preference the caller can satisfy by naming: the selector decodes `prev`
+    and must not deliberately reuse it. The in-process `PlanSelector` walks
+    the request's pinned plan, and a pool-backed (RPGW) selector is a
+    recorded cross-repo dependency, never invented here. The intent is
+    recorded on every evidence row (`egress_intent`), never derived from a
+    provider status (a 429 attempt stays `normal`), and never accepted from
+    the wire — inbound `X-OFP-*` is stripped before any stage.
+    `fallback.max_attempts` bounds DISTINCT egresses; one route member is
+    tried at most once per request. Pinned by
     `internal/routing/intent_test.go`, `internal/upstream/intent_test.go`,
     and `internal/router/intent_router_test.go`.
 
