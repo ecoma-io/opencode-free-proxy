@@ -109,13 +109,16 @@ holding a stale snapshot can never prune against its older keep-set.
 - **Transports** (`internal/router`) — cached by transport signature.
   Cache membership is NOT request ownership: a request owns the `*Client` it
   resolved by reference, so eviction cannot fail or destabilize it. Eviction
-  closes the old transport's IDLE connections immediately; a connection still
-  busy under an in-flight request returns to its transport's idle pool
-  afterwards and is reaped by the `IdleConnTimeout` every transport carries
-  (`net/http` registers no finalizer, so that timeout — not GC — is the
-  backstop that eventually releases a returned conn). An active connection
-  is never closed by the prune; the stale snapshot self-heals by rebuilding
-  the client on its next dial.
+  latches the old transport's `closeIdle` and closes its IDLE connections
+  immediately; a connection still busy under an in-flight request completes,
+  and the moment it returns to the pool `tryPutIdleConn` sees the latched
+  flag and closes it ON RETURN — not by the timer. `IdleConnTimeout` is the
+  backstop for the unlatched lifetime only: it reaps a conn that re-entered
+  the pool AFTER a later prune re-armed the latch, or one whose transport
+  was never pruned (`net/http` registers no finalizer, so that timeout — not
+  GC — is what eventually releases a never-pruned transport's returned
+  conn). An active connection is never closed by the prune; the stale
+  snapshot self-heals by rebuilding the client on its next dial.
 
 ## The request pipeline
 
@@ -152,7 +155,8 @@ AGENTS.md for the porting discipline):
    never put a byte on the wire. 60 s response-header timeout, 360 s stream
    stall (reset per line). Every SECONDARY read of an already-received
    body — the terminal error-envelope read, the redirect drain, the non-SSE
-   guard — is bounded by the byte cap AND a total deadline
+   guard, and the `/v1/models` fetch (bounded under its own
+   `ModelsFetchTimeout`) — is bounded by the byte cap AND a total deadline
    (`SecondaryReadTimeout`, 10 s); only the SSE product read (ScanLines)
    keeps a progress-reset stall, because a slow-but-live stream is the
    product there.
@@ -301,7 +305,9 @@ transport can _prove_ about transmission. The contract those fields serve is
   the SSE product — the terminal error-envelope read, the redirect drain,
   and the non-SSE guard — through `ReadBoundedBody`, which caps the bytes
   (`maxErrorBodyBytes` / `maxNonSSEBodyBytes`) AND the total time
-  (`config.SecondaryReadTimeout`, 10 s, via a watchdog). The
+  (`config.SecondaryReadTimeout`, 10 s, via a watchdog). A fourth secondary
+  read, the `/v1/models` fetch, is total-bounded by its own request context
+  (`config.ModelsFetchTimeout`) rather than the helper. The
   response-HEADER timeout (`ConnectTimeout`) is spent once headers arrive
   and bounds nothing further, so a peer streaming a secondary body forever
   below the byte cap would pin the goroutine outright without the deadline.

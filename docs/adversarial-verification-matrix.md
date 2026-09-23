@@ -173,11 +173,13 @@ recorded**.
 ### R7 — Secondary body reads are total-bounded (bytes AND time); the SSE product read is not
 
 - **Contract:** every read of an already-received upstream body that is NOT the
-  SSE product — the terminal error-envelope read, the redirect drain, and the
-  non-SSE guard — is bounded by a byte cap (`maxErrorBodyBytes` /
-  `maxNonSSEBodyBytes`) and a total deadline (`config.SecondaryReadTimeout`,
-  10 s). A peer streaming a secondary body forever below the byte cap pins the
-  goroutine only until the deadline fires. The SSE product read (`ScanLines`)
+  SSE product — the terminal error-envelope read, the redirect drain, the
+  non-SSE guard, and the `/v1/models` fetch — is bounded by a byte cap
+  (`maxErrorBodyBytes` / `maxNonSSEBodyBytes` / 4 MiB for models) and a total
+  deadline (`config.SecondaryReadTimeout`, 10 s; the models fetch under its
+  own `config.ModelsFetchTimeout`, enforced by the request context). A peer
+  streaming a secondary body forever below the byte cap pins the goroutine
+  only until the deadline fires. The SSE product read (`ScanLines`)
   deliberately keeps its 360 s progress-reset stall instead: a slow-but-live
   stream is the product, and any chunk re-arms the window.
 - **Guard seam:** `internal/upstream/client.go` `ReadBoundedBody` /

@@ -399,8 +399,10 @@ Responses passthrough client still receives a parseable `response.failed`
 terminal plus `[DONE]` (`internal/router/stream.go`).
 
 Every SECONDARY read of an already-received upstream body — the terminal
-error-envelope read, the redirect drain, and the non-SSE guard — is bounded
-by its byte cap AND a total deadline (`config.SecondaryReadTimeout`, 10 s).
+error-envelope read, the redirect drain, the non-SSE guard, and the
+`/v1/models` fetch — is bounded by its byte cap AND a total deadline
+(`config.SecondaryReadTimeout`, 10 s; the models fetch under its own
+`config.ModelsFetchTimeout`).
 The response-HEADER timeout is spent once headers arrive and bounds nothing
 further, so a peer dripping a secondary body below the byte cap forever
 would pin the goroutine without the deadline. The SSE product read is the

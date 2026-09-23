@@ -61,8 +61,10 @@ The obligations are asymmetric, and deliberately so:
 
 The state machine is **monotonic**: an attempt never returns to `not_sent`
 after leaving it. A hop that dialed successfully and wrote nothing reports
-`not_sent` only while no earlier hop wrote either — the claim is about the
-attempt, and the attempt's history is what the classifier reads.
+`not_sent` only while no earlier hop wrote either — and only on a hop that
+performed a dial: a pooled-connection failure has no dial and never claims
+`not_sent`, clean or not. The claim is about the attempt, and the attempt's
+history is what the classifier reads.
 
 `not_sent ⇒ failover MAY` is a permission, not an instruction. `unknown ⇒ no
 replay` is absolute: an unproven state is not a weak `not_sent`, it is the
