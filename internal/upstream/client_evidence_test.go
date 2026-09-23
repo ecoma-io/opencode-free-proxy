@@ -1,11 +1,11 @@
 package upstream
 
-// Evidence-capture tests for DoClassifiedObserved: every failed dial leaves a
-// row carrying the facts the verdict actually had (status/headers/body/rate
-// limits BEFORE classification reduces them), retried verdicts are captured
-// before the drain destroys them, and successful dials leave no row. The
-// retry/classification BEHAVIOR is already pinned by client_test.go — these
-// tests pin only what the recorder observed.
+// Evidence-capture tests for DoClassifiedObserved: every failed interaction
+// leaves exactly ONE row carrying the facts the verdict actually had
+// (status/headers/body/rate limits BEFORE classification reduces them), and
+// successful dials leave no row. One Client.Do is one logical upstream call
+// (issue #53), so "one row per failed interaction" and "one row per attempt"
+// are the same statement here.
 
 import (
 	"context"
@@ -14,16 +14,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 
 	"opencode-free-proxy/internal/config"
 )
 
 // doObserved runs one observed call against a test server.
-func doObserved(c *Client, url string, rec *Recorder) (*http.Response, *UpstreamError, Class) {
+func doObserved(c *Client, url string, rec *Recorder) (*http.Response, *UpstreamError, Failure) {
 	return c.DoClassifiedObserved(context.Background(), url, staticHeaders(), []byte("{}"), rec)
 }
+
+// testClient is the plain direct client the evidence cases dial with. It used
+// to stub the retry sleep; there is no sleep seam any more, so it is NewClient.
+func testClient() *Client { return NewClient() }
 
 func TestEvidence429CarriesRateLimits(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -37,13 +40,18 @@ func TestEvidence429CarriesRateLimits(t *testing.T) {
 	defer srv.Close()
 
 	rec := NewRecorder()
-	_, uerr, class := doObserved(newTestClient(&recordingSleeper{}), srv.URL, rec)
-	if uerr == nil || uerr.Status != 429 || class != ClassUpstream429 {
-		t.Fatalf("uerr=%v class=%s", uerr, class)
+	_, uerr, failure := doObserved(testClient(), srv.URL, rec)
+	if uerr == nil || uerr.Status != 429 || failure.Class != ClassUpstream429 {
+		t.Fatalf("uerr=%v class=%s", uerr, failure.Class)
+	}
+	// A provider verdict: the request was received and answered, so nothing
+	// here may ever authorise a re-send (the recovery contract's whole point).
+	if failure.Origin != OriginUpstream || failure.RequestState != RequestStateResponseStarted || failure.ReplaySafe() {
+		t.Fatalf("429 provenance = %+v, want an upstream response_started verdict", failure)
 	}
 	rows := rec.Rows()
 	if len(rows) != 1 {
-		t.Fatalf("rows = %d, want 1 (429 never retries)", len(rows))
+		t.Fatalf("rows = %d, want 1 (one call, one row)", len(rows))
 	}
 	row := rows[0]
 	if row.Phase != PhaseResponse || row.Status != 429 || row.Class != ClassUpstream429.String() {
@@ -52,8 +60,10 @@ func TestEvidence429CarriesRateLimits(t *testing.T) {
 	if row.RateLimit == nil || row.RateLimit.RetryAfter != "17" || len(row.RateLimit.Entries) != 3 {
 		t.Fatalf("rate limits lost: %+v", row.RateLimit)
 	}
-	if row.Retried || row.RetryDecision != "" {
-		t.Fatalf("no retry happened, but row says retried=%t decision=%q", row.Retried, row.RetryDecision)
+	// The executor, not the client, owns the two decisions; before it runs
+	// they are unset — a row never claims a decision before one exists.
+	if row.HealthDecision != "" || row.FallbackDecision != "" {
+		t.Fatalf("client-layer row carries decisions: %+v", row)
 	}
 	if row.ErrType != "rate_limit_error" {
 		t.Fatalf("error type lost: %q", row.ErrType)
@@ -88,12 +98,12 @@ func TestEvidenceStatusCoverage(t *testing.T) {
 			defer srv.Close()
 
 			rec := NewRecorder()
-			_, uerr, class := doObserved(newTestClient(&recordingSleeper{}), srv.URL, rec)
+			_, uerr, failure := doObserved(testClient(), srv.URL, rec)
 			if uerr == nil || uerr.Status != tc.status {
 				t.Fatalf("uerr = %v", uerr)
 			}
-			if class != tc.class {
-				t.Fatalf("class = %s, want %s", class, tc.class)
+			if failure.Class != tc.class {
+				t.Fatalf("class = %s, want %s", failure.Class, tc.class)
 			}
 			rows := rec.Rows()
 			if len(rows) != 1 {
@@ -106,7 +116,10 @@ func TestEvidenceStatusCoverage(t *testing.T) {
 	}
 }
 
-func TestEvidence502ExhaustedChain(t *testing.T) {
+// TestEvidence502IsTerminal: a 502 is the provider's answer and the end of
+// the request. Exactly one row, carrying the body it answered with, its rate
+// limits, and the provenance that forbids replaying it anywhere.
+func TestEvidence502IsTerminal(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-RateLimit-Reset", "1735689600")
 		w.WriteHeader(http.StatusBadGateway)
@@ -115,104 +128,61 @@ func TestEvidence502ExhaustedChain(t *testing.T) {
 	defer srv.Close()
 
 	rec := NewRecorder()
-	_, uerr, class := doObserved(newTestClient(&recordingSleeper{}), srv.URL, rec)
-	if uerr == nil || uerr.Status != 502 || class != ClassUpstream5xx {
-		t.Fatalf("uerr=%v class=%s", uerr, class)
+	_, uerr, failure := doObserved(testClient(), srv.URL, rec)
+	if uerr == nil || uerr.Status != 502 || failure.Class != ClassUpstream5xx {
+		t.Fatalf("uerr=%v class=%s", uerr, failure.Class)
 	}
-	rows := rec.Rows()
-	if len(rows) != 4 { // 3 matrix retries + the terminal dial
-		t.Fatalf("rows = %d, want 4", len(rows))
+	if failure.ReplaySafe() {
+		t.Fatalf("502 provenance claims replay safety: %+v", failure)
 	}
-	for i, row := range rows {
-		if row.Dial != i+1 {
-			t.Fatalf("row %d has dial %d", i, row.Dial)
-		}
-		if row.Status != 502 || row.Class != ClassUpstream5xx.String() {
-			t.Fatalf("row %d = %+v", i, row)
-		}
-		if row.RateLimit == nil {
-			t.Fatalf("row %d: retried rows keep headers-only evidence (rate limits)", i)
-		}
-		if i < 3 {
-			// Retried verdicts are captured BEFORE drainAndClose: headers-only
-			// (body unread), but the retry disposition is already decided.
-			if !row.Retried || row.RetryDecision != RetryRetrySameEgress || row.RetryDelayMS != config.RetryRules[502].Delay.Milliseconds() {
-				t.Fatalf("retried row %d = %+v", i, row)
-			}
-			if row.BodyPeek != "" || row.BodyBytes != 0 || row.Message != "" {
-				t.Fatalf("retried row %d must be headers-only: %+v", i, row)
-			}
-		}
-	}
-	term := rows[3]
-	if term.Retried || term.RetryDecision != "" || term.MatrixDraws != 3 {
-		t.Fatalf("terminal row = %+v, want exhausted matrix (3 draws) and no client-level decision", term)
-	}
-	if term.BodyPeek == "" || term.Message != "bad gateway" {
-		t.Fatalf("terminal row lost the body: %+v", term)
-	}
-}
-
-func TestEvidence503RetryThenSuccessLeavesOneRow(t *testing.T) {
-	var mu sync.Mutex
-	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		mu.Lock()
-		hits++
-		n := hits
-		mu.Unlock()
-		if n == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = io.WriteString(w, `{"error":{"message":"overloaded"}}`)
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {}\n\n")
-	}))
-	defer srv.Close()
-
-	rec := NewRecorder()
-	resp, uerr, _ := doObserved(newTestClient(&recordingSleeper{}), srv.URL, rec)
-	if uerr != nil {
-		t.Fatalf("uerr = %v", uerr)
-	}
-	defer func() { _ = resp.Body.Close() }()
 	rows := rec.Rows()
 	if len(rows) != 1 {
-		t.Fatalf("rows = %d, want exactly the failed dial (success gets none)", len(rows))
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
 	}
-	if rows[0].Status != 503 || !rows[0].Retried || rows[0].RetryDelayMS != config.RetryRules[503].Delay.Milliseconds() {
-		t.Fatalf("row = %+v", rows[0])
+	row := rows[0]
+	if row.Status != 502 || row.Class != ClassUpstream5xx.String() {
+		t.Fatalf("row = %+v", row)
+	}
+	if row.BodyPeek == "" || row.Message != "bad gateway" {
+		t.Fatalf("terminal row lost the body: %+v", row)
+	}
+	if row.RateLimit == nil {
+		t.Fatalf("response headers lost: %+v", row)
 	}
 }
 
 func TestEvidenceTransportErrors(t *testing.T) {
-	t.Run("connection refused chain", func(t *testing.T) {
-		// A closed listener: every dial is refused, and the 502 rule retries
-		// the transport 3 times before the terminal row.
+	t.Run("connection refused is one row", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		url := srv.URL
 		srv.Close()
 
 		rec := NewRecorder()
-		_, uerr, class := doObserved(newTestClient(&recordingSleeper{}), url, rec)
-		if uerr == nil || class != ClassConnectionError {
-			t.Fatalf("uerr=%v class=%s", uerr, class)
+		_, uerr, failure := doObserved(testClient(), url, rec)
+		if uerr == nil || failure.Class != ClassConnectionError {
+			t.Fatalf("uerr=%v class=%s", uerr, failure.Class)
+		}
+		// Nothing was listening, so no request byte ever existed: this is the
+		// one shape that authorises an egress move.
+		if !failure.ReplaySafe() {
+			t.Fatalf("refused dial is not replay-safe: %+v", failure)
 		}
 		rows := rec.Rows()
-		if len(rows) != 4 {
-			t.Fatalf("rows = %d, want 3 retried + 1 terminal", len(rows))
+		if len(rows) != 1 {
+			t.Fatalf("rows = %d, want exactly 1", len(rows))
 		}
-		for i, row := range rows {
-			if row.Phase != PhaseTransport || row.Status != 0 || row.Class != ClassConnectionError.String() {
-				t.Fatalf("row %d = %+v", i, row)
-			}
-			if row.Message == "" || row.Fingerprint == "" {
-				t.Fatalf("row %d missing message/fingerprint", i)
-			}
+		row := rows[0]
+		if row.Phase != PhaseTransport || row.Status != 0 || row.Class != ClassConnectionError.String() {
+			t.Fatalf("row = %+v", row)
 		}
-		if !strings.Contains(rows[3].Message, "connection refused") {
-			t.Fatalf("terminal message = %q, want the transport text", rows[3].Message)
+		if row.Message == "" || row.Fingerprint == "" {
+			t.Fatalf("row missing message/fingerprint: %+v", row)
+		}
+		if !strings.Contains(row.Message, "connection refused") {
+			t.Fatalf("message = %q, want the transport text", row.Message)
+		}
+		if row.Origin != OriginTransport.String() || row.RequestState != RequestStateNotSent.String() {
+			t.Fatalf("provenance lost on the row: %+v", row)
 		}
 	})
 	t.Run("fingerprint is address-independent", func(t *testing.T) {
@@ -229,7 +199,7 @@ func TestEvidenceTransportErrors(t *testing.T) {
 		fps := make([]string, 2)
 		for i, addr := range addrs {
 			rec := NewRecorder()
-			_, _, _ = doObserved(newTestClient(&recordingSleeper{}), "http://"+addr, rec)
+			_, _, _ = doObserved(testClient(), "http://"+addr, rec)
 			rows := rec.Rows()
 			if len(rows) == 0 {
 				t.Fatal("no transport rows")
@@ -251,7 +221,7 @@ func TestEvidenceLargeBodyIsPeekedNotCopied(t *testing.T) {
 	defer srv.Close()
 
 	rec := NewRecorder()
-	_, _, _ = doObserved(newTestClient(&recordingSleeper{}), srv.URL, rec)
+	_, _, _ = doObserved(testClient(), srv.URL, rec)
 	rows := rec.Rows()
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d", len(rows))
@@ -275,7 +245,7 @@ func TestEvidenceStructuredErrorFields(t *testing.T) {
 	defer srv.Close()
 
 	rec := NewRecorder()
-	_, _, _ = doObserved(newTestClient(&recordingSleeper{}), srv.URL, rec)
+	_, _, _ = doObserved(testClient(), srv.URL, rec)
 	rows := rec.Rows()
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d", len(rows))
@@ -293,7 +263,7 @@ func TestEvidenceSuccessEmitsNothing(t *testing.T) {
 	defer srv.Close()
 
 	rec := NewRecorder()
-	resp, uerr, _ := doObserved(newTestClient(&recordingSleeper{}), srv.URL, rec)
+	resp, uerr, _ := doObserved(testClient(), srv.URL, rec)
 	if uerr != nil {
 		t.Fatalf("uerr = %v", uerr)
 	}

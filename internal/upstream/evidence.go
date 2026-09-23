@@ -1,7 +1,7 @@
 // evidence.go is the strictly-observational forensics layer for upstream
 // failures: a request-scoped Recorder collecting one bounded Row per failed
 // dial, skipped plan entry, and post-header stream phase. NOTHING in this file
-// influences routing, retry, fallback, health, or streaming behavior — rows
+// influences routing, failover, health, or streaming behavior — rows
 // are written where the facts become known (client.go verdict boundary,
 // fallback.go decision boundary, router stream phases) and read only by the
 // router's log renderer. Per AGENTS.md rule 7 the recorder is request-scoped
@@ -37,18 +37,19 @@ const (
 )
 
 // Skip reasons (fallback.go pass-over branches). A skip is a scheduling fact,
-// never a failure: no health observation, no retry-budget draw.
+// never a failure: no health observation, no attempt consumed.
 const (
 	SkipSlotFull       = "slot_full"
 	SkipTransportBuild = "transport_build"
 	SkipUnknownEgress  = "unknown_egress"
 )
 
-// RetryDecision names what happened after the dial this row describes.
+// FallbackDecision names what happened to the egress after the dial this row
+// describes. There is no "retry" value: a dial is one logical upstream call,
+// so the only decision left is whether the request moved to another egress.
 const (
-	RetryRetrySameEgress = "retry_same_egress" // the per-egress matrix retried
-	RetryFallback        = "fallback"          // the executor moved to the next egress
-	RetryStop            = "stop"              // terminal: returned to the caller
+	FallbackYes  = "fallback" // the executor moved to the next egress (replay-safe failure)
+	FallbackStop = "stop"     // terminal on this egress: returned to the caller
 )
 
 // HealthDecision names the health observation this dial produced. There is
@@ -73,11 +74,10 @@ type Row struct {
 	// dials a transport and does not know the egress it belongs to).
 	Egress     string
 	EgressType string // direct|http|https|socks5, from the snapshot's config.Egress
-	// Attempt is the 1-based cross-egress attempt number; Dial is the 1-based
-	// dial index inside that attempt (> 1 only when the retry matrix retried).
-	// The renderer derives attempt_id = request_id/Attempt[.Dial].
+	// Attempt is the 1-based cross-egress attempt number. One attempt is one
+	// logical upstream call, so the renderer derives attempt_id =
+	// request_id/Attempt with no dial suffix.
 	Attempt int
-	Dial    int
 	// Reason carries the skip reason or the stream/forced failure phase
 	// (stall/read_error/client_disconnect/too_large/…); empty for dial rows.
 	Reason string
@@ -111,20 +111,13 @@ type Row struct {
 	// carries no direction); RequestState is always one of
 	// unknown/not_sent/response_started.
 	//
-	// These fields are OBSERVATIONAL in this build: the retry/health/fallback
-	// decisions still read Class. They are recorded now because provenance
-	// cannot be reconstructed after the fact from a log that never had it.
+	// These fields ARE the decision inputs: the executor reads
+	// ReplaySafe() — origin = transport AND request_state = not_sent — for
+	// both the health mark and the fallback move (issue #53). Class says what
+	// went wrong; only these say whether re-sending is safe.
 	Origin       string
 	FailurePhase string
 	RequestState string
-
-	// MatrixDraws is the per-egress shared retry budget consumed through
-	// this dial; Retried marks that THIS dial was retried (set only after
-	// tryRetry decided — a row never claims a retry before the matrix made
-	// it) and RetryDelayMS the delay that followed.
-	MatrixDraws  int
-	Retried      bool
-	RetryDelayMS int64
 
 	DurationMS int64
 	// InFlight is the egress's concurrency occupancy at dial time; 0 when
@@ -132,7 +125,10 @@ type Row struct {
 	InFlight int
 
 	HealthDecision string
-	RetryDecision  string
+	// FallbackDecision is what the executor did with the egress after this
+	// dial: FallbackYes (moved on — the failure was replay-safe) or
+	// FallbackStop (terminal here).
+	FallbackDecision string
 }
 
 // RateLimit is the safe extraction of a response's rate-limit headers.
@@ -192,7 +188,7 @@ func (r *Recorder) Len() int {
 
 // Annotate applies f to rows[from:] — the executor's completion pass over one
 // egress attempt's rows, filling egress/attempt identity and the health +
-// retry decisions it just made. from is a Len() captured before the attempt
+// failover decisions it just made. from is a Len() captured before the attempt
 // dialed; out-of-range indices are clamped, so a stale index can never panic.
 func (r *Recorder) Annotate(from int, f func(*Row)) {
 	if r == nil {
@@ -505,48 +501,33 @@ func ExtractRateLimit(h http.Header) *RateLimit {
 // (connection/timeout/proxy-auth/context). The transport fingerprint folds the
 // class into the errType slot so a timeout and a connection refusal never
 // collide, and NormalizeMessage strips the dial address so the same logical
-// failure through a different egress fingerprints identically. retried is set
-// only by callers that already saw tryRetry succeed. failure carries the
-// provenance (origin/phase/request_state) alongside the class — the class
-// still drives the decision tables, the provenance is recorded for the
-// contract that will.
-func appendTransportRow(rec *Recorder, dial int, dur time.Duration, draws int, retried bool, delay time.Duration, failure Failure, err error) {
+// failure through a different egress fingerprints identically. failure carries
+// the class AND the provenance (origin/phase/request_state) the decisions read.
+func appendTransportRow(rec *Recorder, dur time.Duration, failure Failure, err error) {
 	if rec == nil {
 		return
 	}
-	decision := ""
-	if retried {
-		decision = RetryRetrySameEgress
-	}
 	rec.Append(Row{
-		Phase:         PhaseTransport,
-		Dial:          dial,
-		Class:         failure.Class.String(),
-		Origin:        failure.Origin.String(),
-		FailurePhase:  failure.Phase.String(),
-		RequestState:  failure.RequestState.String(),
-		Message:       sanitizeEvidence(err.Error(), config.EvidenceMessageBytes),
-		Fingerprint:   Fingerprint(0, failure.Class.String(), "", err.Error()),
-		DurationMS:    dur.Milliseconds(),
-		MatrixDraws:   draws,
-		Retried:       retried,
-		RetryDelayMS:  delay.Milliseconds(),
-		RetryDecision: decision,
+		Phase:        PhaseTransport,
+		Class:        failure.Class.String(),
+		Origin:       failure.Origin.String(),
+		FailurePhase: failure.Phase.String(),
+		RequestState: failure.RequestState.String(),
+		Message:      sanitizeEvidence(err.Error(), config.EvidenceMessageBytes),
+		Fingerprint:  Fingerprint(0, failure.Class.String(), "", err.Error()),
+		DurationMS:   dur.Milliseconds(),
 	})
 }
 
 // appendResponseRow records an upstream HTTP error verdict. raw is the SAME
 // capped slice the caller already read for parseUpstreamError — never a
-// second body read; it is nil for a retried verdict whose body went straight
-// to the drain (headers-only row, no message/peek), with uerr nil alongside.
+// second body read.
 //
-// The two row shapes inside one retry-matrix chain fingerprint differently
-// BY DESIGN: a retried (headers-only) row hashes over status alone — the
-// body it must never buffer is unknown to it, and a fingerprint may not
-// fake fields it did not see — while the terminal dial carries the full
-// status|type|code|message key. Each shape's key is stable across requests,
-// so grouping works per shape; the message field disambiguates within it.
-func appendResponseRow(rec *Recorder, dial int, dur time.Duration, draws int, retried bool, delay time.Duration, status int, h http.Header, raw []byte, uerr *UpstreamError, failure Failure) {
+// The fingerprint hashes over status|type|code|normalized message, so the same
+// logical verdict groups across attempts, egresses and requests. Both status
+// and provenance are what the provider said and what that proves: an HTTP
+// verdict is always upstream/response_started, which no policy may replay.
+func appendResponseRow(rec *Recorder, dur time.Duration, status int, h http.Header, raw []byte, uerr *UpstreamError, failure Failure) {
 	if rec == nil {
 		return
 	}
@@ -558,41 +539,30 @@ func appendResponseRow(rec *Recorder, dial int, dur time.Duration, draws int, re
 	if raw != nil {
 		et, ec = parseErrorFields(raw)
 	}
-	decision := ""
-	if retried {
-		decision = RetryRetrySameEgress
-	}
 	row := Row{
-		Phase:         PhaseResponse,
-		Dial:          dial,
-		Status:        status,
-		Class:         failure.Class.String(),
-		Origin:        failure.Origin.String(),
-		FailurePhase:  failure.Phase.String(),
-		RequestState:  failure.RequestState.String(),
-		ErrType:       sanitizeEvidence(et, 64),
-		ErrCode:       sanitizeEvidence(ec, 64),
-		Message:       msg,
-		BodyBytes:     len(raw),
-		Truncated:     raw != nil && len(raw) > config.EvidencePeekBytes,
-		Fingerprint:   Fingerprint(status, et, ec, msg),
-		RateLimit:     ExtractRateLimit(h),
-		DurationMS:    dur.Milliseconds(),
-		MatrixDraws:   draws,
-		Retried:       retried,
-		RetryDelayMS:  delay.Milliseconds(),
-		RetryDecision: decision,
+		Phase:        PhaseResponse,
+		Status:       status,
+		Class:        failure.Class.String(),
+		Origin:       failure.Origin.String(),
+		FailurePhase: failure.Phase.String(),
+		RequestState: failure.RequestState.String(),
+		ErrType:      sanitizeEvidence(et, 64),
+		ErrCode:      sanitizeEvidence(ec, 64),
+		Message:      msg,
+		BodyBytes:    len(raw),
+		Truncated:    raw != nil && len(raw) > config.EvidencePeekBytes,
+		Fingerprint:  Fingerprint(status, et, ec, msg),
+		RateLimit:    ExtractRateLimit(h),
+		DurationMS:   dur.Milliseconds(),
 	}
-	if !retried {
-		// Byte-clamp BEFORE the string conversion: string(raw) copies the
-		// whole capped slice (≤1 MiB) for EvidencePeekBytes to survive it.
-		// The cut may split a rune; sanitizeEvidence repairs the boundary.
-		peek := raw
-		if len(peek) > config.EvidencePeekBytes {
-			peek = peek[:config.EvidencePeekBytes]
-		}
-		row.BodyPeek = sanitizeEvidence(string(peek), config.EvidencePeekBytes)
+	// Byte-clamp BEFORE the string conversion: string(raw) copies the whole
+	// capped slice (≤1 MiB) for EvidencePeekBytes to survive it. The cut may
+	// split a rune; sanitizeEvidence repairs the boundary.
+	peek := raw
+	if len(peek) > config.EvidencePeekBytes {
+		peek = peek[:config.EvidencePeekBytes]
 	}
+	row.BodyPeek = sanitizeEvidence(string(peek), config.EvidencePeekBytes)
 	rec.Append(row)
 }
 

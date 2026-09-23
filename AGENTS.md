@@ -80,58 +80,72 @@ The semantics agents most often get wrong:
    pinned per request from its snapshot; state (streak + cooldown) is
    process-wide keyed by egress id + transport signature (`type:url`). A
    policy-only reload keeps history; a proxy URL swap starts a fresh
-   identity. Only connection errors, typed proxy-auth, timeouts, and 5xx
-   mark health; 429 and other 4xx never; success resets; a threshold
-   decrease never arms retroactively.
+   identity. Health is **egress-path health only**, marked by the same
+   predicate that permits the egress move — `Failure.ReplaySafe()` (issue
+   #53, docs/recovery-semantics.md). Provider statuses mark nothing, 4xx and
+   5xx alike; success resets; a threshold decrease never arms retroactively.
 6. Proxy-auth (407) is typed at the transport boundary only
    (`internal/upstream/connect.go`, `socks5.go`). A 407 that arrives as a
    response status is conservatively `client_error` — no fallback, no health
-   mark. Never classify by error text. Typed proxy-auth bypasses the
-   per-egress retry matrix: exactly one dial, then immediate fallback.
-7. Streaming commitment: once a live upstream response exists there is no
+   mark. Never classify by error text. Typed proxy-auth is a dial-phase
+   failure, so it marks health and moves to the next egress after exactly
+   one dial — there is no retry budget for it to bypass.
+7. **One logical upstream call per attempt.** There is no provider-level
+   retry: a response of ANY status (2xx, 429, 4xx, 5xx) is relayed verbatim
+   and ends the request on the egress that produced it; `fallback.max_attempts`
+   bounds DISTINCT egresses, not provider requests. Only a failure that
+   provably preceded the request byte may move the request on
+   (`Failure.ReplaySafe()`). This is a deliberate behaviour change — do not
+   reintroduce status-keyed retry, shared retry budgets, or retry-delay
+   tables. Pinned by `internal/upstream/terminal_test.go` (every status in
+   the table → exactly one upstream request), the router's
+   `TestNoFallbackAfterProviderStatus` / `TestUpstreamErrorEvent429Terminal`,
+   and the black-box `TestEgress429IsTerminalAndMarksNoHealth` /
+   `TestEvidence429TerminalReconstructsFromLogs`.
+8. Streaming commitment: once a live upstream response exists there is no
    fallback, ever; a mid-stream death aborts the downstream response
    (`internal/router/stream.go`).
-8. `log-level` (debug|info|warn|error, default info) is a process-global
+9. `log-level` (debug|info|warn|error, default info) is a process-global
    zerolog threshold. The config-reload goroutine is the ONLY runtime writer
    of `zerolog.SetGlobalLevel`; the swap message must keep the literal
    `config reload: swapped to new config (generation %d` — the e2e suite
    greps it. Completion lines log at info and are the e2e suite's only
    request-outcome evidence (Debug would hide them).
-9. Upstream-error forensics (issue #45) are strictly observational. The
-   recorder (`internal/upstream/evidence.go`) only COLLECTS rows;
-   `internal/router/evidence_log.go` is the only emit boundary. The
-   completion line's `Msgf` text is frozen — evidence events are additive
-   only (warn `upstream_error` per failed interaction, debug
-   `egress_skipped` per pass-over; success emits nothing). Rows are
-   captured BEFORE classification reduces the verdict, but never before a
-   decision exists (`Retried` only after `tryRetry` decided). Upstream- or
-   attacker-derived text reaches a log only sanitized and inside JSON
-   fields — the rendered `Msgf` quotes it with `%q`. Never route request
-   bodies, credentials, proxy URLs or session ids into a row; the session
-   travels only as `session_fp` (sha256[:16] pseudonym). Stream/forced
-   deaths are `response_started` PHASE rows — the delivered status is
-   never rewritten into an HTTP verdict. See
-   docs/architecture.md "Upstream error evidence".
+10. Upstream-error forensics (issue #45) are strictly observational. The
+    recorder (`internal/upstream/evidence.go`) only COLLECTS rows;
+    `internal/router/evidence_log.go` is the only emit boundary. The
+    completion line's `Msgf` text is frozen — evidence events are additive
+    only (warn `upstream_error` per failed interaction, debug
+    `egress_skipped` per pass-over; success emits nothing). Rows are
+    captured BEFORE classification reduces the verdict, but never before a
+    decision exists (`fallback_decision` only after the executor decided).
+    Upstream- or attacker-derived text reaches a log only sanitized and
+    inside JSON fields — the rendered `Msgf` quotes it with `%q`. Never
+    route request bodies, credentials, proxy URLs or session ids into a row;
+    the session travels only as `session_fp` (sha256[:16] pseudonym).
+    Stream/forced deaths are `response_started` PHASE rows — the delivered
+    status is never rewritten into an HTTP verdict. See docs/architecture.md
+    "Upstream error evidence".
 
 ## Layout
 
-| Package              | Role                                                                                                                                                                                                                   |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                                |
-| `internal/logging`   | zerolog construction (`time`/`level`/`msg` field names), the constructor-edge compatibility adapter for legacy test callbacks                                                                                          |
-| `internal/config`    | every runtime constant + the `OCFP_`-prefixed bootstrap env vars; multi-egress YAML model (routes, egresses, `upstream.base`, `user_agent.sync_interval`, `log-level`), interpolation, redaction, hot-reload store     |
-| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                       |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                            |
-| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration + evidence emit boundary (`evidence_log.go`)                                                       |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                                     |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                                   |
-| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging, strictly-observational evidence recorder (`evidence.go`) |
-| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                           |
-| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                                 |
-| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                                     |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                                |
-| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                               |
-| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                                   |
+| Package              | Role                                                                                                                                                                                                                                       |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                                                    |
+| `internal/logging`   | zerolog construction (`time`/`level`/`msg` field names), the constructor-edge compatibility adapter for legacy test callbacks                                                                                                              |
+| `internal/config`    | every runtime constant + the `OCFP_`-prefixed bootstrap env vars; multi-egress YAML model (routes, egresses, `upstream.base`, `user_agent.sync_interval`, `log-level`), interpolation, redaction, hot-reload store                         |
+| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                                           |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                                                |
+| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/failover orchestration (one logical upstream call per attempt) + evidence emit boundary (`evidence_log.go`)                                   |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                                                         |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                                                       |
+| `internal/upstream`  | HTTP client (single-call execute, failure taxonomy + provenance, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging, strictly-observational evidence recorder (`evidence.go`) |
+| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                                               |
+| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                                                     |
+| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                                                         |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                                                    |
+| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                                                   |
+| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                                                       |
 
 ## Porting discipline (the rules that keep parity)
 
@@ -142,8 +156,10 @@ The semantics agents most often get wrong:
    `x?.error`) go through `jsonx` helpers — never Go zero-value checks. `[]`
    and `{}` are truthy in JS; `"0"` is truthy; `null`/`false`/`0`/`""` are not.
 3. **Constants live only in `internal/config`**, mirroring `open-sse/config`
-   (URLs, retry matrix, timeouts, fingerprints, error envelopes). Nothing
-   upstream-shaped may be hardcoded elsewhere.
+   (URLs, timeouts, fingerprints, error envelopes, evidence bounds). Nothing
+   upstream-shaped may be hardcoded elsewhere. (The JS retry matrix's
+   constants are deliberately absent: issue #53 removed the table, and
+   re-adding its numbers anywhere re-adds its semantics.)
 4. **Deliberate divergences are documented**, with the reason, at the site:
    e.g. the JS `customToolNames?.has()` array crash is not replicated, the
    ccFilterNaming bypass pattern (P5) is dropped for lack of the settings
@@ -153,9 +169,12 @@ The semantics agents most often get wrong:
 5. **Behavioral changes need JS evidence.** Before "fixing" relay/pipeline
    behavior, read the matching 9router code and cite it — the weirdness is
    usually load-bearing (double `[DONE]` on chat→chat, `data: null` drops,
-   non-iterable `choices` chunk drops, shared retry budget across statuses).
+   non-iterable `choices` chunk drops). The recovery rules are the standing
+   exception: the JS retry matrix and its status-keyed budgets were removed
+   by issue #53 as a deliberate divergence, documented in
+   docs/recovery-semantics.md — do not restore them for parity's sake.
 6. **Fail-open vs fail-closed is part of the contract** (UA cache warm probe,
-   models fallback to the static registry, 429 never retried). Keep it.
+   models fallback to the static registry). Keep it.
 7. **Process-wide state has a lifecycle, not just a shape**
    (docs/architecture.md "Process-wide state lifecycles"): health state is
    reclaimed once per generation and

@@ -10,8 +10,8 @@ HTTP request
   → Health policy   (policy pinned from generation N)
   → Scheduler       (round-robin / weighted head selection)
   → Egress          (per-egress transport of generation N)
-  → Upstream        (upstream.base of generation N)
-  → Fallback        (fallback policy of generation N; retry matrix per attempt)
+  → Upstream        (upstream.base of generation N; ONE logical call)
+  → Failover        (fallback policy of generation N; pre-request failures ONLY)
   → Response        (+ completion log: generation=N route=… egress=…)
 ```
 
@@ -68,10 +68,14 @@ Four separate decisions over the one snapshot:
    concurrency headroom (`Server.routeHeads`).
 3. **Scheduling** — orders only the INITIAL attempt among survivors
    (`routing.Scheduler.Plan`).
-4. **Fallback** — the attempt loop walks the route's remaining egresses
-   under the snapshot's `fallback` policy and the per-egress retry matrix
-   (`internal/upstream`). Once a live upstream response exists the request
-   is committed: no fallback after the first streamed byte.
+4. **Failover** — the executor makes exactly ONE logical upstream call and
+   walks the route's remaining egresses only when that call failed at a
+   phase that provably preceded transmission (`Failure.ReplaySafe()`:
+   origin `transport` + state `not_sent`), bounded by the snapshot's
+   `fallback` policy (`internal/upstream`). A provider response of any
+   status is terminal, and once a live upstream response exists the
+   request is committed: no failover after the first streamed byte. See
+   `docs/recovery-semantics.md` for the contract this implements.
 
 Health (consecutive-failure cooldown) is the temporary-eligibility layer on
 top: **policy** travels with the request's snapshot, **state** is
@@ -136,11 +140,13 @@ AGENTS.md for the porting discipline):
    normalization), header forging (`Bearer public`, compound opencode
    User-Agent synced from GitHub — passed through verbatim when the
    downstream UA is a valid ≥ 1.17 opencode client and forged otherwise) —
-   headers are rebuilt on every retry attempt.
-8. Retry matrix: 429 → no retry; 502 ×3 @3s; 503 ×3 @2s; 504 ×2 @3s;
-   network errors follow 502 — one shared attempt budget across all retryable
-   statuses. 60 s response-header timeout, 360 s stream stall (reset per
-   line).
+   headers are rebuilt per egress attempt.
+8. One logical upstream call, then a failover decision. There is no
+   per-egress retry matrix: a provider response (2xx, 429, any 4xx/5xx) is
+   relayed verbatim and ends the call, and the route's next egress is tried
+   only when the attempt failed before the request existed — a dial that
+   never put a byte on the wire. 60 s response-header timeout, 360 s stream
+   stall (reset per line).
 9. Relay: format-matched passthrough (with usage estimation seam) or
    translation; non-streaming clients get the forced SSE→JSON aggregate
    with the same usage/thinking synthesis as the JS router (only when the
@@ -150,43 +156,55 @@ AGENTS.md for the porting discipline):
 ## Upstream error evidence (forensics)
 
 Every failed upstream interaction leaves one structured log event, so a
-request's log alone reconstructs **request → attempts → dials → egress →
-verdict → classification → health → fallback → outcome**. The layer is
-strictly observational: nothing it records influences routing, retry,
-fallback, health or streaming behavior, and the successful dial that
-serves a request produces no event at all (the completion line owns
-success telemetry — happy-path log volume is unchanged).
+request's log alone reconstructs **request → attempts → egress → phase →
+provenance → verdict → classification → health → failover decision →
+outcome**. The layer is strictly observational: nothing it records
+influences routing, failover, health or streaming behavior, and the
+successful attempt that serves a request produces no event at all (the
+completion line owns success telemetry — happy-path log volume is
+unchanged).
 
 - **Capture happens where facts become known, before classification
   reduces them** — ordering is response → capture → classify → health →
-  retry/fallback decision → emit. A 4xx/5xx row is extracted from the
-  same capped body slice `parseUpstreamError` reads (never a second
-  read); a verdict the retry matrix is about to drain is captured
-  headers-only first, so rate-limit headers and structured
-  `error.type`/`error.code` survive the reduction.
+  failover decision → emit. An HTTP verdict row is extracted from the same
+  capped body slice `parseUpstreamError` reads (never a second read), so
+  rate-limit headers and structured `error.type`/`error.code` are on the
+  row as the provider sent them.
 - **One warn `upstream_error` event per row, emitted exactly once**
   (`internal/router/evidence_log.go` is the only emit boundary — a
   post-header abort renders only its own new row, never re-rendering what
   the post-Execute pass already logged); skipped plan entries (`slot_full`,
   `transport_build`, `unknown_egress`) render at debug as
   `egress_skipped` — scheduling diagnostics stay out of the info stream.
-- **Correlation**: every event carries `request_id`; a dial row carries
-  `attempt_id` = `request_id/N` (cross-egress attempt N) or
-  `request_id/N.M` (retry-matrix dial M inside attempt N). Stream-phase
-  rows have no attempt id — the attempt already committed and returned.
+- **Correlation**: every event carries `request_id`; a failure row carries
+  `attempt_id` = `request_id/N`, where N is the cross-egress attempt — one
+  logical upstream call, so there is no dial suffix. Stream-phase rows and
+  skips have no attempt id (the attempt already committed and returned, or
+  never dialed at all).
 - **Phases, not re-classification**: `response` (an HTTP verdict ≥ 400),
   `transport` (no HTTP response exists), `stream`/`forced` (a live
   response died or failed conversion after headers). Stream/forced rows
   carry class `response_started` — the reserved logging-only
   classification: the delivered status stays the delivered status, no
-  health observation, no fallback (streaming commitment untouched). The
+  health observation, no failover (streaming commitment untouched). The
   `status` field records what the UPSTREAM did — the status the response
   started with — never the synthesized client 502 a forced-conversion
   failure writes downstream (that is the error-write path's fact, visible
   in the completion line).
-- **429 is not an outage**: 429/4xx rows carry `health_decision:
-neutral`; only connection/timeout/proxy-auth/5xx rows say `marked`.
-  A rate-limit observation never poisons an egress — regression-pinned.
+- **The row states the decision, not just the outcome**:
+  `health_decision` is `marked` | `neutral` and `fallback_decision` is
+  `fallback` | `stop`, both fixed at the moment the executor decided — so
+  one row answers "was this failure attributed to the egress, and did the
+  request move on?". A verdict row (429, any 4xx/5xx) is always
+  `neutral` + `stop`: the provider answered, so nothing about the egress
+  failed and there is nothing to move past. Only a replay-safe transport
+  failure can be `marked` + `fallback`.
+- **Provenance rides the row**: `origin` (`upstream` | `transport` |
+  `client`), `failure_phase` and `request_state`. An HTTP verdict is
+  `upstream` / `response_headers` / `response_started`; a pre-request
+  transport failure is `transport` / its dial phase / `not_sent` — the
+  same evidence the failover decision was made from, rendered for the
+  operator.
 - **What a row may never contain**: request bodies, tool arguments,
   authorization/cookie headers, proxy URLs (transport rows carry the
   proxy _type_ only), raw session ids. The session travels as
@@ -202,12 +220,8 @@ neutral`; only connection/timeout/proxy-auth/5xx rows say `marked`.
   identifiers ("config.yaml" vs "secrets.env") keep distinguishing.
   Grouping is deliberately coarse where shapes coincide ("file.go:42"
   folds like host:port; version numbers fold with any digits) — the
-  `message` field disambiguates within a group. Two shapes inside one
-  retry-matrix chain hash differently BY DESIGN: retried (headers-only)
-  dials key on status alone — the body they never buffered is unknown to
-  them, and a fingerprint never fakes unseen fields — while the terminal
-  dial carries the full key. They are equality keys for humans — never
-  inputs to behavior.
+  `message` field disambiguates within a group. A fingerprint is an
+  equality key for humans — never an input to behavior.
 - **Bounds**: 16 rows per request (past that, a `dropped` counter rides
   the last event), 512 B messages, 256 B body peeks, 8 rate-limit
   entries, 64 B header values. A hostile upstream cannot grow memory or
@@ -216,8 +230,8 @@ neutral`; only connection/timeout/proxy-auth/5xx rows say `marked`.
 - **All text is sanitized** (control bytes folded, whitespace collapsed,
   rune-safe clamps) and `%q`-quoted in the rendered line (CWE-117).
 - **Present/absent semantics**: absent information is an absent field —
-  missing rate-limit headers, an uncapped egress's in-flight, a headerless
-  retried verdict. Nothing fakes a default.
+  missing rate-limit headers, an uncapped egress's in-flight, a
+  failure phase that could not be attributed. Nothing fakes a default.
 
 Logs are the analysis surface for upstream failures by design: the
 proxy has no metrics subsystem, so nothing here can introduce
@@ -272,7 +286,9 @@ transport can _prove_ about transmission. The contract those fields serve is
   (no proxy URL, host, port or credential can reach them). Where the phase
   cannot be attributed the field is absent, which is an honest gap rather
   than a guess. `ReplaySafe()` is the single predicate the recovery policy
-  will read — `origin = transport ∧ request_state = not_sent`.
+  reads — `origin = transport ∧ request_state = not_sent` — and it gates
+  both halves of recovery: whether the attempt may move to another egress
+  and whether the egress is marked unhealthy.
 
 ## Endpoints
 
@@ -289,20 +305,20 @@ upstream and are translated transparently for chat clients.
 
 ## Package layout
 
-| Package              | Role                                                                                                                                                                                      |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                   |
-| `internal/logging`   | zerolog construction + the compatibility adapter at constructor edges; centralized `time`/`level`/`msg` field names                                                                       |
-| `internal/config`    | every runtime constant + bootstrap env vars; multi-egress YAML model, interpolation, redaction, hot-reload store, the immutable `Runtime` snapshot                                        |
-| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                          |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                               |
-| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/fallback orchestration + the per-request snapshot capture + the evidence emit boundary       |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                        |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                      |
-| `internal/upstream`  | HTTP client (retry matrix, failure taxonomy, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging, the error-evidence recorder |
-| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                              |
-| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                    |
-| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                        |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                   |
-| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                  |
-| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                      |
+| Package              | Role                                                                                                                                                                                                            |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                         |
+| `internal/logging`   | zerolog construction + the compatibility adapter at constructor edges; centralized `time`/`level`/`msg` field names                                                                                             |
+| `internal/config`    | every runtime constant + bootstrap env vars; multi-egress YAML model, interpolation, redaction, hot-reload store, the immutable `Runtime` snapshot                                                              |
+| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                     |
+| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/failover orchestration (one logical upstream call) + the per-request snapshot capture + the evidence emit boundary |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                              |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                            |
+| `internal/upstream`  | HTTP client (single-call execute, failure taxonomy + provenance, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging, the error-evidence recorder   |
+| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                    |
+| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                          |
+| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                              |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                         |
+| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                        |
+| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                            |

@@ -139,10 +139,10 @@ request hot path is a pure cache read — see
 
 ### `fallback`
 
-| Field          | Type | Default | Meaning                                                                                   |
-| -------------- | ---- | ------- | ----------------------------------------------------------------------------------------- |
-| `enabled`      | bool | `true`  | `false` pins every request to its single scheduled head                                   |
-| `max_attempts` | int  | `3`     | DISTINCT egresses one request may try, first included; `0` = default 3; negative rejected |
+| Field          | Type | Default | Meaning                                                                                                                                                                 |
+| -------------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`      | bool | `true`  | `false` pins every request to its single scheduled head                                                                                                                 |
+| `max_attempts` | int  | `3`     | DISTINCT egresses one request may try, first included; `0` = default 3; negative rejected. One attempt = one logical upstream call, so this bounds egress movement only |
 
 ### `health`
 
@@ -201,7 +201,7 @@ shaped so the default level is already investigative:
 - **info (default)** — one completion line per request, plus one warn
   `upstream_error` event per failed upstream interaction (dial, stream
   death, forced-conversion failure) with rate limits, classification,
-  health and retry decisions. Successful requests emit nothing extra.
+  health and failover decisions. Successful requests emit nothing extra.
 - **debug** — adds `egress_skipped` diagnostics (slot-full / transport
   build / unknown-egress pass-overs), which can be frequent under load.
 - **warn / error** — silences the completion lines; failure evidence
@@ -274,32 +274,39 @@ Three different layers — do not conflate them:
    egress is filtered out of the head set (all egresses filtered → 502), and
    `0` = unlimited. It never rejects a request by itself.
 
-## Retry × fallback budgets
+## Attempt budget (there is no retry budget)
 
-The upstream retry matrix sits INSIDE each fallback attempt:
-429 → 0 retries (fail fast by contract), 502 → 3 retries @3s (4 POSTs),
-503 → 3 @2s, 504 → 2 @3s; unlisted statuses never retry. Network errors draw
-the 502 rule. The counter is ONE per URL shared by every retryable status and
-network errors alike, and the cap is the firing rule's (base.js parity) —
-alternating 502/503 gives up after 3 combined attempts, not 3 of each. A
-typed proxy-auth failure is the exception: exactly ONE dial, no budget
-consumed, straight to fallback (see
-[Proxy-authentication (407)](#proxy-authentication-407-classification)).
+This proxy holds **no provider-level budget**. One attempt is one logical
+upstream call: a provider response — 2xx, 429, any 4xx or 5xx — is relayed
+verbatim and ends the request on the egress that produced it. There is
+nothing to retry because there is nothing this proxy could learn from
+asking the same provider a second time about a request the provider has
+already answered (`docs/recovery-semantics.md`).
 
-The fallback loop then adds at most `fallback.max_attempts` DISTINCT egresses
-per request (default 3, including the first; `enabled: false` or a budget < 1
-pins the request to one attempt). Worst case for a 502 storm: 4 POSTs × 3
-egresses = 12 upstream calls; a credential-refusing proxy storm is 1 POST per
-egress. No inter-attempt sleep — the cooldown is health-based, per egress,
-and applies to FUTURE requests only.
+`fallback.max_attempts` therefore bounds **egress movement only**: at most
+that many DISTINCT egresses per request (default 3, including the first;
+`enabled: false` or a budget < 1 pins the request to one attempt). An
+attempt may move on for exactly one reason — the failure provably happened
+before a request byte existed (`Failure.ReplaySafe()`, i.e. `origin =
+transport ∧ request_state = not_sent`). Everything else stops: a provider
+verdict, a response-header timeout after transmission, a post-transmission
+reset, a failure on a pooled connection, a client cancellation.
 
-The client sees the LAST REAL verdict: when the plan runs out of egresses
-before the budget, the final dialed egress's own status and message are
-returned — a deliberate divergence from base.js, which DOES synthesize
+The worst case is one POST per egress, and it is only reachable when every
+egress fails before a request exists: a three-egress route whose proxies
+all refuse CONNECT costs 3 dials and **0** upstream calls. A 5xx storm
+costs exactly 1, however many egresses the route lists — the first
+provider answer is the answer. No inter-attempt sleep — the cooldown is
+health-based, per egress, and applies to FUTURE requests only.
+
+The client sees the LAST REAL failure: when the plan runs out of egresses
+before the budget, the final dialed egress's own failure class and message
+are returned — a deliberate divergence from base.js, which synthesizes
 `All N URLs failed with status 429` when the plan outlives its URLs
-(base.js:183; see the divergence note in `internal/upstream/fallback.go`):
-this proxy keeps the last real verdict so the status the client backoffs on
-stays the upstream's. The synthetic
+(base.js:183; see the divergence note in `internal/upstream/fallback.go`).
+Under the issue #53 contract that case can no longer arise — a 429 never
+moves egress at all — but the divergence stands as the reason this proxy
+keeps the last real verdict instead of a synthesized one. The synthetic
 `502 none of the eligible egresses could serve the request` appears only when
 NOTHING was dialed — every plan entry was skipped (slot-full, unknown
 egress, transport build failed) or the head set was empty (`attempts=0` in
@@ -318,12 +325,19 @@ Policy and state are split (`internal/health/health.go`):
   proxy URL changes the key, so a fresh transport never inherits the old
   transport's streak or cooldown.
 
-Only real egress faults mark health: connection errors, typed proxy-auth,
-response-header timeouts (60s), and 5xx after the retry matrix. 429 and every
-other 4xx are verdicts about the REQUEST — they fall back (429) or not (4xx)
-but never mark. Health is observed when response HEADERS arrive: a stream
-that dies or stalls after a 200 start is the streaming commitment's abort,
-not a health observation. Failures during an active cooldown never extend it;
+Health measures **egress-path health only** — whether the egress can carry a
+request at all — so the mark uses the same predicate as the failover
+decision (`Failure.ReplaySafe()`). Marked: a proxy TCP/TLS connect failure, a
+typed proxy-auth refusal, a SOCKS5 negotiation or CONNECT refusal, a target
+TCP connect failure, an origin TLS handshake failure. Never marked: **any**
+provider HTTP status (429, 4xx and 5xx alike — those are verdicts about the
+REQUEST or about the provider, not about this path), a request-write failure,
+a response-header timeout after transmission, a pooled-connection failure, a
+mid-stream death, a client cancellation. Health is observed when response
+HEADERS arrive: a stream that dies or stalls after a 200 start is the
+streaming commitment's abort, not a health observation. Poisoning an egress
+on a verdict would suppress a healthy path and invert the meaning of the
+table. Failures during an active cooldown never extend it;
 a success resets the streak and clears the deadline — but a cooling egress is
 filtered from the head set, so in practice only an in-flight request that was
 planned before the arm can deliver that clearing success; the usual ways an
@@ -351,12 +365,13 @@ CONNECT tunnel, or was relayed byte-for-byte by a plain-HTTP forward proxy,
 so ownership is not claimed. Consequences: surfaced to the client, NO
 fallback, no health mark.
 
-`proxy_auth_error` itself falls back to the next egress, marks health, and —
-uniquely — bypasses the per-egress retry matrix: one dial, then immediate
-fallback, because the proxy will refuse the same credentials identically on
-every retry. One honest exception: a 407 that loses the race against the
-connect deadline classifies as a timeout (health-marked, retried) — the
-typed proof never arrived, and text-probing to recover it is banned. SOCKS5
+`proxy_auth_error` is a typed dial-phase failure, so it is replay-safe: the
+attempt moves to the next egress and this one is marked unhealthy. Exactly
+one dial — the failure is proof the request was never sent, so there is
+nothing to repeat. One honest exception: a 407 that loses the race against
+the connect deadline classifies as a timeout (a dial-phase failure too, so
+likewise marked and moved on) — the typed proof never arrived, and
+text-probing to recover it is banned. SOCKS5
 detail: REP `0x02` ("connection not allowed by ruleset") is a plain
 connection error, not proxy-auth; only RFC 1929 rejections are. A `socks5`
 egress picks its DNS side by url scheme: `socks5://` resolves the target

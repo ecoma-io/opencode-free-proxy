@@ -11,13 +11,14 @@ import (
 // request can have reached the provider.
 //
 // Class (failure.go) answers "what kind of failure is this" for the decisions
-// this build makes today. It cannot answer the question the recovery-ownership
-// migration turns on: did the failure happen BEFORE the request was
-// transmitted? A proxy-connect refusal and a response-header timeout are both
+// this build makes today. It cannot answer the question recovery turns on:
+// did the failure happen BEFORE the request was transmitted? A proxy-connect
+// refusal and a response-header timeout are both
 // ClassTimeout/ClassConnectionError, yet only the first may be replayed on
 // another egress. This file carries that second axis as a SEPARATE value
-// rather than widening the enum, so the taxonomy the current retry/health/
-// fallback tables read keeps the shape they were written against.
+// rather than widening the enum, so `Class` keeps the shape the JS taxonomy
+// gave it while `ReplaySafe()` is what the health mark and the egress move
+// both read (issue #53, docs/recovery-semantics.md).
 //
 // The rules, stated once:
 //

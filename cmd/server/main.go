@@ -76,7 +76,7 @@ func main() {
 		log.Info().Str("path", cfg.ConfigPath).Str("poll", cfg.ConfigPoll.String()).Msg("config loaded")
 	}
 
-	server := router.NewServer(store, uaCache, direct, log, time.Sleep)
+	server := router.NewServer(store, uaCache, direct, log)
 
 	// Sync the compound UA triple (opencode version, ai-sdk provider-utils,
 	// bun) from GitHub: one forced warm at startup, then a background ticker

@@ -319,9 +319,9 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// that pinned routing above.)
 	url := upstream.BuildURL(rt.UpstreamBase(), upstreamModel)
 	reqCtx, cancelUpstream := context.WithCancel(r.Context())
-	// base.js re-invokes transformRequest+buildHeaders inside the retry loop, so
-	// a forged x-opencode-request id is fresh on every attempt; the closure is
-	// what the client calls once per attempt.
+	// base.js re-invokes transformRequest+buildHeaders on every URL attempt, so
+	// a forged x-opencode-request id is fresh each time; the closure is what
+	// the client calls once per egress attempt.
 	buildHeaders := func() map[string]string {
 		return upstream.BuildHeaders(downstream, session, s.UA.Get())
 	}

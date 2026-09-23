@@ -155,7 +155,7 @@ func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
 // ATYP=3 is defined for FQDNs, not dotted quads. A failed remote-resolve
 // CONNECT fails exactly like any other CONNECT error: same reply codes, same
 // error class — there is no silent fallback to local resolution and no
-// retry.
+// re-dial inside this dialer.
 func (d *socks5Dialer) connect(ctx context.Context, conn net.Conn, addr string) error {
 	// One phase covers the whole reach-the-target step: the local resolution
 	// a socks5:// proxy URL performs here, the CONNECT request, and the reply

@@ -6,16 +6,20 @@ import (
 	"net"
 )
 
-// Class is the executor's failure taxonomy. It exists to keep three concerns
-// separate inside upstream: the retry matrix (unchanged, INSIDE one egress
-// attempt), health observation (which classes poison an egress), and
-// fallback (which classes may move to the next attempt).
+// Class names WHAT went wrong, for logs and the client-facing envelope. It is
+// deliberately NOT the fallback/health predicate any more: a class alone
+// cannot say whether the request reached the provider, and that is the only
+// question that decides whether re-sending is safe. That predicate lives on
+// the failure's provenance — Failure.ReplaySafe in provenance.go — where the
+// transport boundary's own evidence backs it. Read this type as a label;
+// never as authorisation (docs/recovery-semantics.md).
 type Class int
 
 const (
 	ClassSuccess Class = iota
 	// ClassConnectionError: transport failure (dial, DNS for the proxy or
-	// target, reset before response). 502-mapped in the retry matrix.
+	// target, reset before response). The 502 the client sees is the
+	// envelope; the provenance says whether anything was sent.
 	ClassConnectionError
 	// ClassProxyAuthError: the proxy refused credentials, PROVEN at the
 	// transport boundary by a typed *proxyAuthError — SOCKS5 RFC 1929 status
@@ -26,18 +30,23 @@ const (
 	// allowed by ruleset", a plain connection refusal — fallback + health
 	// mark either way, only the label changes).
 	ClassProxyAuthError
-	// ClassTimeout: response headers took longer than ConnectTimeout.
+	// ClassTimeout: the connect budget expired — at the dial (provable, and
+	// therefore replayable) or while waiting for response headers after the
+	// request was written (unprovable, and therefore not). Same label, two
+	// very different states: only the provenance tells them apart.
 	ClassTimeout
-	// ClassUpstream429: 429 from the upstream. Fallback allowed, health is
-	// NEVER marked — rate limiting says nothing about the egress's ability
-	// to serve, and poisoning it on 429 would suppress healthy egresses.
+	// ClassUpstream429: 429 from the upstream. A provider verdict about the
+	// request's rate; it never marks health, never moves to another egress,
+	// and is handed to the caller verbatim. OFP does not infer "try another
+	// egress" from it — that policy is the Injector's (issue #53).
 	ClassUpstream429
-	// ClassUpstream5xx: 502/503/504 after the retry matrix is exhausted.
+	// ClassUpstream5xx: 502/503/504 from the upstream. The provider answered,
+	// so the request was received: relayed verbatim, never retried, never a
+	// reason to re-ask on another path.
 	ClassUpstream5xx
 	// ClassClientError: other 4xx — including EVERY 407 that arrives as a
-	// response status (see classifyStatusFor). Never falls back (the request
-	// itself was rejected; another egress would repeat the 400) and never
-	// marks health.
+	// response status (see classifyStatusFor). A provider verdict, relayed
+	// verbatim.
 	ClassClientError
 	// ClassResponseStarted: the mid-stream commitment boundary — upstream
 	// died after a live response was already delivered downstream; no
@@ -45,12 +54,14 @@ const (
 	// LOGGING classification only, produced exclusively by the router's
 	// evidence rows (stream.go / forced.go phase failures): the executor
 	// never sees it, so it neither falls back (the commitment stands) nor
-	// marks health (MarksHealth/FallbackAllowed are false below, pinned by
-	// test) — a stream that dies after a 200 start leaves the egress's health
-	// exactly as the header-time success observation left it.
+	// marks health — a stream that dies after a 200 start leaves the egress's
+	// health exactly as the header-time success observation left it. Its
+	// provenance is response_started, which is not replay-safe by
+	// construction.
 	ClassResponseStarted
-	// ClassContextCanceled: downstream disconnected. No fallback (nothing
-	// to deliver to) and no health mark (the egress did nothing wrong).
+	// ClassContextCanceled: downstream disconnected. Nothing to deliver to
+	// (no fallback) and nothing the egress did wrong (no health mark); its
+	// provenance origin is client, which is never replay-safe.
 	ClassContextCanceled
 )
 
@@ -79,33 +90,22 @@ func (c Class) String() string {
 	}
 }
 
-// MarksHealth reports whether this class counts toward the consecutive-
-// failure threshold. Deliberately excludes 429 and 4xx: both are verdicts
-// about a request, not about the egress.
-func (c Class) MarksHealth() bool {
-	switch c {
-	case ClassConnectionError, ClassProxyAuthError, ClassTimeout, ClassUpstream5xx:
-		return true
-	}
-	return false
-}
-
-// FallbackAllowed reports whether the executor may try the next egress.
+// MarksHealth and FallbackAllowed are GONE (issue #53). Both read a flat
+// label and both were wrong for the same reason: what poisons an egress and
+// what may be re-sent on another one are not properties of what the error
+// looked like, but of WHERE it happened and whether the request went out.
+// A 429 was right to exclude and a 5xx was wrong to include; a
+// response-header timeout was wrong to include and a proxy-connect refusal
+// was right to.
 //
-// Deliberate divergence from base.js, cited per porting discipline: the JS
-// router moves to the next URL only on 429 (base.js:83-85 shouldRetry) and
-// network errors (base.js:175-178) — an exhausted 502/503/504 is returned
-// as-is from the same URL. This executor ALSO falls back on 5xx/timeouts:
-// with several egresses, a proven-bad upstream answer is a reason to try
-// another PATH, and the health registry (not the retry matrix) is what
-// absorbs the poisoning concern.
-func (c Class) FallbackAllowed() bool {
-	switch c {
-	case ClassConnectionError, ClassProxyAuthError, ClassTimeout, ClassUpstream429, ClassUpstream5xx:
-		return true
-	}
-	return false
-}
+// Both predicates are now the same one, on the failure's provenance:
+//
+//	Failure.ReplaySafe() == origin = transport && request_state = not_sent
+//
+// — a failure at a dial phase this process performs itself, before any
+// request byte existed. That is exactly "the egress, not the provider,
+// failed", so it authorises BOTH the health mark and the egress move, and
+// there is no second table to keep in sync with it.
 
 // proxyAuthError is produced ONLY by the transport boundary speaking the
 // proxy's own protocol (connect.go: the proxy answered CONNECT with 407;

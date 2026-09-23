@@ -62,7 +62,6 @@ func genRouter(t *testing.T, dir, doc string, logf func(string, ...any)) (*http.
 		identity.NewUserAgentCache(),
 		upstream.NewClient(), // direct client: every egress here is direct or proxied
 		logf,
-		func(time.Duration) {}, // no-op sleep: retry matrices run instantly
 	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.HandleChatCompletions)

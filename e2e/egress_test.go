@@ -25,11 +25,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -134,27 +136,112 @@ func statusProxy(count *atomic.Int64, status *atomic.Int64) *httptest.Server {
 // observation decides everything.
 const healthYAML = "health:\n  failure_threshold: 1\n  cooldown: 60s\n"
 
+// failProxy is a TCP endpoint that speaks no SOCKS5. An egress pointed at it
+// fails INSIDE the dialer the proxy owns (the RFC 1928 greeting never gets a
+// reply), so the attempt dies with nothing sent — the only failure shape that
+// may move to another egress now that a provider verdict (429/4xx/5xx) is
+// terminal (issue #53).
+//
+// It stands in for what the health/reload suites used to get from a 500-only
+// upstream proxy, and adds the ordering primitive those tests need: dialed
+// fires the moment a dial lands, so a test can hold a request inside egress a
+// while it swaps the config.
+//
+// socks5h:// (remote resolve) is deliberate: the dial reaches the proxy before
+// any name lookup of the .invalid upstream base could fail for another reason.
+type failProxy struct {
+	ln       net.Listener
+	dialed   chan struct{} // closed by the first accepted dial
+	dialedOf sync.Once
+	hold     bool
+
+	mu    sync.Mutex
+	conns []net.Conn
+	dials int64
+}
+
+func newFailProxy(t *testing.T, hold bool) *failProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &failProxy{ln: ln, dialed: make(chan struct{}), hold: hold}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			p.dialedOf.Do(func() { close(p.dialed) })
+			p.mu.Lock()
+			p.dials++
+			hold := p.hold
+			if hold {
+				p.conns = append(p.conns, c)
+			}
+			p.mu.Unlock()
+			if !hold {
+				_ = c.Close()
+			}
+		}
+	}()
+	t.Cleanup(p.Close)
+	return p
+}
+
+// url is the config proxy URL an egress points at to fail pre-request.
+func (p *failProxy) url() string { return "socks5h://" + p.ln.Addr().String() }
+
+// dials returns how many dials have landed (all of them fail by construction).
+func (p *failProxy) dialCount() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dials
+}
+
+// waitDialed blocks until a dial has arrived.
+func (p *failProxy) waitDialed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.dialed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no dial reached the failing egress proxy")
+	}
+}
+
+// release hangs up every held connection and stops holding: the parked dial
+// fails pre-request now, and so does every dial after it. One-shot by design —
+// a released gate must never park a later attempt.
+func (p *failProxy) release() {
+	p.mu.Lock()
+	p.hold = false
+	for _, c := range p.conns {
+		_ = c.Close()
+	}
+	p.conns = nil
+	p.mu.Unlock()
+}
+
+func (p *failProxy) Close() {
+	p.release()
+	_ = p.ln.Close()
+}
+
 // TestReloadHealthPolicyPinnedPerGeneration: a request adjudicates its own
 // observations under the health policy of ITS config snapshot. Generation 1
-// ships health disabled; while a request is parked inside egress a (which
-// answers 500 when released), the file swaps to generation 2 (health enabled,
-// threshold 1, 60s cooldown). The parked request's failure must NOT mark a —
-// otherwise generation 2's threshold would cool it on the spot — while the
-// FIRST generation-2 failure of a does arm the cooldown.
+// ships health disabled; while a request is parked inside egress a's dial
+// (which fails pre-request when released), the file swaps to generation 2
+// (health enabled, threshold 1, 60s cooldown). The parked request's failure
+// must NOT mark a — otherwise generation 2's threshold would cool it on the
+// spot — while the FIRST generation-2 failure of a does arm the cooldown.
 func TestReloadHealthPolicyPinnedPerGeneration(t *testing.T) {
 	dir := cfgDir(t)
 
-	// a 500s, but every call parks on the gate first: holding the request
-	// open proves its snapshot was pinned (the dial already happened) before
-	// the reload is written.
-	gate := make(chan struct{})
-	var aCalls atomic.Int64
-	proxyA := fwdProxy(func(w http.ResponseWriter, _ *http.Request) {
-		aCalls.Add(1)
-		<-gate
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	defer proxyA.Close()
+	// a's dial parks on the proxy until released: holding the request open
+	// proves its snapshot was pinned (the dial already happened) before the
+	// reload is written.
+	proxyA := newFailProxy(t, true)
 	var bCalls atomic.Int64
 	proxyB := chatProxy(&bCalls)
 	defer proxyB.Close()
@@ -162,11 +249,11 @@ func TestReloadHealthPolicyPinnedPerGeneration(t *testing.T) {
 	// Both generations share egresses and routes byte-for-byte; ONLY the
 	// health block differs — the swap is a policy-only reload.
 	egressYAML := fmt.Sprintf(`egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, proxyA.URL, proxyB.URL)
+`, proxyA.url(), proxyB.URL)
 	// upstream.invalid: never dialed (both egresses are proxies) — but the
 	// section must be present or the base reverts to the real opencode.ai.
 	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+"health:\n  enabled: false\n")
@@ -177,14 +264,13 @@ routes:
 
 	done := make(chan *http.Response, 1)
 	go func() { done <- sp.post(t, streamBody, nil) }()
-	waitFor(t, 5*time.Second, func() bool { return aCalls.Load() == 1 },
-		"request never parked inside proxy a\nlog:\n"+sp.out.String())
+	proxyA.waitDialed(t)
 
 	// Swap to generation 2 while the generation-1 request sits in a.
 	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+healthYAML)
 	waitSwap(t, sp, "config reload: swapped to new config (generation 2")
 
-	close(gate)
+	proxyA.release()
 	var resp *http.Response
 	select {
 	case resp = <-done:
@@ -210,7 +296,7 @@ routes:
 	if eg := drainChat(t, sp.post(t, streamBody, nil)); eg != "b" {
 		t.Fatalf("X-OFP-Egress = %q, want b (a failed, fell back)", eg)
 	}
-	if got := aCalls.Load(); got != 2 {
+	if got := proxyA.dialCount(); got != 2 {
 		t.Fatalf("a dialed %d times, want 2 (the parked gen-1 dial + this gen-2 dial) — the in-flight failure must not mark health", got)
 	}
 	assertRequestLine(t, sp, 2, "generation=2", "attempts=2", "fallback=true")
@@ -223,7 +309,7 @@ routes:
 	if eg := drainChat(t, sp.post(t, streamBody, nil)); eg != "b" {
 		t.Fatalf("X-OFP-Egress = %q, want b", eg)
 	}
-	if got := aCalls.Load(); got != 2 {
+	if got := proxyA.dialCount(); got != 2 {
 		t.Fatalf("a dialed %d times after its generation-2 failure, want 2 — the cooldown did not arm", got)
 	}
 	assertRequestLine(t, sp, 4, "generation=2", "egress=b", "attempts=1", "fallback=false")
@@ -436,12 +522,9 @@ routes:
 func TestPolicyOnlyReloadKeepsHealthState(t *testing.T) {
 	dir := cfgDir(t)
 
-	var aCalls atomic.Int64
-	proxyA := fwdProxy(func(w http.ResponseWriter, _ *http.Request) {
-		aCalls.Add(1)
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	defer proxyA.Close()
+	// a fails every dial, pre-request: an egress-path failure, which is what
+	// the health policy adjudicates.
+	proxyA := newFailProxy(t, false)
 	var bCalls atomic.Int64
 	proxyB := chatProxy(&bCalls)
 	defer proxyB.Close()
@@ -449,11 +532,11 @@ func TestPolicyOnlyReloadKeepsHealthState(t *testing.T) {
 	// Byte-identical egress/routes across both generations; ONLY the health
 	// threshold changes (1 → 5).
 	egressYAML := fmt.Sprintf(`egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, proxyA.URL, proxyB.URL)
+`, proxyA.url(), proxyB.URL)
 	writeCFG(t, dir, upstreamBase("http://upstream.invalid/zen")+egressYAML+healthYAML)
 	sp := spawnProxy(t, dir, map[string]string{
 		"OCFP_CONFIG":         "cfg.yaml",
@@ -480,7 +563,7 @@ routes:
 		}
 		assertRequestLine(t, sp, i-1, "generation=2", "egress=b", "attempts=1", "fallback=false")
 	}
-	if got := aCalls.Load(); got != 1 {
+	if got := proxyA.dialCount(); got != 1 {
 		t.Fatalf("a dialed %d times after a policy-only reload, want 1 — the reload cleared its cooldown", got)
 	}
 	if got := bCalls.Load(); got != 4 {

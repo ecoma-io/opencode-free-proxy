@@ -1,6 +1,9 @@
 // Package upstream ports the OpenCode executor boundary: request transform
 // chain (executors/opencode.js transformRequest), upstream headers
-// (buildHeaders), session resolution, and the retrying HTTP call.
+// (buildHeaders), session resolution, and the single upstream HTTP call —
+// one logical provider request per attempt, with egress failover permitted
+// only for failures proven to precede the request (issue #53,
+// docs/recovery-semantics.md).
 package upstream
 
 import (

@@ -1,5 +1,13 @@
 package upstream
 
+// Attempt-budget and executor-isolation tests (issue #53).
+//
+// The budget this file bounds is DIFFERENT from the one it used to bound.
+// There is no per-egress retry matrix any more: MaxAttempts caps distinct
+// egresses per logical provider attempt, and only a failure that provably
+// happened before the request was transmitted consumes a draw. A provider
+// verdict — 429, 4xx, 5xx — consumes nothing and moves nothing.
+
 import (
 	"context"
 	"fmt"
@@ -11,7 +19,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/health"
@@ -19,10 +26,10 @@ import (
 )
 
 // handlerFixture is like executorFixture but with a per-egress HANDLER
-// (statuses can vary over time) and no-op sleep — the retry-matrix statuses
-// (502/503/504) loop instantly, keeping the exact-POST-count assertions fast.
+// (statuses can vary over time).
 type handlerFixture struct {
 	servers map[string]*httptest.Server
+	clients map[string]*Client
 	rec     *scriptedRecorder
 	exec    *Executor
 	health  *health.Registry
@@ -59,17 +66,11 @@ func newHandlerFixture(t *testing.T, handlers map[string]http.HandlerFunc) *hand
 	}
 	sort.Strings(ids)
 
-	clients := map[string]*Client{}
+	f.clients = map[string]*Client{}
 	for id := range handlers {
 		c := NewClient()
-		c.Sleep = func(time.Duration) {} // no-op: exact POST counts, no 2-3s waits
-		addr := f.servers[id].Listener.Addr().String()
-		c.HTTP.Transport = &http.Transport{
-			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, network, addr)
-			},
-		}
-		clients[id] = c
+		c.HTTP.Transport = dialTo(f.servers[id].Listener.Addr().String())
+		f.clients[id] = c
 	}
 	file := config.File{
 		Egress: make([]config.Egress, 0, len(ids)),
@@ -84,10 +85,21 @@ func newHandlerFixture(t *testing.T, handlers map[string]http.HandlerFunc) *hand
 	}
 	f.rt = rt
 	f.exec = NewExecutor(func(e *config.Egress) (*Client, bool) {
-		c, ok := clients[e.ID]
+		c, ok := f.clients[e.ID]
 		return c, ok
 	}, f.health, f.slots)
 	return f
+}
+
+// deadEgress re-points an egress's transport at a closed port: the only
+// failure shape that consumes an attempt-budget draw (see the file header).
+func (f *handlerFixture) deadEgress(t *testing.T, id string) {
+	t.Helper()
+	c, ok := f.clients[id]
+	if !ok {
+		t.Fatalf("fixture has no egress %q", id)
+	}
+	c.HTTP.Transport = dialTo(closedAddr(t))
 }
 
 func (f *handlerFixture) Close() {
@@ -127,16 +139,31 @@ func sequenceHandler(statuses ...int) http.HandlerFunc {
 	}
 }
 
-// TestExecuteBudgetExactPostCounts proves the retry × fallback budget has no
-// amplification: a 502 egress burns its full per-attempt matrix (1 initial +
-// 3 retries = 4 POSTs) while the fallback target pays exactly 1. MaxAttempts
-// caps DISTINCT egresses, never multiplies per-egress retries.
-func TestExecuteBudgetExactPostCounts(t *testing.T) {
+// closedAddr returns an address nothing is listening on.
+func closedAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+// TestExecuteFallbackExactPostCounts: no amplification. A replay-safe failure
+// on a costs exactly one dial there (and zero requests on a's wire — nothing
+// was ever sent), the fallback egress pays exactly one POST, and the total is
+// one request for the whole logical attempt.
+func TestExecuteFallbackExactPostCounts(t *testing.T) {
 	f := newHandlerFixture(t, map[string]http.HandlerFunc{
-		"a": statusHandler(http.StatusBadGateway), // 502 × forever
+		"a": statusHandler(http.StatusOK),
 		"b": statusHandler(http.StatusOK),
 	})
 	defer f.Close()
+	f.deadEgress(t, "a")
 
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
@@ -149,25 +176,23 @@ func TestExecuteBudgetExactPostCounts(t *testing.T) {
 	if id != "b" || attempts != 2 || class != ClassSuccess {
 		t.Fatalf("id=%q attempts=%d class=%s, want b/2/success", id, attempts, class)
 	}
-	// 1 initial + 3 retries on a (RetryRules[502].Attempts == 3), exactly 1 on b.
-	if got := f.rec.count("a"); got != 4 {
-		t.Fatalf("a POSTs = %d, want 4 (1 initial + 3 retries)", got)
+	if got := f.rec.count("a"); got != 0 {
+		t.Fatalf("a received %d requests — a pre-request failure must never send one", got)
 	}
 	if got := f.rec.count("b"); got != 1 {
-		t.Fatalf("b POSTs = %d, want 1 (fallback never retries a fresh egress)", got)
+		t.Fatalf("b POSTs = %d, want exactly 1", got)
 	}
-	if got := f.rec.total(); got != 5 {
-		t.Fatalf("total POSTs = %d, want 5", got)
+	if got := f.rec.total(); got != 1 {
+		t.Fatalf("total upstream requests = %d, want 1", got)
 	}
 }
 
-// TestExecute503ExhaustsMatrixThenFallsBack: the executor-level twin of the
-// client-level 503 row — the FULL 503 matrix (1 initial + 3 retries) runs
-// INSIDE the attempt before the executor moves to the next egress, which pays
-// exactly one POST.
-func TestExecute503ExhaustsMatrixThenFallsBack(t *testing.T) {
+// TestExecuteProviderStatusConsumesNoBudgetDraw: a route with budget 3 and a
+// healthy sibling, where the head answers 503. The budget is untouched (one
+// attempt), the sibling is never dialed, and the request ends on the verdict.
+func TestExecuteProviderStatusConsumesNoBudgetDraw(t *testing.T) {
 	f := newHandlerFixture(t, map[string]http.HandlerFunc{
-		"a": statusHandler(http.StatusServiceUnavailable), // 503 × forever
+		"a": statusHandler(http.StatusServiceUnavailable),
 		"b": statusHandler(http.StatusOK),
 	})
 	defer f.Close()
@@ -176,126 +201,36 @@ func TestExecute503ExhaustsMatrixThenFallsBack(t *testing.T) {
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-	if uerr != nil || resp == nil {
-		t.Fatalf("uerr=%v resp=%v, want success on b", uerr, resp)
+	if resp != nil {
+		_ = resp.Body.Close()
+		t.Fatal("want no response: the 503 verdict is the outcome")
 	}
-	_ = resp.Body.Close()
-	if id != "b" || attempts != 2 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s, want b/2/success", id, attempts, class)
+	if uerr == nil || uerr.Status != http.StatusServiceUnavailable {
+		t.Fatalf("uerr = %+v, want the provider's 503", uerr)
 	}
-	if got := f.rec.count("a"); got != 1+config.RetryRules[503].Attempts {
-		t.Fatalf("a POSTs = %d, want %d (full 503 matrix before fallback)", got, 1+config.RetryRules[503].Attempts)
+	if id != "a" || attempts != 1 || class != ClassUpstream5xx {
+		t.Fatalf("id=%q attempts=%d class=%s, want a/1/upstream_5xx", id, attempts, class)
 	}
-	if got := f.rec.count("b"); got != 1 {
-		t.Fatalf("b POSTs = %d, want 1", got)
+	if got := f.rec.count("b"); got != 0 {
+		t.Fatalf("b POSTs = %d, want 0", got)
 	}
 }
 
-// TestExecute504ExhaustsMatrixThenFallsBack: same shape for 504 — its matrix
-// is smaller (1 initial + 2 retries) and must be exhausted INSIDE the attempt
-// before fallback.
-func TestExecute504ExhaustsMatrixThenFallsBack(t *testing.T) {
+// TestExecuteCancelledContextNeverReachesTheWire: a canceled request must stop
+// on the attempted egress without dialing another, and without either egress
+// seeing a request. Nothing is delivered (there is nobody to deliver to) and
+// no health mark is made (the caller failed, not the egress).
+func TestExecuteCancelledContextNeverReachesTheWire(t *testing.T) {
 	f := newHandlerFixture(t, map[string]http.HandlerFunc{
-		"a": statusHandler(http.StatusGatewayTimeout), // 504 × forever
-		"b": statusHandler(http.StatusOK),
-	})
-	defer f.Close()
-
-	resp, id, attempts, class, uerr := f.exec.Execute(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-	if uerr != nil || resp == nil {
-		t.Fatalf("uerr=%v resp=%v, want success on b", uerr, resp)
-	}
-	_ = resp.Body.Close()
-	if id != "b" || attempts != 2 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s, want b/2/success", id, attempts, class)
-	}
-	if got := f.rec.count("a"); got != 1+config.RetryRules[504].Attempts {
-		t.Fatalf("a POSTs = %d, want %d (full 504 matrix before fallback)", got, 1+config.RetryRules[504].Attempts)
-	}
-	if got := f.rec.count("b"); got != 1 {
-		t.Fatalf("b POSTs = %d, want 1", got)
-	}
-}
-
-// TestExecuteClientErrorNeverFallsBack: 400/404 are verdicts about the
-// REQUEST (ClassClientError — FallbackAllowed false). One egress, one POST,
-// and the healthy fallback target is never dialed: another egress would
-// repeat the rejection verbatim.
-func TestExecuteClientErrorNeverFallsBack(t *testing.T) {
-	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
-		f := newHandlerFixture(t, map[string]http.HandlerFunc{
-			"a": statusHandler(status),
-			"b": statusHandler(http.StatusOK),
-		})
-
-		resp, id, attempts, class, uerr := f.exec.Execute(
-			context.Background(), f.servers["a"].URL,
-			func() map[string]string { return map[string]string{} },
-			[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-		f.Close()
-		if resp != nil || uerr == nil {
-			t.Fatalf("%d: resp=%v uerr=%v, want the terminal client-error verdict", status, resp, uerr)
-		}
-		if uerr.Status != status {
-			t.Fatalf("%d: surfaced status = %d", status, uerr.Status)
-		}
-		if class != ClassClientError {
-			t.Fatalf("%d: class = %s, want ClassClientError", status, class)
-		}
-		if attempts != 1 || id != "a" {
-			t.Fatalf("%d: attempts=%d id=%q, want exactly one attempt on a", status, attempts, id)
-		}
-		if got := f.rec.count("b"); got != 0 {
-			t.Fatalf("%d: b was dialed %d times — a client-error verdict must never fall back", status, got)
-		}
-	}
-}
-
-// TestExecuteContextCancelDuringRetrySleepStopsDialing: the request ctx dies
-// inside the client's retry sleep (the gap between attempt 1's verdict and
-// attempt 2). The next attempt must fail WITHOUT touching the wire (the
-// transport checks the dead ctx before dialing), classify as
-// ClassContextCanceled, and the executor must not fall back — there is
-// nobody left to deliver a response to.
-func TestExecuteContextCancelDuringRetrySleepStopsDialing(t *testing.T) {
-	f := newHandlerFixture(t, map[string]http.HandlerFunc{
-		"a": statusHandler(http.StatusBadGateway),
+		"a": statusHandler(http.StatusOK),
 		"b": statusHandler(http.StatusOK),
 	})
 	defer f.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	cancel()
 
-	var dials atomic.Int64
-	addrA := f.servers["a"].Listener.Addr().String()
-	a := NewClient()
-	a.Sleep = func(time.Duration) { cancel() } // the ctx dies mid-retry-gap
-	a.HTTP.Transport = &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			dials.Add(1)
-			return (&net.Dialer{}).DialContext(ctx, network, addrA)
-		},
-	}
-	addrB := f.servers["b"].Listener.Addr().String()
-	b := NewClient()
-	b.Sleep = func(time.Duration) {}
-	b.HTTP.Transport = &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			dials.Add(1)
-			return (&net.Dialer{}).DialContext(ctx, network, addrB)
-		},
-	}
-	clients := map[string]*Client{"a": a, "b": b}
-	exec := NewExecutor(func(e *config.Egress) (*Client, bool) {
-		c, ok := clients[e.ID]
-		return c, ok
-	}, f.health, f.slots)
-
-	resp, id, attempts, class, uerr := exec.Execute(
+	resp, id, attempts, class, uerr := f.exec.Execute(
 		ctx, f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
@@ -306,39 +241,38 @@ func TestExecuteContextCancelDuringRetrySleepStopsDialing(t *testing.T) {
 		t.Fatalf("class = %s, want ClassContextCanceled", class)
 	}
 	if attempts != 1 || id != "a" {
-		t.Fatalf("attempts=%d id=%q, want the single pre-cancel attempt on a", attempts, id)
+		t.Fatalf("attempts=%d id=%q, want the single canceled attempt on a", attempts, id)
 	}
 	if uerr == nil || !strings.Contains(uerr.Message, "context canceled") {
 		t.Fatalf("uerr = %+v, want the canceled-context error", uerr)
 	}
-	if got := dials.Load(); got != 1 {
-		t.Fatalf("dials = %d, want 1 — the post-cancel attempt must never reach the wire", got)
+	if got := f.rec.total(); got != 0 {
+		t.Fatalf("upstream requests = %d, want 0 — a canceled request never reaches a provider", got)
 	}
-	if got := f.rec.count("b"); got != 0 {
-		t.Fatalf("b POSTs = %d — a canceled request must not fall back", got)
+	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
+		t.Fatal("a cancellation is the caller's failure: it must not mark the egress unhealthy")
 	}
 }
 
-// TestExecute429Then200KeepsEgressUsable is the adversarial rate-limit proof:
-// a 429 falls back (b serves), but the 429'd egress stays HEALTHY — the next
-// request routes straight back to a, which serves. A wrong "429 poisons
-// health" implementation would route request 2 to b or degrade to 502/503.
-func TestExecute429Then200KeepsEgressUsable(t *testing.T) {
+// TestExecuteVerdictLeavesEgressHealthyAndRoutable is the poisoning proof: an
+// egress that answered 429 is still healthy, so the very next request is routed
+// straight back to it — one attempt, no sibling involved.
+func TestExecuteVerdictLeavesEgressHealthyAndRoutable(t *testing.T) {
 	f := newHandlerFixture(t, map[string]http.HandlerFunc{
 		"a": sequenceHandler(http.StatusTooManyRequests, http.StatusOK), // 1st: 429, then 200
 		"b": statusHandler(http.StatusOK),
 	})
 	defer f.Close()
 
-	// req 1: a → 429 → fallback b → 200.
+	// req 1: a → 429, terminal.
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-	if uerr != nil || id != "b" || attempts != 2 || class != ClassSuccess {
-		t.Fatalf("req1: id=%q attempts=%d class=%s uerr=%v, want b/2/success", id, attempts, class, uerr)
+	if id != "a" || attempts != 1 || class != ClassUpstream429 || uerr == nil || uerr.Status != 429 {
+		t.Fatalf("req1: id=%q attempts=%d class=%s uerr=%v, want the terminal 429 on a", id, attempts, class, uerr)
 	}
-	_ = resp.Body.Close()
+	_ = resp
 	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
 		t.Fatal("a's 429 must NOT mark it unhealthy (rate limit ≠ egress failure)")
 	}
@@ -355,79 +289,46 @@ func TestExecute429Then200KeepsEgressUsable(t *testing.T) {
 	if attempts2 != 1 || class2 != ClassSuccess {
 		t.Fatalf("req2: attempts=%d class=%s, want a single attempt", attempts2, class2)
 	}
-	if got := f.rec.count("b"); got != 1 {
-		t.Fatalf("b POSTs = %d, want 1 (only req1 fell back)", got)
+	if got := f.rec.count("b"); got != 0 {
+		t.Fatalf("b POSTs = %d, want 0 (neither request may move egress)", got)
 	}
 }
 
-// TestExecute429Then500PoisonsOnlyThe500: the same egress gets 429 then 500.
-// The 429 keeps it healthy; the subsequent 500 (a genuine egress failure)
-// marks it unhealthy. Health tracks consecutive FAILURES, and only true
-// failure classes contribute.
-func TestExecute429Then500PoisonsOnlyThe500(t *testing.T) {
+// TestExecuteNoVerdictPoisonsHealth: 429 then 500 then 502 on the same egress.
+// None of them is an egress outage — health tracks the egress PATH, and the
+// provider answered all three times — so the egress stays healthy throughout.
+func TestExecuteNoVerdictPoisonsHealth(t *testing.T) {
 	f := newHandlerFixture(t, map[string]http.HandlerFunc{
-		"a": sequenceHandler(http.StatusTooManyRequests, http.StatusInternalServerError),
+		"a": sequenceHandler(http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway),
 		"b": statusHandler(http.StatusOK),
 	})
 	defer f.Close()
 
-	// req1: a → 429 → fallback b; the 429 keeps a healthy.
-	resp, _, _, _, uerr := f.exec.Execute(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-	if uerr != nil {
-		t.Fatalf("req1 uerr=%v, want success via fallback", uerr)
+	for i, want := range []int{429, 500, 502} {
+		resp, id, _, _, uerr := f.exec.Execute(
+			context.Background(), f.servers["a"].URL,
+			func() map[string]string { return map[string]string{} },
+			[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
+		if resp != nil {
+			_ = resp.Body.Close()
+			t.Fatalf("req%d: want no response", i+1)
+		}
+		if uerr == nil || uerr.Status != want {
+			t.Fatalf("req%d: uerr = %+v, want %d", i+1, uerr, want)
+		}
+		if id != "a" {
+			t.Fatalf("req%d: id = %q, want a", i+1, id)
+		}
+		if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
+			t.Fatalf("req%d: a provider verdict (%d) must never mark the egress unhealthy", i+1, want)
+		}
 	}
-	_ = resp.Body.Close()
-	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
-		t.Fatal("req1: single 429 must not mark a unhealthy")
+	if got := f.rec.count("b"); got != 0 {
+		t.Fatalf("b POSTs = %d, want 0", got)
 	}
-
-	// req2: a → 500 → fallback b; the 500 marks a unhealthy (threshold 1).
-	resp2, _, _, _, uerr2 := f.exec.Execute(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-	if uerr2 != nil {
-		t.Fatalf("req2 uerr=%v, want success via fallback", uerr2)
+	if got := f.rec.count("a"); got != 3 {
+		t.Fatalf("a POSTs = %d, want 3 (one per request)", got)
 	}
-	_ = resp2.Body.Close()
-	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
-		t.Fatal("req2: the 500 must mark a unhealthy (consecutive-failure threshold 1)")
-	}
-}
-
-// TestExecute500Then200RecoversEgress: after a 500 (single POST, marks
-// health), one 200 clears the mark (Observe(true) resets the streak) — the
-// egress is usable on the very next request.
-func TestExecute500Then200RecoversEgress(t *testing.T) {
-	f := newHandlerFixture(t, map[string]http.HandlerFunc{
-		"a": sequenceHandler(http.StatusInternalServerError, http.StatusOK),
-		"b": statusHandler(http.StatusOK),
-	})
-	defer f.Close()
-
-	resp, id, _, _, uerr := f.exec.Execute(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-	if uerr != nil || id != "b" {
-		t.Fatalf("id=%q uerr=%v, want fallback to b", id, uerr)
-	}
-	_ = resp.Body.Close()
-	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
-		t.Fatal("a's 500 marks it unhealthy")
-	}
-
-	resp2, id2, _, _, uerr2 := f.exec.Execute(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-	if uerr2 != nil || id2 != "a" {
-		t.Fatalf("req2 id=%q uerr=%v, want a restored (single success clears)", id2, uerr2)
-	}
-	_ = resp2.Body.Close()
 }
 
 // TestExecutorConsumesPinnedEgressPointers: the executor must dial through
@@ -438,33 +339,22 @@ func TestExecute500Then200RecoversEgress(t *testing.T) {
 // reference — immutability by construction, asserted here.
 func TestExecutorConsumesPinnedEgressPointers(t *testing.T) {
 	f := newHandlerFixture(t, map[string]http.HandlerFunc{
-		"a": sequenceHandler(http.StatusInternalServerError, http.StatusOK),
+		"a": statusHandler(http.StatusOK),
 		"b": statusHandler(http.StatusOK),
 	})
 	defer f.Close()
+	f.deadEgress(t, "a")
 
 	plan := f.plan("a", "b")
 
 	// Rebuild the executor with a recording clientFor.
-	clients := map[string]*Client{}
-	for id, srv := range f.servers {
-		c := NewClient()
-		c.Sleep = func(time.Duration) {}
-		addr := srv.Listener.Addr().String()
-		c.HTTP.Transport = &http.Transport{
-			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, network, addr)
-			},
-		}
-		clients[id] = c
-	}
 	var mu sync.Mutex
 	var seen []*config.Egress
 	exec := NewExecutor(func(e *config.Egress) (*Client, bool) {
 		mu.Lock()
 		seen = append(seen, e)
 		mu.Unlock()
-		c, ok := clients[e.ID]
+		c, ok := f.clients[e.ID]
 		return c, ok
 	}, f.health, f.slots)
 
@@ -498,10 +388,11 @@ func TestExecutorConsumesPinnedEgressPointers(t *testing.T) {
 // differ, and the executor keeps dialing the pinned ones.
 func TestExecutorIgnoresRuntimeSwapAfterPlan(t *testing.T) {
 	f := newHandlerFixture(t, map[string]http.HandlerFunc{
-		"a": sequenceHandler(http.StatusInternalServerError, http.StatusOK),
+		"a": statusHandler(http.StatusOK),
 		"b": statusHandler(http.StatusOK),
 	})
 	defer f.Close()
+	f.deadEgress(t, "a")
 
 	plan := f.plan("a", "b")
 	// Simulate a reload: a NEW runtime with the same ids resolves to NEW

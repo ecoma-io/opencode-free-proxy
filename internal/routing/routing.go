@@ -1,6 +1,6 @@
 // Package routing selects WHERE a request starts: the ordered egress list
-// (RoutePlan) a matched route produces. Fallback (what to try after a
-// retryable failure) and health (whether an egress is temporarily eligible)
+// (RoutePlan) a matched route produces. Failover (what to try after a
+// replay-safe failure) and health (whether an egress is temporarily eligible)
 // are separate concerns — routing only matches and orders, it never decides
 // failure handling. The executor consumes RoutePlan and knows nothing about
 // the strategies that shaped it.

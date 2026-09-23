@@ -2,7 +2,7 @@ package upstream
 
 // Evidence tests for ExecuteObserved: the executor annotates each attempt's
 // rows with egress identity, the attempt number, in-flight occupancy, and the
-// health + retry/fallback decisions it just made — so a request's rows alone
+// health + fallback decisions it just made — so a request's rows alone
 // reconstruct request → attempts → egress → verdict → decision. The fallback
 // BEHAVIOR is pinned by fallback_test.go; these pin the forensic record.
 
@@ -12,9 +12,16 @@ import (
 	"testing"
 )
 
-func TestEvidenceAttemptCorrelation429Chain(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 429, "b": 429, "c": 200})
+// TestEvidenceAttemptCorrelationAcrossEgresses: two replay-safe failures in a
+// row, then a serving third egress. Each failed attempt leaves exactly one
+// row, numbered in dial order, and each carries the decisions the executor
+// made at that moment (mark + move on for both, since the plan had a third
+// entry left).
+func TestEvidenceAttemptCorrelationAcrossEgresses(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200, "c": 200})
 	defer f.Close()
+	f.deadEgress(t, "a")
+	f.deadEgress(t, "b")
 
 	rec := NewRecorder()
 	resp, id, attempts, _, uerr := f.exec.ExecuteObserved(
@@ -35,50 +42,69 @@ func TestEvidenceAttemptCorrelation429Chain(t *testing.T) {
 	}
 	for i, row := range rows {
 		eg := string(rune('a' + i))
-		if row.Egress != eg || row.Attempt != i+1 || row.Phase != PhaseResponse {
+		if row.Egress != eg || row.Attempt != i+1 || row.Phase != PhaseTransport {
 			t.Fatalf("row %d = %+v, want egress %s attempt %d", i, row, eg, i+1)
 		}
-		if row.Status != 429 || row.Class != ClassUpstream429.String() {
+		if row.Class != ClassConnectionError.String() {
 			t.Fatalf("row %d = %+v", i, row)
 		}
-		if row.HealthDecision != HealthNeutral {
-			t.Fatalf("row %d: 429 must be health-neutral, got %q", i, row.HealthDecision)
+		// A pre-request transport failure is the one thing that marks health.
+		if row.HealthDecision != HealthMarked {
+			t.Fatalf("row %d: a failed dial must be attributed to the egress, got %q", i, row.HealthDecision)
 		}
-		if row.RetryDecision != RetryFallback {
-			t.Fatalf("row %d: decision = %q, want fallback", i, row.RetryDecision)
+		if row.FallbackDecision != FallbackYes {
+			t.Fatalf("row %d: decision = %q, want fallback", i, row.FallbackDecision)
+		}
+		if row.Origin != OriginTransport.String() || row.RequestState != RequestStateNotSent.String() {
+			t.Fatalf("row %d: provenance lost: %+v", i, row)
 		}
 		if row.EgressType != "direct" {
 			t.Fatalf("row %d: egress type = %q, want direct", i, row.EgressType)
 		}
 	}
-	if !f.health.Healthy(healthKey("a"), testHealthPolicy) || !f.health.Healthy(healthKey("b"), testHealthPolicy) {
-		t.Fatal("row health decisions must mirror the registry: 429 poisons nothing")
+	if f.health.Healthy(healthKey("a"), testHealthPolicy) || f.health.Healthy(healthKey("b"), testHealthPolicy) {
+		t.Fatal("row health decisions must mirror the registry: both failed dials mark")
 	}
 }
 
-func TestEvidence5xxMarksHealth(t *testing.T) {
+// TestEvidenceProviderVerdictMarksNoHealth: a 500 is the provider answering.
+// One row, no health mark, and the decision on the row is STOP — the sibling
+// egress is never dialed.
+func TestEvidenceProviderVerdictMarksNoHealth(t *testing.T) {
 	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 200})
 	defer f.Close()
 
 	rec := NewRecorder()
-	resp, _, _, _, uerr := f.exec.ExecuteObserved(
+	_, _, attempts, _, _ := f.exec.ExecuteObserved(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 2), rec)
-	if uerr != nil || resp == nil {
-		t.Fatalf("uerr = %v", uerr)
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
 	}
-	defer func() { _ = resp.Body.Close() }()
 
 	rows := rec.Rows()
-	if len(rows) != 1 || rows[0].HealthDecision != HealthMarked || rows[0].RetryDecision != RetryFallback {
-		t.Fatalf("rows = %+v, want 500 → marked + fallback", rows)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
 	}
-	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
-		t.Fatal("row must mirror the registry: 500 marks health")
+	row := rows[0]
+	if row.HealthDecision != HealthNeutral || row.FallbackDecision != FallbackStop {
+		t.Fatalf("row = %+v, want neutral + stop for a provider verdict", row)
+	}
+	if row.Origin != OriginUpstream.String() || row.RequestState != RequestStateResponseStarted.String() {
+		t.Fatalf("row provenance = %+v, want upstream/response_started", row)
+	}
+	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
+		t.Fatal("row must mirror the registry: a 500 marks nothing")
+	}
+	if got := f.rec.count("b"); got != 0 {
+		t.Fatalf("b POSTs = %d, want 0", got)
 	}
 }
 
+// TestEvidenceTerminalVerdictStops: the same shape for 429, which the removed
+// matrix treated specially — the row now says what actually happened: one
+// attempt, no health mark, stop.
 func TestEvidenceTerminalVerdictStops(t *testing.T) {
 	f := newExecutorFixture(t, map[string]int{"a": 429})
 	defer f.Close()
@@ -98,19 +124,21 @@ func TestEvidenceTerminalVerdictStops(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d", len(rows))
 	}
-	if rows[0].RetryDecision != RetryStop || rows[0].HealthDecision != HealthNeutral {
-		t.Fatalf("terminal row = %+v, want stop + neutral (plan exhausted, nothing marked)", rows[0])
+	if rows[0].FallbackDecision != FallbackStop || rows[0].HealthDecision != HealthNeutral {
+		t.Fatalf("terminal row = %+v, want stop + neutral", rows[0])
 	}
 }
 
-// TestEvidenceTerminalStopAfterTrailingSkip: plan [a, b] where a fails
-// (fallback allowed) and b's slot fills between plan and dial. The post-loop
-// plan-exhaustion correction must hit the row the DECISION stamped — a's
-// terminal dial row (fallback → stop) — and never the skip row appended
-// after it: a skip is a scheduling fact and carries no retry disposition.
+// TestEvidenceTerminalStopAfterTrailingSkip: plan [a, b] where a fails replay-
+// safely (fallback allowed at the time) and b's slot fills between plan and
+// dial. The post-loop plan-exhaustion correction must hit the row the DECISION
+// stamped — a's transport row (fallback → stop) — and never the skip row
+// appended after it: a skip is a scheduling fact and carries no fallback
+// disposition.
 func TestEvidenceTerminalStopAfterTrailingSkip(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 429, "b": 200})
+	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200})
 	defer f.Close()
+	f.deadEgress(t, "a")
 	f.slots.Acquire("b", 1) // b's only slot is busy: plan passes over it
 
 	rec := NewRecorder()
@@ -124,60 +152,22 @@ func TestEvidenceTerminalStopAfterTrailingSkip(t *testing.T) {
 			MaxConcurrency:  map[string]int{"a": 1, "b": 1},
 			HealthPolicy:    testHealthPolicy,
 		}, rec)
-	if uerr == nil || uerr.Status != http.StatusTooManyRequests {
-		t.Fatalf("uerr = %v, want the terminal 429", uerr)
+	if uerr == nil {
+		t.Fatal("want a terminal failure: both plan entries are unusable")
 	}
 	if id != "a" || attempts != 1 {
 		t.Fatalf("id=%q attempts=%d, want a/1", id, attempts)
 	}
 
 	rows := rec.Rows()
-	if len(rows) != 2 || rows[0].Phase != PhaseResponse || rows[1].Phase != PhaseSkip {
-		t.Fatalf("rows = %+v, want a 429 row then a b skip row", rows)
+	if len(rows) != 2 || rows[0].Phase != PhaseTransport || rows[1].Phase != PhaseSkip {
+		t.Fatalf("rows = %+v, want a transport row then a b skip row", rows)
 	}
-	if rows[0].Egress != "a" || rows[0].RetryDecision != RetryStop {
+	if rows[0].Egress != "a" || rows[0].FallbackDecision != FallbackStop {
 		t.Fatalf("terminal dial row = %+v, want stop (plan exhausted behind it)", rows[0])
 	}
-	if rows[1].Egress != "b" || rows[1].Reason != SkipSlotFull || rows[1].RetryDecision != "" {
-		t.Fatalf("skip row = %+v, want slot_full with NO retry disposition", rows[1])
-	}
-}
-
-// TestEvidenceRetriedMatrixSharesAttempt: a 502 that burns the whole matrix
-// inside ONE egress attempt yields 4 rows sharing attempt=1 with distinct dial
-// numbers — the attempt_id derivation input (reqID/1, reqID/1.2, …). Only the
-// terminal dial carries the executor's fallback decision; matrix-retried dials
-// keep retry_same_egress.
-func TestEvidenceRetriedMatrixSharesAttempt(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 502, "b": 200})
-	defer f.Close()
-
-	rec := NewRecorder()
-	resp, _, _, _, uerr := f.exec.ExecuteObserved(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 2), rec)
-	if uerr != nil || resp == nil {
-		t.Fatalf("uerr = %v", uerr)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	rows := rec.Rows()
-	if len(rows) != 4 {
-		t.Fatalf("rows = %d, want 3 matrix retries + terminal on attempt 1", len(rows))
-	}
-	for i, row := range rows {
-		if row.Egress != "a" || row.Attempt != 1 || row.Dial != i+1 {
-			t.Fatalf("row %d = %+v, want a attempt 1 dial %d", i, row, i+1)
-		}
-	}
-	for i := 0; i < 3; i++ {
-		if rows[i].RetryDecision != RetryRetrySameEgress || !rows[i].Retried {
-			t.Fatalf("matrix row %d = %+v, want retry_same_egress", i, rows[i])
-		}
-	}
-	if rows[3].RetryDecision != RetryFallback || rows[3].Retried {
-		t.Fatalf("terminal row = %+v, want fallback after matrix exhausted", rows[3])
+	if rows[1].Egress != "b" || rows[1].Reason != SkipSlotFull || rows[1].FallbackDecision != "" {
+		t.Fatalf("skip row = %+v, want slot_full with NO fallback disposition", rows[1])
 	}
 }
 

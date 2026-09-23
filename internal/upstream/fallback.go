@@ -12,11 +12,19 @@ import (
 )
 
 // Executor drives the cross-egress attempt loop — the fallback layer. Each
-// attempt is one per-egress Client.DoClassified; the retry matrix
-// (RetryRules) stays untouched INSIDE the attempt. After a terminal result
-// the executor classifies → maybe observes health → maybe moves to the next
-// attempt. Fallback never happens once a live response exists: the calling
-// relay owns commitment from the moment Execute returns a non-nil response.
+// attempt is one per-egress Client.DoClassified, and each attempt is one
+// logical provider call: the client neither retries statuses nor re-dials.
+//
+// The ONLY reason to move to another egress is a failure that provably
+// happened before the request was transmitted — Failure.ReplaySafe(). A
+// provider HTTP response of any status ends the request (it is relayed), an
+// unprovable failure (a response-header timeout, a post-transmission reset, a
+// pooled-connection failure) ends it too, and so does client cancellation.
+// The same predicate gates the health mark, because it is exactly "the
+// egress, not the provider, failed" (docs/recovery-semantics.md).
+//
+// Fallback never happens once a live response exists: the calling relay owns
+// commitment from the moment Execute returns a non-nil response.
 type Executor struct {
 	clientFor func(*config.Egress) (*Client, bool)
 	health    *health.Registry // nil = no registry wired (health off)
@@ -38,9 +46,13 @@ func NewExecutor(clientFor func(*config.Egress) (*Client, bool), h *health.Regis
 // never under a global knob (issue #6).
 type AttemptPolicy struct {
 	FallbackEnabled bool
-	MaxAttempts     int // distinct egresses including the first; < 1 = 1
-	MaxConcurrency  map[string]int
-	HealthPolicy    health.Policy
+	// MaxAttempts bounds DISTINCT egresses per logical provider attempt
+	// (including the first; < 1 = 1). It bounds egress movement ONLY: the
+	// request holds no provider-level budget, because a provider response of
+	// any status ends the logical call — see the Executor doc.
+	MaxAttempts    int
+	MaxConcurrency map[string]int
+	HealthPolicy   health.Policy
 }
 
 // Budget is the attempt cap the executor enforces for this policy. It is
@@ -63,8 +75,12 @@ func (p AttemptPolicy) Budget() int {
 // spot (see the loop tail below); only a request that never dialed (every
 // plan entry skipped, or an empty head set) gets the synthetic 502 envelope.
 //
-// Invariants (issue #3):
-//   - 429 falls back to the next egress but NEVER marks health.
+// Invariants (issue #3, revised by issue #53):
+//   - Fallback happens ONLY on a replay-safe failure (origin = transport AND
+//     request_state = not_sent). A provider response, an unprovable failure
+//     and a cancellation all end the request on the egress that produced them.
+//   - An egress is marked unhealthy exactly when it is the side that failed —
+//     the same replay-safe condition — so 429/4xx/5xx never poison it.
 //   - No fallback after any downstream write — guaranteed structurally:
 //     downstream writes happen only after this returns a response.
 //   - A slot that fills between plan and dial is SKIPPED, never a failure.
@@ -106,11 +122,11 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 //     with egress id/type, attempt number, and in-flight occupancy — the
 //     client layer dials a transport and cannot know them;
 //   - decisions: the LAST row of a failed attempt receives the health and
-//     retry/fallback decisions the executor just made, AFTER they were made
-//     (a row never claims a decision before it exists).
+//     failover decisions the executor just made, AFTER they were made (a row
+//     never claims a decision before it exists).
 //
 // Ordering is therefore exactly: response → capture → classify → health →
-// retry/fallback decision → (later, at the router) emit.
+// failover decision → (later, at the router) emit.
 func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy, rec *Recorder) (*http.Response, string, int, Class, *UpstreamError) {
 	budget := policy.Budget()
 	attempts := 0
@@ -121,7 +137,7 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 	// attempt's decisions were stamped on (-1 = none). The post-loop
 	// correction below targets exactly that row — computed when the decision
 	// was stamped, never "the last row now", because skip rows can be
-	// appended after a failed attempt and must never receive a retry
+	// appended after a failed attempt and must never receive a failover
 	// disposition.
 	terminalRow := -1
 	// The budget is checked exactly once per dial, at the continue guard
@@ -169,8 +185,8 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 			inFlight = x.slots.InFlight(id)
 		}
 		startRow := rec.Len()
-		resp, uerr, class := client.DoClassifiedObserved(ctx, url, buildHeaders, bodyJSON, rec)
-		lastClass = class
+		resp, uerr, failure := client.DoClassifiedObserved(ctx, url, buildHeaders, bodyJSON, rec)
+		lastClass = failure.Class
 		// Identity annotation for every row this attempt captured.
 		rec.Annotate(startRow, func(row *Row) {
 			row.Egress = id
@@ -183,26 +199,30 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 			if x.slots != nil {
 				x.slots.Release(id)
 			}
-			if class == ClassContextCanceled {
-				annotateDecision(rec, startRow, HealthNeutral, RetryStop)
-				return nil, id, attempts, class, uerr
-			}
+			// ONE predicate for both decisions (issue #53): a failure is
+			// attributable to the EGRESS — and therefore worth marking, and
+			// worth re-sending elsewhere — only when it happened at a dial
+			// phase this process performs itself, before any request byte
+			// existed. Everything else (a provider verdict, a response-header
+			// timeout after transmission, a post-send reset, a pooled-
+			// connection failure, a dead caller) stops here on this egress.
+			safe := failure.ReplaySafe()
 			health := HealthNeutral
-			if class.MarksHealth() && x.health != nil {
+			if safe && x.health != nil {
 				// State identity is id+transport (eg.HealthKey) so a policy-
 				// only reload keeps history while a transport swap starts
 				// clean; the POLICY is this request's snapshot.
 				x.health.Observe(eg.HealthKey(), false, policy.HealthPolicy)
 				health = HealthMarked
 			}
-			if !class.FallbackAllowed() || attempts >= budget {
-				annotateDecision(rec, startRow, health, RetryStop)
-				return nil, id, attempts, class, uerr
+			if !safe || attempts >= budget {
+				annotateDecision(rec, startRow, health, FallbackStop)
+				return nil, id, attempts, failure.Class, uerr
 			}
 			// Only the fallback branch's row can need the post-loop
 			// correction — the stop branches return before the loop can
 			// exhaust the plan.
-			terminalRow = annotateDecision(rec, startRow, health, RetryFallback)
+			terminalRow = annotateDecision(rec, startRow, health, FallbackYes)
 			continue
 		}
 		if x.health != nil {
@@ -211,7 +231,7 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 		if x.slots != nil {
 			resp.Body = &slotReleaseBody{ReadCloser: resp.Body, free: func() { x.slots.Release(id) }}
 		}
-		return resp, id, attempts, class, uerr
+		return resp, id, attempts, failure.Class, uerr
 	}
 	// Terminal verdict: the LAST REAL one when anything was dialed — a plan
 	// that ran out before the budget must not rewrite a 429/503/504 into a
@@ -229,9 +249,7 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 	// This executor keeps the last real verdict instead — the synthesized
 	// string is lossy (it discards the upstream's own message body), not
 	// load-bearing, and the status the client backoffs on stays the
-	// upstream's. Everything else is parity: an exhausted retry matrix
-	// returns the real response (base.js:163) and the last URL's real error
-	// escapes (base.js:179).
+	// upstream's. A 429 that every egress answered still leaves as a 429.
 	//
 	// The synthetic envelope is only for a request that never dialed — every
 	// plan entry skipped (slot-full / unknown egress / transport build) or an
@@ -243,12 +261,12 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 		// request did — a log ending in "fallback" with no following attempt
 		// reads as evidence loss. Correct exactly the row the decision
 		// stamped (terminalRow, captured when it was stamped): a skip row
-		// appended after the failed attempt never receives a retry
+		// appended after the failed attempt never receives a fallback
 		// disposition, and an earlier attempt's row keeps its fallback label
 		// (a later attempt did follow it). -1 means the cap dropped the
 		// attempt's rows — nothing to correct.
 		if terminalRow >= 0 {
-			rec.AnnotateAt(terminalRow, func(row *Row) { row.RetryDecision = RetryStop })
+			rec.AnnotateAt(terminalRow, func(row *Row) { row.FallbackDecision = FallbackStop })
 		}
 		return nil, lastID, attempts, lastClass, lastErr
 	}
@@ -268,20 +286,20 @@ func proxyTypeName(eg *config.Egress) string {
 	return string(eg.Proxy.Type)
 }
 
-// annotateDecision stamps the executor's just-made health and retry/fallback
+// annotateDecision stamps the executor's just-made health and fallback
 // decisions onto the LAST row of the failed attempt that starts at startRow,
 // returning the row index it stamped (-1 when the startRow guard fired: the
-// cap dropped every row of the attempt, so there is nothing to stamp).
-// Retried (non-terminal) rows keep their retry_same_egress decision — only
-// the terminal dial's row carries the attempt disposition.
-func annotateDecision(rec *Recorder, startRow int, health, retry string) int {
+// cap dropped every row of the attempt, so there is nothing to stamp). One
+// dial per attempt is what makes "the last row of the attempt" and "the row
+// of the failed dial" the same row.
+func annotateDecision(rec *Recorder, startRow int, health, fallback string) int {
 	last := rec.Len() - 1
 	if last < startRow {
 		return -1
 	}
 	rec.Annotate(last, func(row *Row) {
 		row.HealthDecision = health
-		row.RetryDecision = retry
+		row.FallbackDecision = fallback
 	})
 	return last
 }

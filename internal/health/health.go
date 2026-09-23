@@ -1,7 +1,10 @@
 // Package health is the temporary-eligibility layer: per-egress consecutive
 // failure counting and cooldown. The three layers stay separate — routing
-// chooses where to start, fallback chooses what to try after a retryable
+// chooses where to start, failover chooses what to try after a replay-safe
 // failure, health decides whether an egress may be tried AT ALL for a while.
+// Health measures EGRESS-PATH health only (issue #53): it is marked by the
+// same predicate that permits the egress move (Failure.ReplaySafe), so a
+// provider verdict — 429, 4xx, 5xx alike — never poisons an egress.
 //
 // Policy and state are deliberately split (issue #6):
 //

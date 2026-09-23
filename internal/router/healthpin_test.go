@@ -32,23 +32,12 @@ import (
 func TestInFlightPinShieldsIdentityFromReclaim(t *testing.T) {
 	dir := t.TempDir()
 
-	// a: holds the request until released, then fails with 500. The gate
-	// release is idempotent and also registered as a cleanup: on an assertion
-	// failure mid-test the deferred httptest.Server.Close would otherwise wait
-	// forever for the still-gated request.
-	var gateMu sync.Mutex
-	gate := make(chan struct{})
-	releaseGate := sync.OnceFunc(func() { close(gate) })
-	t.Cleanup(releaseGate)
-	released := false
-	proxyA := forwardingProxy(func(w http.ResponseWriter, r *http.Request) {
-		gateMu.Lock()
-		released = true
-		gateMu.Unlock()
-		<-gate
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	defer proxyA.Close()
+	// a: holds the dial until released, then fails PRE-REQUEST (the SOCKS5
+	// greeting never completes), which is the only failure shape that may
+	// move the request on to b. The proxy's own cleanup closes both the held
+	// connections and the listener, so an assertion failure mid-test cannot
+	// leave the request parked forever.
+	proxyA := newFailingEgressProxy(t, true)
 	var bMu sync.Mutex
 	bCalls := 0
 	proxyB := countProxy(&bCalls, &bMu)
@@ -60,11 +49,11 @@ health:
   failure_threshold: 1
   cooldown: 1h
 egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), nil)
+`, proxyA.url(), pxyURL(proxyB)), nil)
 
 	// Request 1: pins generation 1's keys (keyA included) and blocks inside
 	// a's dial. a must be HEALTHY here — a cooling a would be filtered from
@@ -80,19 +69,7 @@ routes:
 	go func() {
 		done <- postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		gateMu.Lock()
-		r := released
-		gateMu.Unlock()
-		if r || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !released {
-		t.Fatal("request 1 never reached proxy a")
-	}
+	proxyA.waitDialed(t)
 
 	// Now, while request 1 is mid-dial (pin held, state existing), arm a:
 	// threshold 1 → cooling for 1h. Unknown identities are healthy, so
@@ -126,9 +103,9 @@ routes:
 		t.Fatal("a's cooldown state was reclaimed while request 1 still pinned it")
 	}
 
-	// Release request 1; it falls back to b (500 from a) and its pin goes
-	// away.
-	releaseGate()
+	// Release request 1; a's dial fails pre-request, the request falls back
+	// to b, and its pin goes away.
+	proxyA.release()
 	rec1 := <-done
 	if rec1.Code != http.StatusOK || rec1.Header().Get("X-OFP-Egress") != "b" {
 		t.Fatalf("request 1: status=%d egress=%q, want 200 via b (fallback)", rec1.Code, rec1.Header().Get("X-OFP-Egress"))
@@ -174,32 +151,24 @@ func writeCfgAtomic(t *testing.T, dir, doc string) {
 // cannot time: concurrent relays against a config store swapping every few
 // milliseconds, under -race.
 //
-// Shape: odd generations route [a] (a 500-always proxy, armed cooling before
-// the storm, threshold 1 / cooldown 1h); even generations route [c] (a 200
-// proxy). An even generation's reclaim legitimately wipes a's unpinned
-// identity; odd-generation requests already past their heads filter may then
-// legitimately dial a (up to `workers` concurrent dials, until the first 500
-// re-arms the cooldown). So the pass bound is aDials ≤ (generations/2 + 1) ×
-// workers — NOT zero, and the comment must be honest about why: the
-// Get→Pin window the old code raced over is nanoseconds wide and the failure
-// it produced (a pin landing after a reclaim) is a LOGICAL ordering bug, not
-// a data race — the race detector cannot see it and no black-box test can
-// order it deterministically without production hooks (server.go is off
-// limits to this change). What the storm does prove: no deadlock, no lost
-// wakeups, no panic, every request completes, and dial amplification stays
-// within the legit-wipe bound.
+// Shape: odd generations route [a] (a pre-request-failing egress, armed
+// cooling before the storm, threshold 1 / cooldown 1h); even generations
+// route [c] (a 200 proxy). An even generation's reclaim legitimately wipes
+// a's unpinned identity; odd-generation requests already past their heads
+// filter may then legitimately dial a (up to `workers` concurrent dials, until
+// the first failure re-arms the cooldown). So the pass bound is
+// aDials ≤ (generations/2 + 1) × workers — NOT zero, and the comment must be
+// honest about why: the Get→Pin window the old code raced over is nanoseconds
+// wide and the failure it produced (a pin landing after a reclaim) is a
+// LOGICAL ordering bug, not a data race — the race detector cannot see it and
+// no black-box test can order it deterministically without production hooks
+// (server.go is off limits to this change). What the storm does prove: no
+// deadlock, no lost wakeups, no panic, every request completes, and dial
+// amplification stays within the legit-wipe bound.
 func TestRelayPinReclaimConcurrentStorm(t *testing.T) {
 	dir := t.TempDir()
 
-	var aMu sync.Mutex
-	aCalls := 0
-	proxyA := forwardingProxy(func(w http.ResponseWriter, r *http.Request) {
-		aMu.Lock()
-		aCalls++
-		aMu.Unlock()
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	defer proxyA.Close()
+	proxyA := newFailingEgressProxy(t, false)
 	var cMu sync.Mutex
 	cCalls := 0
 	proxyC := countProxy(&cCalls, &cMu)
@@ -209,10 +178,10 @@ func TestRelayPinReclaimConcurrentStorm(t *testing.T) {
 fallback: {max_attempts: 1}
 health: {enabled: true, failure_threshold: 1, cooldown: 1h}
 egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
 routes:
   - {id: r, egress: [a]}
-`, pxyURL(proxyA))
+`, proxyA.url())
 	evenDoc := fmt.Sprintf(`
 fallback: {max_attempts: 1}
 health: {enabled: true, failure_threshold: 1, cooldown: 1h}
@@ -272,12 +241,12 @@ routes:
 				reqMu.Lock()
 				requests++
 				// 200 = an even-generation request served by c. 502 = an
-				// odd-generation request whose only egress a is cooling (no
-				// eligible head). 500 = an odd-generation request that DIALED
-				// a (state legitimately wiped by the last even generation's
-				// reclaim) and relayed a's 500 envelope. Anything else is
-				// broken.
-				if rec.Code != http.StatusOK && rec.Code != http.StatusBadGateway && rec.Code != http.StatusInternalServerError {
+				// odd-generation request that either found a cooling (no
+				// eligible head) or dialed it and failed pre-request with
+				// max_attempts: 1 (no fallback left). A provider status could
+				// not appear here at all: a's only egress never answers HTTP.
+				// Anything else is broken.
+				if rec.Code != http.StatusOK && rec.Code != http.StatusBadGateway {
 					badStatus++
 					if sampleBody == "" {
 						sampleBody = fmt.Sprintf("%d %s", rec.Code, rec.Body.String())
@@ -298,17 +267,15 @@ routes:
 	total := requests
 	sample := sampleBody
 	reqMu.Unlock()
-	aMu.Lock()
-	dials := aCalls
-	aMu.Unlock()
+	dials := proxyA.dialCount()
 	if bad != 0 {
 		t.Fatalf("%d/%d storm requests returned an unexpected status (sample: %s)", bad, total, sample)
 	}
 	// Each even generation's reclaim can uncool a at most once; every
 	// odd-generation request ALREADY past its routeHeads filter at that
-	// instant (up to `workers`) may then dial a, and the first 500 landing
-	// re-arms the cooldown for the rest (fallback max_attempts: 1 caps each
-	// at one dial).
+	// instant (up to `workers`) may then dial a, and the first failure
+	// landing re-arms the cooldown for the rest (fallback max_attempts: 1
+	// caps each at one dial).
 	maxDials := (int(store.Get().Generation)/2 + 1) * workers
 	if dials > maxDials {
 		t.Fatalf("a dialed %d times across %d generations (bound %d) — a pinned identity's state was wiped mid-request more often than legit reclaims explain", dials, store.Get().Generation, maxDials)

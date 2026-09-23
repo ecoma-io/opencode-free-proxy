@@ -19,7 +19,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/identity"
@@ -40,7 +39,7 @@ func evidenceRouter(t *testing.T, log zerolog.Logger, doc string) (*Server, *htt
 		t.Fatal(err)
 	}
 	t.Cleanup(store.Stop)
-	s := NewServer(store, identity.NewUserAgentCache(), upstream.NewClient(), log, func(time.Duration) {})
+	s := NewServer(store, identity.NewUserAgentCache(), upstream.NewClient(), log)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.HandleChatCompletions)
 	mux.HandleFunc("POST /v1/responses", s.HandleResponses)
@@ -96,22 +95,17 @@ func strField(t *testing.T, ev map[string]any, key string) string {
 	return v
 }
 
-// TestUpstreamErrorEvent429Terminal: a single-egress 429 renders exactly one
-// warn upstream_error event carrying the full forensic record, and the
-// completion line still follows unchanged.
+// TestUpstreamErrorEvent429Terminal: a 429 renders exactly one warn
+// upstream_error event carrying the full forensic record — one attempt, no
+// egress move, no health mark — and the completion line still follows
+// unchanged. The healthy sibling egress is never dialed (asserted by the
+// single event and by the request ending on a's verdict).
 func TestUpstreamErrorEvent429Terminal(t *testing.T) {
-	var hits atomic.Int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		n := hits.Add(1)
-		if n == 1 {
-			w.Header().Set("Retry-After", "17")
-			w.Header().Set("X-RateLimit-Remaining", "0")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`))
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(chatStreamSSE))
+		w.Header().Set("Retry-After", "17")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`))
 	}))
 	defer up.Close()
 
@@ -119,14 +113,14 @@ func TestUpstreamErrorEvent429Terminal(t *testing.T) {
 	_, mux := evidenceRouter(t, logging.New(&buf), twoDirectEgressDoc(up.URL))
 
 	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d (body=%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d (body=%s), want the provider's 429 relayed", rec.Code, rec.Body.String())
 	}
 
 	events := decodeEvents(t, &buf)
 	errs := eventsWith(events, "upstream_error")
 	if len(errs) != 1 {
-		t.Fatalf("upstream_error events = %d, want 1 (egress a 429s, b serves): %v", len(errs), eventsWith(events, "upstream_error"))
+		t.Fatalf("upstream_error events = %d, want 1 (one attempt on a): %v", len(errs), eventsWith(events, "upstream_error"))
 	}
 	ev := errs[0]
 	if ev["level"] != "warn" {
@@ -147,14 +141,16 @@ func TestUpstreamErrorEvent429Terminal(t *testing.T) {
 		// Provenance (issue #51): an HTTP verdict is the provider's answer, and
 		// a response existing PROVES the request was received — never a replay
 		// candidate.
-		"origin":                "upstream",
-		"failure_phase":         "response_headers",
-		"request_state":         "response_started",
-		"error_type":            "rate_limit_error",
-		"message":               "rate limited",
-		"retry_after":           "17",
+		"origin":        "upstream",
+		"failure_phase": "response_headers",
+		"request_state": "response_started",
+		"error_type":    "rate_limit_error",
+		"message":       "rate limited",
+		"retry_after":   "17",
+		// The recovery split (issue #53): a provider verdict marks no health and
+		// moves no egress — the decision on the row is STOP.
 		"health_decision":       "neutral",
-		"retry_decision":        "fallback",
+		"fallback_decision":     "stop",
 		"route":                 "default",
 		"model":                 "qwen3-coder-free",
 		"endpoint":              "chat",
@@ -175,6 +171,12 @@ func TestUpstreamErrorEvent429Terminal(t *testing.T) {
 	if ev["max_attempts"] != float64(3) { // the config default fallback budget
 		t.Fatalf("max_attempts = %v, want 3", ev["max_attempts"])
 	}
+	// The removed retry-matrix vocabulary must not reappear on the wire.
+	for _, stale := range []string{"retry_decision", "retried", "retry_delay_ms", "matrix_draws"} {
+		if _, has := ev[stale]; has {
+			t.Fatalf("stale retry field %q on the event: %v", stale, ev[stale])
+		}
+	}
 	// The completion line still lands, same request id, AFTER the evidence.
 	done := eventsWith(events, "request completed")
 	if len(done) != 1 {
@@ -183,13 +185,19 @@ func TestUpstreamErrorEvent429Terminal(t *testing.T) {
 	if strField(t, done[0], "request_id") != reqID {
 		t.Fatal("completion line lost the request id correlation")
 	}
-	if done[0]["class"] != "success" || done[0]["status"] != float64(200) {
-		t.Fatalf("completion outcome = %v", done[0])
+	if done[0]["class"] != "upstream_429" || done[0]["status"] != float64(429) {
+		t.Fatalf("completion outcome = %v, want the relayed 429", done[0])
+	}
+	if done[0]["fallback"] != false || done[0]["attempts"] != float64(1) {
+		t.Fatalf("completion line claims an egress move: %v", done[0])
 	}
 }
 
-// TestUpstreamErrorCorrelatesFallbackAttempts: 429 on a, 429 on b → two
-// upstream_error events sharing one request_id with attempt ids /1 and /2.
+// TestUpstreamErrorCorrelatesFallbackAttempts: a replay-safe failure on a
+// (its proxy refuses the connection, so nothing was ever sent) then b's 429 →
+// two upstream_error events sharing one request_id with attempt ids /1 and /2,
+// the first marked (it is the side that failed) and standing, the second the
+// provider's own verdict.
 func TestUpstreamErrorCorrelatesFallbackAttempts(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -197,8 +205,20 @@ func TestUpstreamErrorCorrelatesFallbackAttempts(t *testing.T) {
 	}))
 	defer up.Close()
 
+	// egress a: an http proxy nothing is listening on → the dial to the PROXY
+	// fails before the request exists. egress b: direct.
+	doc := fmt.Sprintf(`upstream:
+  base: %q
+egress:
+  - id: a
+    proxy: {type: http, url: "http://127.0.0.1:1"}
+  - {id: b}
+routes:
+  - {id: default, egress: [a, b]}
+`, up.URL)
+
 	var buf bytes.Buffer
-	_, mux := evidenceRouter(t, logging.New(&buf), twoDirectEgressDoc(up.URL))
+	_, mux := evidenceRouter(t, logging.New(&buf), doc)
 
 	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
 	if rec.Code != http.StatusTooManyRequests {
@@ -221,13 +241,50 @@ func TestUpstreamErrorCorrelatesFallbackAttempts(t *testing.T) {
 		if ev["egress"] != wantEgress[i] {
 			t.Fatalf("attempt %d → egress %v, want %q", i+1, ev["egress"], wantEgress[i])
 		}
-		if ev["health_decision"] != "neutral" {
-			t.Fatalf("429 poisoned health: %v", ev["health_decision"])
-		}
 	}
-	// a fell back; b's terminal verdict stopped (plan exhausted).
-	if errs[0]["retry_decision"] != "fallback" || errs[1]["retry_decision"] != "stop" {
-		t.Fatalf("retry decisions = %v, %v, want fallback then stop", errs[0]["retry_decision"], errs[1]["retry_decision"])
+	// a's failure was provably pre-request: it stands and marks a. b answered
+	// with a 429: the request stops there, on b's own verdict — which marks
+	// nothing.
+	if errs[0]["fallback_decision"] != "fallback" || errs[0]["health_decision"] != "marked" {
+		t.Fatalf("first event = %v, want a marked pre-request failure that moved on", errs[0])
+	}
+	if errs[0]["origin"] != "transport" || errs[0]["request_state"] != "not_sent" {
+		t.Fatalf("first event provenance = %v/%v, want transport/not_sent", errs[0]["origin"], errs[0]["request_state"])
+	}
+	if errs[1]["fallback_decision"] != "stop" || errs[1]["health_decision"] != "neutral" {
+		t.Fatalf("second event = %v, want a terminal provider verdict", errs[1])
+	}
+}
+
+// TestNoFallbackAfterProviderStatus: the recovery split's hard rule at the
+// router level — a 503 (or any provider status) on the head egress leaves the
+// healthy sibling untouched. Two egresses are configured; exactly one is
+// dialed.
+func TestNoFallbackAfterProviderStatus(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"overloaded"}}`))
+	}))
+	defer up.Close()
+
+	var buf bytes.Buffer
+	_, mux := evidenceRouter(t, logging.New(&buf), twoDirectEgressDoc(up.URL))
+
+	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want the provider's 503 relayed", rec.Code)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream requests = %d, want exactly 1 (429/5xx never move egress)", got)
+	}
+	done := eventsWith(decodeEvents(t, &buf), "request completed")
+	if len(done) != 1 {
+		t.Fatalf("completion lines = %d, want 1", len(done))
+	}
+	if done[0]["fallback"] != false || done[0]["attempts"] != float64(1) || done[0]["egress"] != "a" {
+		t.Fatalf("completion line claims a fallback: %v", done[0])
 	}
 }
 
@@ -283,18 +340,12 @@ routes:
 }
 
 // TestUpstreamErrorNoReEmitOnPostHeaderAbort: the emit contract is ONE event
-// per row, ever. A request whose first egress 429s (row emitted at the
-// post-Execute pass) and whose fallback egress then dies mid-stream (a second
-// emit from StreamAbort) must yield exactly two upstream_error events — the
-// 429 row must NOT be rendered a second time by the stream-phase emit.
+// per row, ever. A request whose first egress fails replay-safely (row emitted
+// at the post-Execute pass) and whose fallback egress then dies mid-stream (a
+// second emit from StreamAbort) must yield exactly two upstream_error events —
+// the first row must NOT be rendered a second time by the stream-phase emit.
 func TestUpstreamErrorNoReEmitOnPostHeaderAbort(t *testing.T) {
-	var hits atomic.Int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if hits.Add(1) == 1 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
-			return
-		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n"))
 		w.(http.Flusher).Flush()
@@ -303,7 +354,18 @@ func TestUpstreamErrorNoReEmitOnPostHeaderAbort(t *testing.T) {
 	defer up.Close()
 
 	var buf bytes.Buffer
-	_, mux := evidenceRouter(t, logging.New(&buf), twoDirectEgressDoc(up.URL))
+	// egress a's proxy refuses the connection (nothing reaches a wire), so a's
+	// row is a pre-request transport failure and the request may move to b.
+	doc := fmt.Sprintf(`upstream:
+  base: %q
+egress:
+  - id: a
+    proxy: {type: http, url: "http://127.0.0.1:1"}
+  - {id: b}
+routes:
+  - {id: default, egress: [a, b]}
+`, up.URL)
+	_, mux := evidenceRouter(t, logging.New(&buf), doc)
 
 	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
 	if !strings.Contains(rec.Body.String(), "Hel") {
@@ -313,11 +375,11 @@ func TestUpstreamErrorNoReEmitOnPostHeaderAbort(t *testing.T) {
 	events := decodeEvents(t, &buf)
 	errs := eventsWith(events, "upstream_error")
 	if len(errs) != 2 {
-		t.Fatalf("upstream_error events = %d, want exactly 2 (the 429 row once, the stream row once)", len(errs))
+		t.Fatalf("upstream_error events = %d, want exactly 2 (a's transport row once, the stream row once): %v", len(errs), errs)
 	}
 	reqID := strField(t, errs[0], "request_id")
-	if errs[0]["phase"] != "response" || errs[0]["egress"] != "a" || errs[0]["retry_decision"] != "fallback" {
-		t.Fatalf("first event = %v, want egress a's 429 falling back", errs[0])
+	if errs[0]["phase"] != "transport" || errs[0]["egress"] != "a" || errs[0]["fallback_decision"] != "fallback" {
+		t.Fatalf("first event = %v, want egress a's pre-request failure moving on", errs[0])
 	}
 	if errs[1]["phase"] != "stream" || errs[1]["egress"] != "b" {
 		t.Fatalf("second event = %v, want egress b's stream death", errs[1])
@@ -430,7 +492,7 @@ func TestEvidenceEmitLevelPolicy(t *testing.T) {
 		rec := upstream.NewRecorder()
 		rec.Append(upstream.Row{Phase: upstream.PhaseSkip, Egress: "a", Reason: upstream.SkipSlotFull})
 		rec.Append(upstream.Row{Phase: upstream.PhaseResponse, Egress: "a", EgressType: "direct", Attempt: 1,
-			Status: 429, Class: "upstream_429", HealthDecision: "neutral", RetryDecision: "stop"})
+			Status: 429, Class: "upstream_429", HealthDecision: "neutral", FallbackDecision: "stop"})
 		return rec
 	}
 

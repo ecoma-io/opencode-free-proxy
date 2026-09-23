@@ -60,6 +60,7 @@ func scriptedUpstream(t *testing.T, name string, status int, rec *scriptedRecord
 // own fixed status. plan/policy are sized to the caller's scenario.
 type executorFixture struct {
 	servers map[string]*httptest.Server
+	clients map[string]*Client
 	rec     *scriptedRecorder
 	exec    *Executor
 	health  *health.Registry
@@ -85,26 +86,51 @@ func newExecutorFixture(t *testing.T, statuses map[string]int) *executorFixture 
 	for id, status := range statuses {
 		f.servers[id] = scriptedUpstream(t, id, status, f.rec)
 	}
-	clients := map[string]*Client{}
+	f.clients = map[string]*Client{}
 	for id := range statuses {
 		c := NewClient()
 		// Pin each egress's dial to ITS OWN listener, independent of the URL
 		// host (production differentiates egresses by proxy transport; here
 		// the dial is the differentiator).
-		addr := f.servers[id].Listener.Addr().String()
-		c.HTTP.Transport = &http.Transport{
-			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, network, addr)
-			},
-		}
-		clients[id] = c
+		c.HTTP.Transport = dialTo(f.servers[id].Listener.Addr().String())
+		f.clients[id] = c
 	}
 	f.rt = fixtureRuntime(statuses)
 	f.exec = NewExecutor(func(e *config.Egress) (*Client, bool) {
-		c, ok := clients[e.ID]
+		c, ok := f.clients[e.ID]
 		return c, ok
 	}, f.health, f.slots)
 	return f
+}
+
+// dialTo is the fixture transport: a plain http.Transport whose every dial
+// lands on addr, so an egress is identified by its listener and the request
+// URL's host is irrelevant.
+//
+// The dial is wrapped in recordingDialer exactly as production wraps it
+// (client.go/transport.go). Without that wrapper the attempt carries no dial
+// trace, and a fixture failure would classify as request_state=unknown — which
+// the executor correctly refuses to fall back from. The wrappers are what make
+// a fixture failure replay-safe, so the wrappers are part of the fixture.
+func dialTo(addr string) *http.Transport {
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	return &http.Transport{DialContext: recordingDialer(FailurePhaseTargetConnect, dial)}
+}
+
+// deadEgress re-points an egress's transport at a closed port: every attempt
+// fails at target_connect with nothing written. That is the ONLY failure shape
+// the executor may fall back from (upstream.Failure.ReplaySafe), so every test
+// that wants a fallback has to build it this way — a provider STATUS can no
+// longer produce one.
+func (f *executorFixture) deadEgress(t *testing.T, id string) {
+	t.Helper()
+	c, ok := f.clients[id]
+	if !ok {
+		t.Fatalf("fixture has no egress %q", id)
+	}
+	c.HTTP.Transport = dialTo(closedAddr(t))
 }
 
 // fixtureRuntime builds a snapshot the same shape production gets from a
@@ -192,11 +218,14 @@ func TestExecuteFirstEgressServes(t *testing.T) {
 	}
 }
 
-// TestExecuteFallsBackOn5xx: a 500-class failure on the first egress falls
-// back to the next; health is marked; the winner's success clears it.
-func TestExecuteFallsBackOn5xx(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 200})
+// TestExecuteFallsBackOnPreRequestTransportFailure: the ONLY shape that moves
+// an egress — a dial that provably never put a request on the wire. a's
+// transport points at a closed port; b serves; a is marked unhealthy (it is
+// the side that failed) and the winner's success marks b healthy.
+func TestExecuteFallsBackOnPreRequestTransportFailure(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200})
 	defer f.Close()
+	f.deadEgress(t, "a")
 
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
@@ -209,47 +238,70 @@ func TestExecuteFallsBackOn5xx(t *testing.T) {
 	if id != "b" || attempts != 2 || class != ClassSuccess {
 		t.Fatalf("id=%q attempts=%d class=%s", id, attempts, class)
 	}
-	if f.rec.count("a") != 1 || f.rec.count("b") != 1 {
-		t.Fatalf("calls a=%d b=%d, want 1 each", f.rec.count("a"), f.rec.count("b"))
+	if f.rec.count("a") != 0 || f.rec.count("b") != 1 {
+		t.Fatalf("calls a=%d b=%d, want 0/1 (a's dial never reached a server)", f.rec.count("a"), f.rec.count("b"))
 	}
 	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
-		t.Fatal("a's 500 must mark it unhealthy")
+		t.Fatal("a's failed dial must mark it unhealthy (egress-path health)")
 	}
 	if !f.health.Healthy(healthKey("b"), testHealthPolicy) {
 		t.Fatal("b's success must mark it healthy")
 	}
 }
 
-// TestExecute429FallsBackWithoutMarkingHealth: 429 falls back but is a
-// verdict about the request, never about the egress.
-func TestExecute429FallsBackWithoutMarkingHealth(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 429, "b": 200})
-	defer f.Close()
+// TestExecuteProviderVerdictStopsOnItsEgress: the whole point of the recovery
+// split. Every provider answer — 429, 4xx, 5xx — is terminal: it is relayed
+// from the egress that produced it, the healthy sibling b is never dialed, and
+// the answering egress keeps its health (a provider verdict is not an outage).
+func TestExecuteProviderVerdictStopsOnItsEgress(t *testing.T) {
+	for _, status := range []int{400, 403, 404, 408, 422, 429, 500, 502, 503, 504} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			f := newExecutorFixture(t, map[string]int{"a": status, "b": 200})
+			defer f.Close()
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
-	if uerr != nil || resp == nil {
-		t.Fatalf("uerr = %v", uerr)
-	}
-	_ = resp.Body.Close()
-	if id != "b" || attempts != 2 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s", id, attempts, class)
-	}
-	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
-		t.Fatal("429 must NOT mark the egress unhealthy")
+			resp, id, attempts, class, uerr := f.exec.Execute(
+				context.Background(), f.servers["a"].URL,
+				func() map[string]string { return map[string]string{} },
+				[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
+			if resp != nil {
+				_ = resp.Body.Close()
+				t.Fatal("a provider verdict must not be delivered as a success response")
+			}
+			if uerr == nil || uerr.Status != status {
+				t.Fatalf("uerr = %+v, want the provider's own %d", uerr, status)
+			}
+			if id != "a" || attempts != 1 {
+				t.Fatalf("id=%q attempts=%d, want exactly one attempt on a", id, attempts)
+			}
+			if class == ClassSuccess {
+				t.Fatal("class must not be success for a terminal verdict")
+			}
+			if got := f.rec.count("b"); got != 0 {
+				t.Fatalf("b was dialed %d times — a provider verdict never moves egress", got)
+			}
+			if got := f.rec.count("a"); got != 1 {
+				t.Fatalf("a was dialed %d times, want exactly 1", got)
+			}
+			if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
+				t.Fatal("a provider verdict must never poison egress health")
+			}
+			if !f.health.Healthy(healthKey("b"), testHealthPolicy) {
+				t.Fatal("b was never observed and must stay healthy")
+			}
+		})
 	}
 }
 
-// TestExecuteAllUnhealthyReturnsLastRealVerdict: when every egress fails and
-// the plan exhausts BEFORE the budget, the client sees the LAST egress's own
-// verdict — never a synthesized 502 that would rewrite a 429/5xx storm into
-// "no egress" and invert the client's backoff semantics (base.js:163/179
-// parity). The response must still be nil: nothing was written downstream.
-func TestExecuteAllUnhealthyReturnsLastRealVerdict(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 500})
+// TestExecutePlanExhaustionReturnsLastRealVerdict: when every egress fails
+// with a replay-safe transport failure and the plan exhausts BEFORE the
+// budget, the client sees the LAST egress's own transport verdict (a 502
+// envelope) — never a synthesized "all N URLs failed" string. The response
+// must still be nil: nothing was written downstream.
+func TestExecutePlanExhaustionReturnsLastRealVerdict(t *testing.T) {
+	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200})
 	defer f.Close()
+	f.deadEgress(t, "a")
+	f.deadEgress(t, "b")
 
 	resp, id, attempts, class, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
@@ -258,41 +310,14 @@ func TestExecuteAllUnhealthyReturnsLastRealVerdict(t *testing.T) {
 	if resp != nil {
 		t.Fatal("must not return a response when all egresses failed")
 	}
-	if uerr == nil || uerr.Status != http.StatusInternalServerError {
-		t.Fatalf("uerr = %+v, want b's real 500 verdict (plan 2 < budget 3)", uerr)
+	if uerr == nil || uerr.Status != http.StatusBadGateway {
+		t.Fatalf("uerr = %+v, want the last real transport verdict (502)", uerr)
 	}
-	if attempts != 2 || class != ClassUpstream5xx {
+	if attempts != 2 || class != ClassConnectionError {
 		t.Fatalf("attempts=%d class=%s", attempts, class)
 	}
 	if id != "b" {
 		t.Fatalf("last id = %q, want b", id)
-	}
-}
-
-// Test429ExhaustingPlanStaysA429: the adversarial terminal row — a route of
-// two egresses, both rate-limited, default budget 3. The plan ends first, so
-// the client gets the real 429 (fail-fast backoff), not a fabricated 502
-// (retry-now); with a budget of 2 the same request would return the 429 via
-// the budget guard — the verdict must not depend on that arithmetic.
-func Test429ExhaustingPlanStaysA429(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 429, "b": 429})
-	defer f.Close()
-
-	resp, id, attempts, class, uerr := f.exec.Execute(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
-	if resp != nil {
-		t.Fatal("must not return a response when every egress 429'd")
-	}
-	if uerr == nil || uerr.Status != http.StatusTooManyRequests {
-		t.Fatalf("uerr = %+v, want the real 429", uerr)
-	}
-	if attempts != 2 || class != ClassUpstream429 || id != "b" {
-		t.Fatalf("attempts=%d class=%s id=%q, want 2/upstream_429/b", attempts, class, id)
-	}
-	if f.rec.count("a") != 1 || f.rec.count("b") != 1 {
-		t.Fatalf("calls a=%d b=%d, want 1 each (429 never retries)", f.rec.count("a"), f.rec.count("b"))
 	}
 }
 
@@ -329,37 +354,15 @@ func TestAllSkippedReturnsSynthetic502(t *testing.T) {
 	}
 }
 
-// Test429ChainFallsBackToThirdEgress: the adversarial 429 row — two chained
-// rate limits still fall through to the third egress, and NEITHER 429'd
-// egress is poisoned (the next request may be routed back to either).
-func Test429ChainFallsBackToThirdEgress(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 429, "b": 429, "c": 200})
-	defer f.Close()
-
-	resp, id, attempts, class, uerr := f.exec.Execute(
-		context.Background(), f.servers["a"].URL,
-		func() map[string]string { return map[string]string{} },
-		[]byte(`{}`), f.plan("r", "a", "b", "c"), policy(true, 3))
-	if uerr != nil || resp == nil {
-		t.Fatalf("uerr = %v", uerr)
-	}
-	_ = resp.Body.Close()
-	if id != "c" || attempts != 3 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s, want c/3/success", id, attempts, class)
-	}
-	if f.rec.count("a") != 1 || f.rec.count("b") != 1 || f.rec.count("c") != 1 {
-		t.Fatalf("calls a=%d b=%d c=%d, want 1 each (429s never retry)", f.rec.count("a"), f.rec.count("b"), f.rec.count("c"))
-	}
-	if !f.health.Healthy(healthKey("a"), testHealthPolicy) || !f.health.Healthy(healthKey("b"), testHealthPolicy) {
-		t.Fatal("429s must not mark either egress unhealthy")
-	}
-}
-
 // TestExecuteBudgetCapsAttempts: MaxAttempts bounds DISTINCT egresses tried
-// (default 3); the rest of the plan is never dialed.
+// for ONE logical provider attempt (default 3); the rest of the plan is never
+// dialed. Only replay-safe failures consume the budget, so the fixture makes
+// every candidate fail that way.
 func TestExecuteBudgetCapsAttempts(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 500, "c": 200, "d": 200})
+	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200, "c": 200, "d": 200})
 	defer f.Close()
+	f.deadEgress(t, "a")
+	f.deadEgress(t, "b")
 
 	resp, id, attempts, _, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
@@ -377,10 +380,11 @@ func TestExecuteBudgetCapsAttempts(t *testing.T) {
 }
 
 // TestExecuteFallbackDisabled: fallback off → one attempt only, even with a
-// plan of many.
+// plan of many and a failure that would otherwise be replay-safe.
 func TestExecuteFallbackDisabled(t *testing.T) {
-	f := newExecutorFixture(t, map[string]int{"a": 500, "b": 200})
+	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200})
 	defer f.Close()
+	f.deadEgress(t, "a")
 
 	resp, id, attempts, _, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,

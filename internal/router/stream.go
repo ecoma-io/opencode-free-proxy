@@ -49,7 +49,7 @@ const maxNonSSEBodyBytes = 1 << 20
 // fallback, no health mark).
 func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Response, cancelUpstream context.CancelFunc, ev *evidenceLog, egID string, sourceFormat, targetFormat relay.Format, body map[string]any, upstreamModel string, customToolNames map[string]bool, intent *cloak.ThinkingCfg) {
 	defer cancelUpstream()
-	// Retry/error/forced paths close explicitly; this covers the relay paths
+	// Failover/error/forced paths close explicitly; this covers the relay paths
 	// (base.js consumes or cancels the body either way).
 	defer func() { _ = resp.Body.Close() }()
 	started := time.Now()

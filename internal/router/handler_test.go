@@ -1,8 +1,9 @@
 package router
 
 // Integration tests for the /v1/chat/completions and /v1/responses pipeline
-// (chatCore.js order: translate → applyThinking → executor transform → retrying
-// upstream call → relay/aggregate), driven through the same method-mux wiring
+// (chatCore.js order: translate → applyThinking → executor transform →
+// pre-request-only egress failover around one upstream call →
+// relay/aggregate), driven through the same method-mux wiring
 // cmd/server/main.go uses, with an httptest server standing in for OpenCode Zen.
 
 import (
@@ -16,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/identity"
@@ -138,7 +138,6 @@ routes:
 		identity.NewUserAgentCache(),
 		c,
 		nil,
-		func(time.Duration) {}, // no-op sleep: retry matrices run instantly
 	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.HandleChatCompletions)

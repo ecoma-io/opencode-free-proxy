@@ -80,8 +80,10 @@
 #   enabled          bool, default true
 #   max_attempts     int, default 3 — DISTINCT egresses one request may try,
 #                    including the first; 0 means default 3; negative is a
-#                    load error. The per-egress upstream retry matrix sits
-#                    unchanged INSIDE each attempt.
+#                    load error. This is the whole budget: one attempt is one
+#                    logical upstream call, and a provider response of ANY
+#                    status ends it. Only a failure that provably happened
+#                    before the request was sent moves the request on.
 #
 # health (policy — runtime state semantics live in docs/architecture.md)
 #   enabled            bool, default true with a config file. The built-in

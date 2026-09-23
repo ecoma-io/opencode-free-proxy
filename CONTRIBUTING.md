@@ -13,8 +13,13 @@ License 2.0, and that you have the right to grant that license.
 contract lives across the docs split and the code: the request pipeline,
 the model-naming rules, and what the proxy forwards where are in
 [`docs/architecture.md`](docs/architecture.md), the config document is
-[`docs/configuration.md`](docs/configuration.md), and the retry matrix is
-the `RetryRules` table in [`internal/config`](internal/config/config.go).
+[`docs/configuration.md`](docs/configuration.md), and **who may recover
+from what** is [`docs/recovery-semantics.md`](docs/recovery-semantics.md) —
+the cross-service contract that makes provider responses terminal at this
+proxy and confines egress failover to failures proven to precede the
+request. Its terms are implemented in
+[`internal/upstream`](internal/upstream) (`Failure`, `ReplaySafe`) and
+`internal/router` (the failover decision).
 [`AGENTS.md`](AGENTS.md) carries the porting discipline built on top of
 it — JS citations on every ported behavior, JS truthiness through
 `internal/jsonx`, constants only in `internal/config`, documented
@@ -91,9 +96,11 @@ duplicate.
   (`E2E_LIVE=1`) is for humans, never for gates.
 - A test that only pins the loud direction is not a test. This is a
   free-tier client: prefer the case where a change fails _quietly_ — a 429
-  that gets retried when the contract says fail fast, a UA that stays stale
-  past its TTL, a fingerprint tool that stops being injected, an SSE line
-  dropped in a relay branch nobody exercises.
+  that gets retried or moved to another egress when the contract says fail
+  fast, a POST replayed after the request may already have reached the
+  provider, a UA that stays stale past its TTL, a fingerprint tool that
+  stops being injected, an SSE line dropped in a relay branch nobody
+  exercises.
 - Golden unit vectors are ported from `9router-src`'s
   `tests/unit/opencode-*.test.js` — when upstream behavior surprises you,
   the JS source is the place to look first.
