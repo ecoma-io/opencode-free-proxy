@@ -210,7 +210,74 @@ func TestForcedSSEToJsonOversizedUpstreamReturns502(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), "Failed to convert streaming response to JSON") {
 			t.Fatalf("body = %s, want the forced-conversion 502 envelope", rec.Body.String())
 		}
+		assertForced502Provenance(t, rec.Header())
 	case <-time.After(60 * time.Second):
 		t.Fatal("oversized forced body did not abort — the byte cap is not enforced")
 	}
+}
+
+// assertForced502Provenance pins issue #72 on a forced-conversion 502: the
+// gateway synthesized this status over a live 2xx stream, so the success-path
+// label (upstream/ambiguous, handler.go:395) must have been replaced with
+// gateway, and the request state must say response_started — the fact that
+// forbids a caller from re-sending a call that was already answered.
+func assertForced502Provenance(t *testing.T, h http.Header) {
+	t.Helper()
+	if got := h.Get("X-OFP-Failure-Origin"); got != "gateway" {
+		t.Fatalf("X-OFP-Failure-Origin = %q, want gateway — this 502 is OFP's, synthesized over a live 2xx stream (issue #72)", got)
+	}
+	if got := h.Get("X-OFP-Failure-Phase"); got != "" {
+		t.Fatalf("X-OFP-Failure-Phase = %q, want absent — the transcript's 200 arrived; attribution of that detail is the evidence layer's, not the caller's", got)
+	}
+	if got := h.Get("X-OFP-Request-State"); got != "response_started" {
+		t.Fatalf("X-OFP-Request-State = %q, want response_started — a response predates this failure, so a re-send is forbidden", got)
+	}
+}
+
+// TestForcedSSEToJsonUnparseableStreamIsLabelledGateway covers the second
+// forced-failure site: a body that parses to NO chunk and NO error frame
+// answers the generic "Invalid SSE response" 502 — this process's status, over
+// a provider 200 that already streamed.
+func TestForcedSSEToJsonUnparseableStreamIsLabelledGateway(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: not-json-1\n\nnot a data line at all\n")
+	}))
+	defer upstream.Close()
+
+	_, mux := newRouter(t, upstream.URL)
+	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Invalid SSE response for non-streaming request") {
+		t.Fatalf("body = %s, want the generic invalid-SSE 502 envelope", rec.Body.String())
+	}
+	assertForced502Provenance(t, rec.Header())
+}
+
+// TestForcedSSEToJsonErrorFrameIsLabelledGateway covers the third forced-
+// failure site: the stream carried an upstream error FRAME (the provider's own
+// mid-stream error, after the 2xx headers). The message is relayed, but the
+// 502 status itself is this process's — the provider answered 200, never 502 —
+// so the wire label must not let a caller read the status as a provider
+// verdict.
+func TestForcedSSEToJsonErrorFrameIsLabelledGateway(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"error\":{\"message\":\"quota exceeded mid-stream\"}}\n\n")
+	}))
+	defer upstream.Close()
+
+	_, mux := newRouter(t, upstream.URL)
+	rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free"}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "quota exceeded mid-stream") {
+		t.Fatalf("body = %s, want the stream's error message relayed", rec.Body.String())
+	}
+	assertForced502Provenance(t, rec.Header())
 }
