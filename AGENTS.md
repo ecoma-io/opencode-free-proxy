@@ -126,6 +126,32 @@ The semantics agents most often get wrong:
     Stream/forced deaths are `response_started` PHASE rows — the delivered
     status is never rewritten into an HTTP verdict. See docs/architecture.md
     "Upstream error evidence".
+11. Responses are **attributed, not inferred** (issue #55,
+    `internal/router/provenance_header.go`). Anything that came out of the
+    upstream attempt path carries `X-OFP-Failure-Origin` (`upstream` |
+    `gateway`), with `X-OFP-Failure-Phase` and `X-OFP-Request-State` on
+    gateway-origin responses only. The label is read off the returned
+    `Failure` — NEVER off the status that is about to be written, because a
+    provider 502 and a synthesized 502 are the same number. A local error
+    (bad body, unknown model, draining) and a client cancellation carry no
+    provenance header; absence means "not an upstream-interaction outcome",
+    never "upstream". Every inbound `X-OFP-*` header is stripped at the top
+    of the pipeline, so no client can forge one. Pinned by
+    `internal/router/provenance_header_test.go` and the black-box
+    `e2e/provenance_test.go`.
+12. Egress selection is a **logical intent, not an index walk** (issue #56,
+    `internal/routing/intent.go`). The attempt loop asks `routing.Selector`
+    for the next egress under `normal` (no history) or `new-egress` (a
+    replay-safe failure invalidated the previous one); the in-process
+    `PlanSelector` walks the request's pinned plan, and a pool-backed
+    (RPGW) selector is a recorded cross-repo dependency, never invented
+    here. The intent is recorded on every evidence row (`egress_intent`),
+    never derived from a provider status (a 429 attempt stays `normal`),
+    and never accepted from the wire — inbound `X-OFP-*` is stripped before
+    any stage. `fallback.max_attempts` bounds DISTINCT egresses; one route
+    member is tried at most once per request. Pinned by
+    `internal/routing/intent_test.go`, `internal/upstream/intent_test.go`,
+    and `internal/router/intent_router_test.go`.
 
 ## Layout
 

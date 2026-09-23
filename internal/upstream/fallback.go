@@ -67,9 +67,14 @@ func (p AttemptPolicy) Budget() int {
 
 // Execute walks the plan honoring the policy. Returns the live response
 // (commitment — the caller must not fall back after this), the winning
-// egress id, the attempts consumed, the last failure class, and the
-// client-facing UpstreamError. On success uerr is nil and class is
-// ClassSuccess. When no egress could serve, resp is nil and uerr carries the
+// egress id, the attempts consumed, the terminal failure, and the
+// client-facing UpstreamError. On success uerr is nil and the zero Failure
+// (ClassSuccess) is returned. The FAILURE — not just its class — is returned
+// because the class alone cannot be attributed: the caller has to label the
+// response it writes with whether a provider produced it or this process did
+// (issue #55), and only the provenance can say that.
+//
+// When no egress could serve, resp is nil and uerr carries the
 // LAST REAL verdict of the final dialed egress — a deliberate divergence
 // from base.js:183, which synthesizes an "All N URLs failed" error in that
 // spot (see the loop tail below); only a request that never dialed (every
@@ -108,7 +113,7 @@ func (b *slotReleaseBody) Close() error {
 	b.once.Do(b.free)
 	return err
 }
-func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy) (*http.Response, string, int, Class, *UpstreamError) {
+func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy) (*http.Response, string, int, Failure, *UpstreamError) {
 	return x.ExecuteObserved(ctx, url, buildHeaders, bodyJSON, plan, policy, nil)
 }
 
@@ -127,11 +132,21 @@ func (x *Executor) Execute(ctx context.Context, url string, buildHeaders func() 
 //
 // Ordering is therefore exactly: response → capture → classify → health →
 // failover decision → (later, at the router) emit.
-func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy, rec *Recorder) (*http.Response, string, int, Class, *UpstreamError) {
+func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, plan routing.RoutePlan, policy AttemptPolicy, rec *Recorder) (*http.Response, string, int, Failure, *UpstreamError) {
 	budget := policy.Budget()
 	attempts := 0
 	lastID := ""
-	lastClass := ClassConnectionError
+	// The verdict of the LAST dialed attempt. Its initial value is what the
+	// never-dialed envelope below returns: no provider answered and no
+	// request byte existed, so it is transport-origin and provably not_sent —
+	// nothing was even attempted. The class stays ClassConnectionError, the
+	// label this path has always carried.
+	lastFailure := Failure{
+		Class:        ClassConnectionError,
+		Origin:       OriginTransport,
+		Phase:        FailurePhaseNone,
+		RequestState: RequestStateNotSent,
+	}
 	var lastErr *UpstreamError
 	// terminalRow is the recorder index of the row the most recent failed
 	// attempt's decisions were stamped on (-1 = none). The post-loop
@@ -144,32 +159,49 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 	// below — attempts only grows after a dial and every post-dial path
 	// either returns or re-checks the budget before continuing, so no
 	// top-of-loop guard is needed (and one would be dead code today).
-	for i, id := range plan.Attempts {
-		// A skipped head (below) is a scheduling race, never a failure — with
-		// fallback ENABLED the executor moves to the next plan entry. With
+	//
+	// Selection goes through routing.Selector rather than the plan's index:
+	// the request asks for its FIRST egress with intent `normal`, and for
+	// every egress after a replay-safe failure with `new-egress` plus the
+	// egress that just failed. The in-process implementation walks this
+	// request's pinned plan; a pool-backed (RPGW) selector would answer the
+	// same two questions from the pool. The intent is never derived from a
+	// provider status and never accepted from the wire (routing/intent.go).
+	selector := routing.NewPlanSelector(plan)
+	intent := routing.IntentNormal
+	exclude := ""
+	for {
+		id, eg, selected := selector.Next(intent, exclude)
+		if !selected {
+			break
+		}
+		// selIntent is the intent THIS selection was made under, captured
+		// before any branch can change `intent` for the next one.
+		selIntent := intent
+		// A skipped entry (below) is a scheduling race, never a failure — with
+		// fallback ENABLED the executor moves to the next entry. With
 		// fallback disabled no other egress may be dialed, so a skip at the
 		// head ends the plan: the loop falls through to the 502 envelope.
 		// The egress was resolved from the request's snapshot by the
 		// scheduler; a nil slot only happens if a head left the snapshot
 		// between Plan and here — skip, not failure.
-		if i >= len(plan.Egresses) || plan.Egresses[i] == nil {
-			rec.Append(Row{Phase: PhaseSkip, Egress: id, Reason: SkipUnknownEgress})
+		if eg == nil {
+			rec.Append(Row{Phase: PhaseSkip, Egress: id, Intent: string(selIntent), Reason: SkipUnknownEgress})
 			if !policy.FallbackEnabled {
 				break
 			}
 			continue
 		}
-		eg := plan.Egresses[i]
 		client, ok := x.clientFor(eg)
 		if !ok {
-			rec.Append(Row{Phase: PhaseSkip, Egress: id, EgressType: proxyTypeName(eg), Reason: SkipTransportBuild})
+			rec.Append(Row{Phase: PhaseSkip, Egress: id, EgressType: proxyTypeName(eg), Intent: string(selIntent), Reason: SkipTransportBuild})
 			if !policy.FallbackEnabled {
 				break // transport build failed and no fallback: nothing else to try
 			}
 			continue // transport build failed: skip, not failure
 		}
 		if x.slots != nil && !x.slots.Acquire(id, policy.MaxConcurrency[id]) {
-			rec.Append(Row{Phase: PhaseSkip, Egress: id, EgressType: proxyTypeName(eg), Reason: SkipSlotFull})
+			rec.Append(Row{Phase: PhaseSkip, Egress: id, EgressType: proxyTypeName(eg), Intent: string(selIntent), Reason: SkipSlotFull})
 			if !policy.FallbackEnabled {
 				break // head's slot full and no fallback: nothing else to try
 			}
@@ -186,13 +218,14 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 		}
 		startRow := rec.Len()
 		resp, uerr, failure := client.DoClassifiedObserved(ctx, url, buildHeaders, bodyJSON, rec)
-		lastClass = failure.Class
+		lastFailure = failure
 		// Identity annotation for every row this attempt captured.
 		rec.Annotate(startRow, func(row *Row) {
 			row.Egress = id
 			row.EgressType = proxyTypeName(eg)
 			row.Attempt = attempts
 			row.InFlight = inFlight
+			row.Intent = string(selIntent)
 		})
 		if uerr != nil {
 			lastErr = uerr
@@ -217,12 +250,17 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 			}
 			if !safe || attempts >= budget {
 				annotateDecision(rec, startRow, health, FallbackStop)
-				return nil, id, attempts, failure.Class, uerr
+				return nil, id, attempts, failure, uerr
 			}
 			// Only the fallback branch's row can need the post-loop
 			// correction — the stop branches return before the loop can
 			// exhaust the plan.
 			terminalRow = annotateDecision(rec, startRow, health, FallbackYes)
+			// The next selection is a REPLACEMENT request: `new-egress`,
+			// excluding the egress that just failed. Nothing else can set
+			// this — a provider verdict and an unprovable failure both
+			// returned above (issue #56).
+			intent, exclude = routing.IntentNewEgress, id
 			continue
 		}
 		if x.health != nil {
@@ -231,7 +269,7 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 		if x.slots != nil {
 			resp.Body = &slotReleaseBody{ReadCloser: resp.Body, free: func() { x.slots.Release(id) }}
 		}
-		return resp, id, attempts, failure.Class, uerr
+		return resp, id, attempts, failure, uerr
 	}
 	// Terminal verdict: the LAST REAL one when anything was dialed — a plan
 	// that ran out before the budget must not rewrite a 429/503/504 into a
@@ -268,9 +306,9 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 		if terminalRow >= 0 {
 			rec.AnnotateAt(terminalRow, func(row *Row) { row.FallbackDecision = FallbackStop })
 		}
-		return nil, lastID, attempts, lastClass, lastErr
+		return nil, lastID, attempts, lastFailure, lastErr
 	}
-	return nil, lastID, attempts, lastClass, &UpstreamError{
+	return nil, lastID, attempts, lastFailure, &UpstreamError{
 		Status:  http.StatusBadGateway,
 		Message: "none of the eligible egresses could serve the request",
 	}

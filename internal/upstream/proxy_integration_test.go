@@ -95,7 +95,7 @@ func tunnelingProxy(t *testing.T) *httptest.Server {
 // TestHTTPConnect407IsProxyAuth: an HTTP CONNECT proxy answers the CONNECT
 // with 407 — the ONE case where a 407 is provably proxy-owned. Our
 // hand-rolled CONNECT boundary (connect.go) reads the proxy's status line
-// itself and raises the typed *proxyAuthError, so the class is proxy-auth by
+// itself and raises the typed *proxyAuthError, so the failure.Class is proxy-auth by
 // wire evidence, not text inference. The client-facing envelope stays 502
 // (network errors map to the 502 rule in the JS error matrix); the CLASS is
 // what drives retry/fallback.
@@ -104,12 +104,11 @@ func TestHTTPConnect407IsProxyAuth(t *testing.T) {
 
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "https://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassProxyAuthError {
-		t.Fatalf("class = %s, want ClassProxyAuthError", class)
+	if failure.Class != ClassProxyAuthError {
+		t.Fatalf("failure.Class = %s, want ClassProxyAuthError", failure.Class)
 	}
 	if uerr == nil || uerr.Status != http.StatusBadGateway {
 		t.Fatalf("uerr = %+v, want the 502 envelope for a transport-level refusal", uerr)
@@ -169,12 +168,11 @@ func TestHTTPSOrigin407IsClientError(t *testing.T) {
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL}))
 	c.TLSConfig = &tls.Config{RootCAs: originRootPool(t, origin)}
 	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassClientError {
-		t.Fatalf("class = %s, want ClassClientError (origin answered inside the tunnel)", class)
+	if failure.Class != ClassClientError {
+		t.Fatalf("failure.Class = %s, want ClassClientError (origin answered inside the tunnel)", failure.Class)
 	}
 	if uerr == nil || uerr.Status != http.StatusProxyAuthRequired {
 		t.Fatalf("uerr = %+v, want status 407 surfaced to the client", uerr)
@@ -191,12 +189,11 @@ func TestDirectOrigin407IsClientError(t *testing.T) {
 
 	c := NewClient()
 	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassClientError {
-		t.Fatalf("class = %s, want ClassClientError", class)
+	if failure.Class != ClassClientError {
+		t.Fatalf("failure.Class = %s, want ClassClientError", failure.Class)
 	}
 	if uerr == nil || uerr.Status != http.StatusProxyAuthRequired {
 		t.Fatalf("uerr = %+v, want status 407", uerr)
@@ -208,7 +205,7 @@ func TestDirectOrigin407IsClientError(t *testing.T) {
 // requests and replies byte-for-byte, so a 407 may be the proxy gating the
 // request OR the origin's own answer, and no header is reliably proxy-authored
 // (issue #6 rejects content sniffing). Even though we SENT Proxy-Authorization
-// (asserted below), the conservative class is client_error: no fallback (the
+// (asserted below), the conservative failure.Class is client_error: no fallback (the
 // next egress would repeat the rejection), no health mark (a credential
 // problem is not an outage). Only the transport boundary — a CONNECT refusal,
 // an RFC 1929 rejection — may claim proxy_auth_error.
@@ -226,13 +223,12 @@ func TestHTTPOrigin407ThroughForwardProxyIsNotBlindlyProxyAuth(t *testing.T) {
 
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: "http://user:pass@" + strings.TrimPrefix(pxy.URL, "http://")}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassClientError {
-		t.Fatalf("class = %s, want ClassClientError (ambiguous 407 must not be promoted by credentials-sent)",
-			class)
+	if failure.Class != ClassClientError {
+		t.Fatalf("failure.Class = %s, want ClassClientError (ambiguous 407 must not be promoted by credentials-sent)",
+			failure.Class)
 	}
 	if uerr == nil || uerr.Status != http.StatusProxyAuthRequired {
 		t.Fatalf("uerr = %+v, want status 407", uerr)
@@ -247,7 +243,7 @@ func TestHTTPOrigin407ThroughForwardProxyIsNotBlindlyProxyAuth(t *testing.T) {
 func TestProxyAuthFailureDoesNotUseGeneric502Retry(t *testing.T) {
 	f := newProxyAuthFixture(t)
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.origin.URL+"/zen/v1/chat/completions",
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan, policy(true, 3))
@@ -257,13 +253,13 @@ func TestProxyAuthFailureDoesNotUseGeneric502Retry(t *testing.T) {
 	if uerr != nil || resp == nil {
 		t.Fatalf("uerr=%v resp=%v, want fallback to b serving", uerr, resp)
 	}
-	if id != "b" || attempts != 2 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s, want b/2/success", id, attempts, class)
+	if id != "b" || attempts != 2 || failure.Class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d failure.Class=%s, want b/2/success", id, attempts, failure.Class)
 	}
 	if got := f.connects.Load(); got != 1 {
 		t.Fatalf("CONNECTs on a = %d, want 1 (never the 502 matrix's 4)", got)
 	}
-	// The refusal is a true egress failure class: it must have marked health.
+	// The refusal is a true egress failure failure.Class: it must have marked health.
 	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
 		t.Fatal("a's proxy-auth refusal must mark it unhealthy (threshold 1)")
 	}
@@ -275,15 +271,15 @@ func TestProxyAuthFailureDoesNotUseGeneric502Retry(t *testing.T) {
 func TestProxyAuthFailureFallsBackImmediately(t *testing.T) {
 	f := newProxyAuthFixture(t)
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.origin.URL+"/zen/v1/chat/completions",
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan, policy(true, 3))
 	if resp != nil {
 		defer func() { _ = resp.Body.Close() }()
 	}
-	if uerr != nil || resp == nil || id != "b" || attempts != 2 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s uerr=%v, want immediate fallback to b", id, attempts, class, uerr)
+	if uerr != nil || resp == nil || id != "b" || attempts != 2 || failure.Class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d failure.Class=%s uerr=%v, want immediate fallback to b", id, attempts, failure.Class, uerr)
 	}
 	if got := f.connects.Load(); got != 1 {
 		t.Fatalf("CONNECTs on a = %d, want 1 (the refusal ends a's turn)", got)
@@ -530,17 +526,16 @@ func (e errSocks) Error() string { return string(e) }
 
 // TestSocks5AuthFailureIsProxyAuth: the proxy demanded a username/password
 // (RFC 1929) and rejected our credentials — a typed proxyAuthError from the
-// boundary code, so the class is proxy-auth regardless of any error text.
+// boundary code, so the failure.Class is proxy-auth regardless of any error text.
 func TestSocks5AuthFailureIsProxyAuth(t *testing.T) {
 	f := newSocks5Fake(t, 0x02, 0x01, 0x00) // auth required, reject creds
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://user:bad@" + strings.TrimPrefix(f.url, "socks5://")}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassProxyAuthError {
-		t.Fatalf("class = %s, want ClassProxyAuthError", class)
+	if failure.Class != ClassProxyAuthError {
+		t.Fatalf("failure.Class = %s, want ClassProxyAuthError", failure.Class)
 	}
 	if uerr == nil || !strings.Contains(uerr.Message, "proxy authentication failed") {
 		t.Fatalf("uerr.Message = %q, want the auth-failure text", uerr.Message)
@@ -550,22 +545,21 @@ func TestSocks5AuthFailureIsProxyAuth(t *testing.T) {
 // TestSocks5Rep02NotProxyAuth: REP 0x02 is RFC 1928 §6 "connection not
 // allowed by ruleset" — a policy refusal, explicitly NOT a credential
 // failure. Labels matter: fallback/health behave identically either way, but
-// the class must not lie about the cause.
+// the failure.Class must not lie about the cause.
 func TestSocks5Rep02NotProxyAuth(t *testing.T) {
 	f := newSocks5Fake(t, 0x00, 0x00, 0x02) // no-auth greet, REP 0x02 CONNECT
 	// 127.0.0.1 resolves locally without DNS — the point of the test is the
 	// proxy's REP 0x02, reached only after the resolution step succeeds.
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class == ClassProxyAuthError {
+	if failure.Class == ClassProxyAuthError {
 		t.Fatal("REP 0x02 must NOT classify as proxy-auth (RFC 1928 ruleset refusal)")
 	}
-	if class != ClassConnectionError {
-		t.Fatalf("class = %s, want ClassConnectionError", class)
+	if failure.Class != ClassConnectionError {
+		t.Fatalf("failure.Class = %s, want ClassConnectionError", failure.Class)
 	}
 	if uerr == nil || !strings.Contains(uerr.Message, "connection not allowed by ruleset") {
 		t.Fatalf("uerr.Message = %q, want the ruleset-refusal text", uerr.Message)
@@ -585,9 +579,8 @@ func TestSocks5TunnelServesUpstream(t *testing.T) {
 	f := newSocks5Fake(t, 0x00, 0x00, 0x00) // no-auth, tunnel everything
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
 	resp, uerr, failure := c.DoClassified(context.Background(), upstream.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
-	if uerr != nil || class != ClassSuccess {
-		t.Fatalf("uerr=%v class=%s, want success through the tunnel", uerr, class)
+	if uerr != nil || failure.Class != ClassSuccess {
+		t.Fatalf("uerr=%v failure.Class=%s, want success through the tunnel", uerr, failure.Class)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
@@ -613,9 +606,8 @@ func TestSocks5hConnectCarriesHostname(t *testing.T) {
 	f.resolveAtProxy("target.example", strings.TrimPrefix(upstream.URL, "http://"))
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://" + strings.TrimPrefix(f.url, "socks5://")}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://target.example:80/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
-	if uerr != nil || class != ClassSuccess {
-		t.Fatalf("uerr=%v class=%s, want success through the hostname-form CONNECT", uerr, class)
+	if uerr != nil || failure.Class != ClassSuccess {
+		t.Fatalf("uerr=%v failure.Class=%s, want success through the hostname-form CONNECT", uerr, failure.Class)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
@@ -703,19 +695,18 @@ func TestSocks5hIPLiteralStaysLiteral(t *testing.T) {
 
 // TestSocks5hRep05StaysConnectionError (issue #8 failure mode): a refused
 // remote-resolve CONNECT fails EXACTLY like any other CONNECT refusal — the
-// vendor's instant REP 0x05 surfaces as the same connection-error class and
+// vendor's instant REP 0x05 surfaces as the same connection-error failure.Class and
 // the 502 envelope. No silent fallback to local resolution, no retry, and
 // the frame that was refused is still the hostname form.
 func TestSocks5hRep05StaysConnectionError(t *testing.T) {
 	f := newSocks5Fake(t, 0x00, 0x00, 0x05) // no-auth greet, REP 0x05 refused
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://" + strings.TrimPrefix(f.url, "socks5://")}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://target.example:443/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassConnectionError {
-		t.Fatalf("class = %s, want ClassConnectionError", class)
+	if failure.Class != ClassConnectionError {
+		t.Fatalf("failure.Class = %s, want ClassConnectionError", failure.Class)
 	}
 	if uerr == nil || uerr.Status != http.StatusBadGateway {
 		t.Fatalf("uerr = %+v, want the 502 envelope", uerr)
@@ -740,12 +731,11 @@ func TestSocks5hAuthFlowUnchanged(t *testing.T) {
 	f := newSocks5Fake(t, 0x02, 0x01, 0x00) // auth required, reject creds
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://user:bad@" + strings.TrimPrefix(f.url, "socks5://")}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://target.example/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassProxyAuthError {
-		t.Fatalf("class = %s, want ClassProxyAuthError", class)
+	if failure.Class != ClassProxyAuthError {
+		t.Fatalf("failure.Class = %s, want ClassProxyAuthError", failure.Class)
 	}
 	if uerr == nil || !strings.Contains(uerr.Message, "proxy authentication failed") {
 		t.Fatalf("uerr.Message = %q, want the auth-failure text", uerr.Message)
@@ -896,10 +886,8 @@ func TestCrossSchemeRedirectStaysOnEgress(t *testing.T) {
 	}
 
 	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", headers, []byte(`{"model":"big-pickle"}`))
-
-	class := failure.Class
-	if uerr != nil || class != ClassSuccess {
-		t.Fatalf("uerr=%v class=%s, want the followed chain served through the egress", uerr, class)
+	if uerr != nil || failure.Class != ClassSuccess {
+		t.Fatalf("uerr=%v failure.Class=%s, want the followed chain served through the egress", uerr, failure.Class)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
@@ -954,13 +942,11 @@ func TestCrossSchemeRedirect407IsTyped(t *testing.T) {
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.srv.URL}))
 
 	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassProxyAuthError {
-		t.Fatalf("class = %s, want ClassProxyAuthError (the redirected https hop must ride the typed CONNECT boundary)", class)
+	if failure.Class != ClassProxyAuthError {
+		t.Fatalf("failure.Class = %s, want ClassProxyAuthError (the redirected https hop must ride the typed CONNECT boundary)", failure.Class)
 	}
 	if uerr == nil || uerr.Status != http.StatusBadGateway {
 		t.Fatalf("uerr = %+v, want the 502 envelope", uerr)
@@ -977,7 +963,7 @@ func TestCrossSchemeRedirect407IsTyped(t *testing.T) {
 }
 
 // TestRedirectCapIsUndiciTwenty: the manual walk follows 20 redirects and
-// gives up on the 21st with a network-class error — undici's contract
+// gives up on the 21st with a network-failure.Class error — undici's contract
 // (`if (request.redirectCount === 20) return … makeNetworkError('redirect
 // count exceeded')`, fetch/index.js:1250-1255), NOT net/http's default cap
 // of 10. attempt is called DIRECTLY so the retry matrix does not multiply

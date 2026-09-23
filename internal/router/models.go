@@ -37,6 +37,9 @@ type modelsEntry struct {
 // (its ResponseHeaderTimeout is the only upstream deadline). The total fetch
 // bound is restored with a context deadline (config.ModelsFetchTimeout).
 func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
+	// Same internal-namespace rule as relay(): no route serves a request that
+	// still carries a client-supplied X-OFP-* header.
+	stripInternalHeaders(r)
 	// Drain gate, same contract as relay(): a shutting-down server refuses
 	// NEW work with 503 instead of starting an upstream fetch. The fail-open
 	// fallback below applies only to fetch problems while serving.

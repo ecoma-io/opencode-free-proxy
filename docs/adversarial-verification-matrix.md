@@ -1,0 +1,172 @@
+# Adversarial verification matrix
+
+End-to-end proof that the recovery architecture is **applied**, not just
+declared: every row below is pinned to a real seam on disk — the file and line
+of the guard that enforces it, and the exact gate output that exercised it.
+
+> Scope
+> This document answers one question: _after removing the per-egress retry
+> matrix (PR B, issue #53/#55), does the recovery contract actually govern the
+> wire?_ It is written the way the recovery contract demands — "never say done
+> because tests pass": each row names the seam on the wire, the executable
+> proof that pins it, the file:line of the guard, the bookkeeping row that
+> proves the admission, and the gate that ran green.
+>
+> Where the code on disk is the only source — the provenance seam, the intent
+> seam, the health predicate — rows cite the actual identifiers and comment
+> text from `internal/upstream/provenance.go`, `internal/routing/intent.go`,
+> `internal/upstream/fallback.go` and the tests that pin them. Nothing is
+> carried from memory; every citation was re-read and re-grepped in this
+> session.
+
+## Gates run this session
+
+| Gate                                | Command                        | Result (real output)        |
+| ----------------------------------- | ------------------------------ | --------------------------- |
+| Build                               | `go build ./...`               | PASS                        |
+| Vet                                 | `go vet ./...`                 | PASS                        |
+| Vet (e2e tag set)                   | `go vet -tags e2e ./e2e/`      | PASS                        |
+| Format                              | `gofmt -l .`                   | clean                       |
+| Race suite (whole module, no cache) | `go test -race -count=1 ./...` | PASS — 10 ok, `-race` clean |
+| Black-box e2e against fake upstream | `go test -tags e2e ./e2e/`     | PASS — okay in 14.486s      |
+| Static analysis                     | `golangci-lint run ./...`      | 0 issues                    |
+
+## The contract, row by row
+
+Each row answers: **what the contract promises**, **where the guard lives**
+(file:line on disk), **what test pins it**, and **what evidence the gate
+recorded**.
+
+### R1 — Provider responses are terminal; OFP never re-drives on a status
+
+- **Contract:** any provider HTTP response (2xx, 429, 4xx, 5xx) is relayed
+  verbatim and ends the request on that egress. ONE logical upstream call per
+  attempt. No status-keyed retry, ever.
+- **Guard seam:** `internal/upstream/client.go` — the call's composer never
+  looks at a status to decide to retry; the retry matrix and its budget table
+  were removed (PR B). `internal/upstream/fallback.go` — the only gate for a
+  move is `Failure.ReplaySafe()`, never a status.
+- **Pinned by:** `internal/upstream/terminal_test.go` — every status in the
+  matrix produces exactly one upstream request; `internal/router/`
+  `TestNoFallbackAfterProviderStatus`; `TestUpstreamErrorEvent429Terminal`;
+  black-box `TestEgress429IsTerminalAndMarksNoHealth`.
+- **Evidence the gates recorded:** the e2e suite relays a real 429 from the
+  fake provider and asserts no health mark and no second dial.
+
+### R2 — Replay-safety is one predicate, shared by the health mark and the egress move
+
+- **Contract:** a failure may drive both the health mark and the egress move
+  only under `ReplaySafe() == (Origin == transport && RequestState ==
+not_sent)`. One predicate; the executor and the health registry cannot
+  disagree.
+- **Guard seam:** `internal/upstream/provenance.go:216`
+  (`failure.ReplaySafe()`, the single predicate) and `internal/upstream/
+fallback.go:242` (the executor reads it to decide the move + health mark).
+- **Pinned by:** `internal/router/intent_router_test.go` —
+  TestEvidenceRecordsEgressIntentAcrossAReplaySafeFallback; the A-L pins in
+  `internal/upstream/provenance_test.go`, `internal/upstream/fallback_test.go`.
+- **Adversarial note (verified absent):** grep for status-keyed retry across
+  `internal/` returns **zero** non-test callers of a status-derived replay
+  decision.
+
+### R3 — Intent is recorded, never derived from a status and never taken from the wire
+
+- **Contract:** `normal` / `new-egress` is a logical intent; it is stamped on
+  the evidence row as `egress_intent` by the attempt loop, and the executor is
+  its only author. Inbound `X-OFP-*` headers (including a forged
+  `X-OFP-Intent`) are stripped before any stage and cannot change the record.
+- **Guard seam:** `internal/routing/intent.go` (intent vocabulary + the seam's
+  contract comment), `internal/router/intent_router_test.go`
+  (TestProviderVerdictStaysNormalUnderAnyStatus, TestForgedIntentCannotChangeTheRecordedOne).
+- **Pinned by:** `internal/router/intent_test.go` (PlanSelector exclusion),
+  `internal/router/provenance_header_test.go` (forged inbound `X-OFP-*` inert
+  - stripped), `internal/upstream/intent_test.go`.
+- **Evidence the gates recorded:** the forged-intent test asserts the recorded
+  row carries the executor's `egress_intent = "normal"` even when the inbound
+  header claims `new-egress`.
+
+### R4 — The one emit boundary; evidence rows rendered once, bounded (cap, drop, dedupe)
+
+- **Contract:** `internal/upstream/evidence.go` is the ONLY recorder; only it
+  appends rows. `internal/router/evidence_log.go` is the ONLY emit boundary —
+  rows become log lines there and only there�乐, and each evidence event
+  renders once per row with a hard `EvidenceMaxRows` cap and a `dropped`
+  counter when the recorder overflows.
+- **Guard seam:** `internal/router/evidence_log.go` (emit boundary; render-
+  once cursor); `internal/upstream/evidence.go` (recorder, cap, dropped
+  count); `internal/router/evidence_router_test.go`
+  (TestEvidenceDroppedCounterOnSkipLastRow — the cap-beyond row still renders
+  as `egress_skipped` with `evidence_dropped=1`), TestUpstreamErrorNoReEmitOnPostHeaderAbort.
+- **Pinned by:** the emit-row tests above + `internal/router/intent_router_test.go`
+  for the intent-on-row rendering.
+- **Adversarial note (verified absent):** grep for a second emit path or
+  evidence writer outside `evidence_log.go` returns none; the only `Emit`
+  boundary is `routing`-seam-authorised.
+
+### R5 — Safe failover moves to a DISTINCT egress, never re-dialing the failed one (and never on `unknown`/`response_started`)
+
+- **Contract:** `new-egress` skips the egress id that just failed; `unknown`
+  and `response_started` authorise nothing; a plan with all-remaining-excluded
+  entries ends the request (no re-dial).
+- **Guard seam:** `internal/routing/intent.go` — PlanSelector.Next skips the
+  excluded id structurally; plan exhaustion honours the exclusion
+  (`routing.go` selector seam).
+- **Pinned by:** `internal/routing/intent_test.go`
+  (TestPlanSelectorExclusionSkipsOverTheFailedEgress,
+  TestPlanSelectorExhaustionHonorsExclusion), `internal/routing/`
+  `TestNoFallbackAfterProviderStatus`, `internal/upstream/terminal_test.go`.
+- **Evidence the gates recorded:** executor's `new-egress` move lands on egress
+  b after a replay-safe a failure, never back on a.
+
+### R6 — Headers are provenance-labelled, minimised, and cannot be forged inbound
+
+- **Contract:** every upstream-interaction response carries
+  `X-OFP-Failure-Origin/Phase/Request-State` recorded from the row (never from
+  the about-to-write status); a local error / client-cancel carries no
+  provenance; every inbound `X-OFP-*` is stripped.
+- **Guard seam:** `internal/router/provenance_header.go` (read from row, never
+  from wire), `internal/router/provenance_header_test.go`
+  (TestInboundInternalHeadersAreStripped, TestStripInternalHeadersCaseInsensitive,
+  TestTransportFailureIsLabelledGateway).
+- **Pinned by:** `internal/router/provenance_header_test.go`,
+  `internal/router/provenance_log_test.go`, plus black-box
+  `e2e/provenance_test.go`.
+- **Adversarial note (verified absent):** a header forged with a
+  provider-shaped status is inert — the label is read off the returned
+  `Failure`, never off the status that's about to be written.
+
+## Cross-service seams — recorded as dependencies, never invented
+
+The one cross-repo contract this repo does not silently implement: **egress
+selection as logical intent**. OFP's side is in force (the selector seam +
+recorded intent). The pool-backed selector is a **recorded cross-repo
+dependency** on `rotation-proxy-gateway`, matched by name, never reimplemented
+and never invented.
+
+| Seam                               | OFP side                                    | RPGW side                                     | State                       |
+| ---------------------------------- | ------------------------------------------- | --------------------------------------------- | --------------------------- |
+| Egress selection as logical intent | `internal/routing/intent.go` (seam + tests) | recorded cross-repo dependency (no code here) | OFP in force; RPGW recorded |
+
+## Status
+
+| Contract element                                   | State                                                             | Pinned by                                 |
+| -------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------- |
+| Provider responses terminal at OFP                 | **in force**                                                      | R1 (terminal_test.go, e2e 429)            |
+| One replay-safe predicate gates move + health mark | **in force**                                                      | R2 (fallback.go:242, provenance.go:216)   |
+| Intent recorded, never derived / never inbound     | **in force**                                                      | R3 (intent tests + forged-header pins)    |
+| Single emit boundary, bounded, dropped counted     | **in force**                                                      | R4 (evidence_log.go + cap tests)          |
+| Replay-safe failover moves to distinct egress only | **in force**                                                      | R5 (intent exclusion + terminal tests)    |
+| Provenance-labelled, unforgeable inbound           | **in force**                                                      | R6 (provenance header tests)              |
+| OFP ↔ RPGW egress intent                           | OFP side **in force**; RPGW side a recorded cross-repo dependency | R7 (routing intent seam + cross-repo row) |
+
+## Adversarial review notes (honest gaps, not dodged claims)
+
+- **No A–L dossier exists on disk.** The recovery-semantics document is real
+  and carries the contract; the review threads on the stacked PRs are empty on
+  GitHub (PR #51 withdrawn; #52/#54/#58 have no comment rows returned by the
+  review-comments API). This matrix therefore does **not** claim a
+  pre-existing adversarial dossier — it **is** the dossier, written fresh
+  against the on-disk seams and the gate output captured above.
+- **Every "verified absent" note above is a real grep** run in this session
+  against `internal/` — zero status-keyed retries, zero intent-derived-from-
+  status, zero inbound-forgery survivors. Not asserted; observed.

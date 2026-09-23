@@ -78,6 +78,13 @@ type Row struct {
 	// logical upstream call, so the renderer derives attempt_id =
 	// request_id/Attempt with no dial suffix.
 	Attempt int
+	// Intent is the logical egress intent this attempt's egress was selected
+	// under: `normal` (first attempt — anything eligible) or `new-egress`
+	// (after a replay-safe failure — not the egress that just failed).
+	// Empty on rows with no selection behind them (stream/forced phase rows).
+	// Forensic only: it records what the request ASKED FOR, which is the whole
+	// point of having a selector seam at all (routing/intent.go, issue #56).
+	Intent string
 	// Reason carries the skip reason or the stream/forced failure phase
 	// (stall/read_error/client_disconnect/too_large/…); empty for dial rows.
 	Reason string
