@@ -293,7 +293,11 @@ func (d *connectDialer) proxyTLSConfig() *tls.Config {
 	if base == nil && d.tlsConfig != nil {
 		base = d.tlsConfig()
 	}
-	cfg := &tls.Config{ServerName: d.proxy.Hostname()}
+	// The floor is stated on the literal as well as applied by floorTLS below:
+	// a clone cannot carry it (the injected config's field may be 0), and the
+	// literal is the one place a reader — or a scanner (code scanning
+	// go/missing-ssl-minversion) — looks for it. See tlsMinVersion.
+	cfg := &tls.Config{ServerName: d.proxy.Hostname(), MinVersion: tlsMinVersion}
 	if base != nil {
 		cfg = base.Clone()
 		if cfg.ServerName == "" {
