@@ -326,14 +326,21 @@ Policy and state are split (`internal/health/health.go`):
   transport's streak or cooldown.
 
 Health measures **egress-path health only** — whether the egress can carry a
-request at all — so the mark uses the same predicate as the failover
-decision (`Failure.ReplaySafe()`). Marked: a proxy TCP/TLS connect failure, a
-typed proxy-auth refusal, a SOCKS5 negotiation or CONNECT refusal, a target
-TCP connect failure, an origin TLS handshake failure. Never marked: **any**
-provider HTTP status (429, 4xx and 5xx alike — those are verdicts about the
-REQUEST or about the provider, not about this path), a request-write failure,
-a response-header timeout after transmission, a pooled-connection failure, a
-mid-stream death, a client cancellation. Health is observed when response
+request at all — and it is a **separate question** from the failover
+permission (issue #62): the mark reads `Failure.MarksEgressHealth()`, the move
+reads `Failure.ReplaySafe()`. Marked: a proxy TCP/TLS connect failure, a typed
+proxy-auth refusal, a SOCKS5 greeting or auth failure, a CONNECT request that
+could not be written to the proxy. Never marked: **any** provider HTTP status
+(429, 4xx and 5xx alike — those are verdicts about the REQUEST or about the
+provider, not about this path), a request-write failure, a response-header
+timeout after transmission, a pooled-connection failure, a mid-stream death, a
+client cancellation — **or a destination-side transport failure** (a target
+TCP connect refusal, an origin TLS failure, a CONNECT refusal by a proxy that
+answered for an origin it could not reach). The distinction is what keeps a
+provider outage from quarantining the whole pool: those failures are
+replay-safe, so the request still walks the remaining egresses, and they say
+nothing about any egress's ability to serve. `docs/recovery-semantics.md`
+("Health") states the rule and its justification. Health is observed when response
 HEADERS arrive: a stream that dies or stalls after a 200 start is the
 streaming commitment's abort, not a health observation. Poisoning an egress
 on a verdict would suppress a healthy path and invert the meaning of the

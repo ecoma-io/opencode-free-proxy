@@ -2,9 +2,14 @@
 // failure counting and cooldown. The three layers stay separate — routing
 // chooses where to start, failover chooses what to try after a replay-safe
 // failure, health decides whether an egress may be tried AT ALL for a while.
-// Health measures EGRESS-PATH health only (issue #53): it is marked by the
-// same predicate that permits the egress move (Failure.ReplaySafe), so a
-// provider verdict — 429, 4xx, 5xx alike — never poisons an egress.
+// Health measures EGRESS-PATH health only: it is marked by
+// Failure.MarksEgressHealth, which is the failing step's own answer to "was
+// this the egress endpoint's fault?" (issue #62). That is deliberately narrower
+// than the replay-safety that permits the move (Failure.ReplaySafe), so neither
+// a provider verdict — 429, 4xx, 5xx alike — nor a destination-side transport
+// failure — target TCP connect, origin TLS, CONNECT refusal — poisons an
+// egress. Callers pass only failures the predicate admitted; this package has
+// no opinion about which they are.
 //
 // Policy and state are deliberately split (issue #6):
 //

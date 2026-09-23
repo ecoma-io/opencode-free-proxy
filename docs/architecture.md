@@ -295,10 +295,13 @@ transport can _prove_ about transmission. The contract those fields serve is
   `request_state`; they are fixed vocabulary and carry no egress identity
   (no proxy URL, host, port or credential can reach them). Where the phase
   cannot be attributed the field is absent, which is an honest gap rather
-  than a guess. `ReplaySafe()` is the single predicate the recovery policy
-  reads — `origin = transport ∧ request_state = not_sent` — and it gates
-  both halves of recovery: whether the attempt may move to another egress
-  and whether the egress is marked unhealthy.
+  than a guess. The recovery policy reads TWO predicates off this record
+  (issue #62): `ReplaySafe()` — `origin = transport ∧ request_state =
+not_sent` — decides whether the attempt may move to another egress, and
+  the narrower `MarksEgressHealth()` — the failing phase is one performed
+  against the egress endpoint itself — decides whether the egress is marked
+  unhealthy. They answer different questions and are not nested; see
+  `docs/recovery-semantics.md` ("Two questions, two predicates").
 - **The same record labels the response on the wire** (issue #55,
   `internal/router/provenance_header.go`). The executor returns the terminal
   `Failure`, not just its `Class`, because a caller cannot act on a status

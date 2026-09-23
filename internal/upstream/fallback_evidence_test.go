@@ -15,8 +15,11 @@ import (
 // TestEvidenceAttemptCorrelationAcrossEgresses: two replay-safe failures in a
 // row, then a serving third egress. Each failed attempt leaves exactly one
 // row, numbered in dial order, and each carries the decisions the executor
-// made at that moment (mark + move on for both, since the plan had a third
-// entry left).
+// made at that moment: the request moved on for both (the plan had a third
+// entry left), and health stayed NEUTRAL for both — the fixture's failure is a
+// direct-path target_connect, which is the destination's fault, not the
+// egress's (issue #62). A row reading `fallback` + `neutral` is exactly what a
+// provider outage is supposed to look like.
 func TestEvidenceAttemptCorrelationAcrossEgresses(t *testing.T) {
 	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200, "c": 200})
 	defer f.Close()
@@ -48,9 +51,10 @@ func TestEvidenceAttemptCorrelationAcrossEgresses(t *testing.T) {
 		if row.Class != ClassConnectionError.String() {
 			t.Fatalf("row %d = %+v", i, row)
 		}
-		// A pre-request transport failure is the one thing that marks health.
-		if row.HealthDecision != HealthMarked {
-			t.Fatalf("row %d: a failed dial must be attributed to the egress, got %q", i, row.HealthDecision)
+		// The move and the mark are separate decisions: a destination-side
+		// failure authorises the first and not the second.
+		if row.HealthDecision != HealthNeutral {
+			t.Fatalf("row %d: a target_connect failure must not mark health, got %q", i, row.HealthDecision)
 		}
 		if row.FallbackDecision != FallbackYes {
 			t.Fatalf("row %d: decision = %q, want fallback", i, row.FallbackDecision)
@@ -62,8 +66,8 @@ func TestEvidenceAttemptCorrelationAcrossEgresses(t *testing.T) {
 			t.Fatalf("row %d: egress type = %q, want direct", i, row.EgressType)
 		}
 	}
-	if f.health.Healthy(healthKey("a"), testHealthPolicy) || f.health.Healthy(healthKey("b"), testHealthPolicy) {
-		t.Fatal("row health decisions must mirror the registry: both failed dials mark")
+	if !f.health.Healthy(healthKey("a"), testHealthPolicy) || !f.health.Healthy(healthKey("b"), testHealthPolicy) {
+		t.Fatal("row health decisions must mirror the registry: neither failed dial marks (threshold 1 would quarantine on one mark)")
 	}
 }
 

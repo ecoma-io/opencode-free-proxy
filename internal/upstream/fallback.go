@@ -20,8 +20,14 @@ import (
 // provider HTTP response of any status ends the request (it is relayed), an
 // unprovable failure (a response-header timeout, a post-transmission reset, a
 // pooled-connection failure) ends it too, and so does client cancellation.
-// The same predicate gates the health mark, because it is exactly "the
-// egress, not the provider, failed" (docs/recovery-semantics.md).
+//
+// The health mark is a SECOND question with its own predicate
+// (Failure.MarksEgressHealth): a failure is attributable to the egress — worth
+// a health mark — only when the failing step is one performed against the
+// egress endpoint itself. The two agree wherever an egress-endpoint step
+// failed and diverge at the destination end of the path, where a failure is
+// replay-safe without being egress evidence; issue #62 separated them, and
+// docs/recovery-semantics.md ("Health") states the rule and its justification.
 //
 // Fallback never happens once a live response exists: the calling relay owns
 // commitment from the moment Execute returns a non-nil response.
@@ -84,8 +90,12 @@ func (p AttemptPolicy) Budget() int {
 //   - Fallback happens ONLY on a replay-safe failure (origin = transport AND
 //     request_state = not_sent). A provider response, an unprovable failure
 //     and a cancellation all end the request on the egress that produced them.
-//   - An egress is marked unhealthy exactly when it is the side that failed —
-//     the same replay-safe condition — so 429/4xx/5xx never poison it.
+//   - An egress is marked unhealthy exactly when the failing step was performed
+//     against the egress endpoint itself (Failure.MarksEgressHealth) — a
+//     strictly narrower condition than the replay-safety that permits the move
+//     — so neither a provider status nor a destination-side transport failure
+//     ever poisons it (429/4xx/5xx, target TCP connect, origin TLS, CONNECT
+//     refusal).
 //   - No fallback after any downstream write — guaranteed structurally:
 //     downstream writes happen only after this returns a response.
 //   - A slot that fills between plan and dial is SKIPPED, never a failure.
@@ -232,16 +242,35 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 			if x.slots != nil {
 				x.slots.Release(id)
 			}
-			// ONE predicate for both decisions (issue #53): a failure is
-			// attributable to the EGRESS — and therefore worth marking, and
-			// worth re-sending elsewhere — only when it happened at a dial
-			// phase this process performs itself, before any request byte
-			// existed. Everything else (a provider verdict, a response-header
-			// timeout after transmission, a post-send reset, a pooled-
-			// connection failure, a dead caller) stops here on this egress.
+			// TWO predicates, two questions (issue #62). `safe` is about the
+			// REQUEST: a failure moves to another egress only when it provably
+			// happened before any request byte existed. `MarksEgressHealth` is
+			// about the PATH: the egress is marked only when the step that
+			// failed is one performed against the egress endpoint itself.
+			//
+			// They are not the same question and they do not always agree. A
+			// destination that refuses the TCP connection (target_connect), a
+			// handshake the origin refuses (origin_tls), or a proxy that
+			// answered it could not reach the origin (connect_read /
+			// socks5_connect) are all replay-safe — the request must move — and
+			// all say nothing about this egress's ability to carry traffic, so
+			// marking them would quarantine a healthy pool member.
+			//
+			// The two are not nested, in either direction. A marking phase can
+			// be recorded on a request that may NOT move — a later hop of a
+			// redirect chain losing its proxy endpoint after an earlier hop
+			// already transmitted (issue #60), or the budget being spent. That
+			// is not a contradiction: the mark is a scheduling fact about the
+			// egress, and a health mark authorises nothing — only replay-safety
+			// moves a request. See Failure.MarksEgressHealth.
+			//
+			// Everything neither predicate admits — a provider verdict, a
+			// response-header timeout after transmission, a post-send reset, a
+			// pooled-connection failure, a dead caller — stops here on this
+			// egress.
 			safe := failure.ReplaySafe()
 			health := HealthNeutral
-			if safe && x.health != nil {
+			if failure.MarksEgressHealth() && x.health != nil {
 				// State identity is id+transport (eg.HealthKey) so a policy-
 				// only reload keeps history while a transport swap starts
 				// clean; the POLICY is this request's snapshot.
