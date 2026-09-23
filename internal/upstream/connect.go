@@ -54,8 +54,9 @@ type connectDialer struct {
 	// read per dial so a test can set Client.TLSConfig after NewClientFor.
 	tlsConfig func() *tls.Config
 	// proxyTLS overrides the PROXY-hop TLS settings when the proxy endpoint
-	// is itself https; nil (production) means system roots with ServerName
-	// from the proxy host. Tests inject skip-verify for self-signed fixtures.
+	// is itself https; nil means the tlsConfig seam below supplies the trust
+	// anchors (see proxyTLSConfig), and system roots if that is nil too.
+	// Tests inject skip-verify for self-signed fixtures.
 	proxyTLS *tls.Config
 }
 
@@ -63,10 +64,18 @@ func newConnectDialer(proxy *url.URL, tlsConfig func() *tls.Config) *connectDial
 	return &connectDialer{proxy: proxy, dialer: net.Dialer{Timeout: config.ConnectTimeout}, tlsConfig: tlsConfig}
 }
 
-// DialTLSContext establishes the proxy tunnel and returns the ORIGIN TLS
-// conn. network is always "tcp"; addr is the origin "host:port" (the
-// transport passes cm.targetAddr because this transport's Proxy is nil).
-func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net.Conn, error) {
+// dialProxy connects the TCP hop to the proxy endpoint and, when that endpoint
+// is itself https, the TLS hop on top of it. It is the shared prologue of the
+// two proxy transport paths and the reason both report the same phases for the
+// same failures:
+//
+//   - the CONNECT tunnel (DialTLSContext), used for https origins;
+//   - the absolute-form path (DialProxyTLSContext), used for http origins,
+//     where net/http speaks the proxied request over the conn this returns.
+//
+// It arms one conn deadline that covers everything it and its callers do with
+// the conn; each caller clears it once its own protocol work is done.
+func (d *connectDialer) dialProxy(ctx context.Context) (net.Conn, error) {
 	// Phase bookkeeping (provenance.go). This whole function runs BEFORE
 	// net/http owns a connection, so every failure below is provably pre-
 	// transmission; the trace only has to say WHICH step failed. The calls are
@@ -77,14 +86,62 @@ func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net
 	if err != nil {
 		return nil, fmt.Errorf("proxy %s: dial: %w", config.RedactProxyURL(d.proxy.String()), err)
 	}
-	// One deadline across CONNECT + origin TLS: the HTTPS transport's
-	// ResponseHeaderTimeout never starts — Client.Do has not returned — so
-	// without it a proxy that accepts and stalls would strand the dial past
-	// any caller deadline. The watcher aborts on request-ctx cancellation
-	// the same way socks5.go's does (the transport detaches dial context
-	// cancellation from the request, but a canceled CLIENT ctx must still
-	// tear the tunnel down; Deadline values survive WithoutCancel).
+	// One deadline across the rest of the dial: the response-header timeout
+	// never starts — Client.Do has not returned — so without it a proxy that
+	// accepts and stalls would strand the dial past any caller deadline. The
+	// deadline is inherited from the dial context (net/http keeps Deadline
+	// values across context.WithoutCancel, which is what the transport hands a
+	// dialer) or falls back to config.ConnectTimeout.
 	_ = conn.SetDeadline(deadlineFrom(ctx, config.ConnectTimeout))
+	if d.proxy.Scheme != "https" {
+		return conn, nil
+	}
+	// TLS to the proxy endpoint. The protocol spoken over this conn (CONNECT
+	// for a tunnel, the request itself in absolute form) is HTTP/1.1 in both
+	// cases, which is why proxyTLSConfig offers no ALPN — see its doc.
+	t.enter(FailurePhaseProxyTLS)
+	tlsConn := tls.Client(conn, d.proxyTLSConfig())
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("proxy %s: tls: %w", config.RedactProxyURL(d.proxy.String()), err)
+	}
+	return tlsConn, nil
+}
+
+// DialProxyTLSContext is the DialTLSContext of the ABSOLUTE-FORM proxy
+// transport (an http origin behind an http(s) proxy). net/http calls it with
+// the proxy's own address — this transport's connectMethod is the proxy — and
+// then speaks the origin request over the returned conn. Reaching the proxy is
+// all this dialer does: the CONNECT boundary (DialTLSContext) is for https
+// origins, and an http origin must not be tunneled.
+//
+// Both arguments are deliberately ignored: the dialer owns the proxy endpoint
+// (proxyDialAddr), exactly like the CONNECT boundary, so the address net/http
+// computed cannot disagree with it.
+//
+// The returned conn is a handshaken *tls.Conn — never a uTLS wrapper — because
+// net/http reads ConnectionState off it to decide whether the conn is usable
+// (transport.go dialConn) and an opaque wrapper would silently lose that.
+func (d *connectDialer) DialProxyTLSContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	conn, err := d.dialProxy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The dial is over: from here the conn belongs to net/http, whose own
+	// bounds (ResponseHeaderTimeout) govern the request and the response. A
+	// dial deadline left armed would cut the request short at the dial budget.
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+// DialTLSContext establishes the proxy tunnel and returns the ORIGIN TLS
+// conn. network is always "tcp"; addr is the origin "host:port" (the
+// transport passes cm.targetAddr because this transport's Proxy is nil).
+func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net.Conn, error) {
+	conn, err := d.dialProxy(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// context.AfterFunc, not a select-watcher goroutine: a watcher that
 	// selects between ctx.Done() and a handshake-done channel flips a coin
 	// when BOTH become ready at once — it may Close() the just-returned live
@@ -92,26 +149,19 @@ func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net
 	// deterministically on the success path, so a completed handshake can
 	// never race its own teardown. There is no leak either way: stop() runs
 	// on every return below.
+	//
+	// It is a backstop, not the primary bound: the transport hands this dialer
+	// a context detached from the request (getCtxForDial uses
+	// context.WithoutCancel and keeps only Deadlines), so cancellation reaches
+	// here via the derived deadline, and the conn deadline armed above is what
+	// stops a stalled CONNECT or handshake.
 	// Capture the conn AT SPAWN: conn is reassigned to the TLS wrapper below,
 	// and a closure reading the variable would race that write (go memory
-	// model). Closing the captured TCP conn is correct on every path — every
+	// model). Closing the captured conn is correct on every path — every
 	// later wrapper wraps exactly this conn.
 	dialConn := conn
 	stopWatcher := context.AfterFunc(ctx, func() { _ = dialConn.Close() })
 	defer stopWatcher()
-
-	if d.proxy.Scheme == "https" {
-		// TLS to the proxy first (an https proxy endpoint); the CONNECT then
-		// travels inside that TLS layer. No h2 on this hop — the proxy speaks
-		// HTTP/1.1 CONNECT regardless of what the tunnel carries.
-		t.enter(FailurePhaseProxyTLS)
-		tlsConn := tls.Client(conn, d.proxyTLSConfig())
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("proxy %s: tls: %w", config.RedactProxyURL(d.proxy.String()), err)
-		}
-		conn = tlsConn
-	}
 
 	if err := d.connect(ctx, conn, addr); err != nil {
 		_ = conn.Close()
@@ -218,15 +268,44 @@ func floorTLS(cfg *tls.Config) {
 // proxyTLSConfig builds the PROXY-hop TLS settings for an https proxy
 // endpoint: ServerName from the proxy host unless the injected config names
 // one; the TLS floor applies to the literal and to every injected clone.
+//
+// Trust anchors come from the injected config — the dialer's own proxyTLS
+// first, then the client's TLSConfig (the same seam every ORIGIN handshake
+// takes its roots from, so one injected pool can cover a fixture's proxy and
+// its origin) — and from the system roots when both are nil. Production leaves
+// both nil: nothing in internal/config reaches this seam.
+//
+// Deliberately NO NextProtos, on either hop that ends at the proxy endpoint:
+//
+//   - the CONNECT tunnel speaks HTTP/1.1 CONNECT literally (connect.go), so an
+//     h2-negotiated conn would carry bytes the proxy never parses as CONNECT;
+//   - the absolute-form hop's proxy credentials ride stdlib's h1-only hook —
+//     dialConn installs `pconn.mutateHeaderFunc` to add the URL userinfo's
+//     Proxy-Authorization (net/http/transport.go:1850-1861) and only the
+//     HTTP/1.1 write path applies it (:2829). The h2 transport never does, so
+//     an h2 conn to the proxy would silently DROP the credentials of exactly
+//     the egresses configured with them.
+//
+// An empty ALPN list offers no protocol, so the proxy answers HTTP/1.1 in both
+// cases — the one protocol this file implements against a proxy.
 func (d *connectDialer) proxyTLSConfig() *tls.Config {
+	base := d.proxyTLS
+	if base == nil && d.tlsConfig != nil {
+		base = d.tlsConfig()
+	}
+	// The floor is stated on the literal as well as applied by floorTLS below:
+	// a clone cannot carry it (the injected config's field may be 0), and the
+	// literal is the one place a reader — or a scanner (code scanning
+	// go/missing-ssl-minversion) — looks for it. See tlsMinVersion.
 	cfg := &tls.Config{ServerName: d.proxy.Hostname(), MinVersion: tlsMinVersion}
-	if d.proxyTLS != nil {
-		cfg = d.proxyTLS.Clone()
+	if base != nil {
+		cfg = base.Clone()
 		if cfg.ServerName == "" {
 			cfg.ServerName = d.proxy.Hostname()
 		}
-		floorTLS(cfg)
 	}
+	cfg.NextProtos = nil // never negotiable — see the doc above
+	floorTLS(cfg)
 	return cfg
 }
 
