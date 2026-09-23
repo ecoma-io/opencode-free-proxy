@@ -686,10 +686,12 @@ func TestAllTransportsCarryIdleConnTimeout(t *testing.T) {
 //     ForceAttemptHTTP2 must be ABSENT — dead config lies (pre-parity these
 //     carried config.TLSHandshakeTimeout, bounding a stdlib handshake that
 //     DialTLSContext had already replaced).
-//   - http-origin-via-proxy (viaProxy): stdlib still owns the TCP dial and
-//     the TLS hop to an https PROXY ENDPOINT (origin TLS never rides this
-//     transport — attempt/redirect pick the tunneled one for https), so both
-//     stdlib fields stay.
+//   - http-origin-via-proxy (viaProxy): since issue #61 BOTH proxy-side dials
+//     are this package's — DialContext for an http proxy endpoint, and
+//     DialTLSContext (DialProxyTLSContext, connect.go) for an https one — so
+//     stdlib never handshakes here either and TLSHandshakeTimeout /
+//     ForceAttemptHTTP2 are dead config exactly as on the paths above. The
+//     connect deadline dialProxy arms is what bounds the proxy-hop handshake.
 //   - the tunneled CONNECT transport: DialTLSContext owns dial + CONNECT +
 //     origin TLS under one conn deadline (connect.go); no stdlib dial field.
 //
@@ -721,9 +723,10 @@ func TestDirectPathsBoundDialAndTLS(t *testing.T) {
 	utlsDialing(noSleepClient(NewClientFor(nil)), "NewClientFor(direct)")
 	utlsDialing(noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://127.0.0.1:9"})), "NewClientFor(socks5)")
 
-	// The http-origin transport through an HTTP(S) proxy: stdlib owns the
-	// dial and the PROXY-hop TLS (https proxy endpoints), so both stdlib
-	// bounds stay — this is the one transport where they are live.
+	// The http-origin transport through an HTTP(S) proxy: BOTH proxy-side
+	// dials are this package's, so neither stdlib field is live. Dropping
+	// DialTLSContext here would hand an https proxy endpoint's handshake back
+	// to stdlib, where a certificate or handshake failure is unclassifiable.
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: "http://127.0.0.1:9"}))
 	tr, ok := c.HTTP.Transport.(*http.Transport)
 	if !ok {
@@ -732,8 +735,11 @@ func TestDirectPathsBoundDialAndTLS(t *testing.T) {
 	if tr.DialContext == nil {
 		t.Error("NewClientFor(http): DialContext is nil — the proxy dial is unbounded")
 	}
-	if tr.TLSHandshakeTimeout != config.TLSHandshakeTimeout {
-		t.Errorf("NewClientFor(http): TLSHandshakeTimeout = %v, want %v (bounds the stdlib-owned https-proxy-endpoint hop)", tr.TLSHandshakeTimeout, config.TLSHandshakeTimeout)
+	if tr.DialTLSContext == nil {
+		t.Error("NewClientFor(http): DialTLSContext is nil — an https proxy endpoint's TLS hop would be stdlib's, so a proxy-hop failure could not be attributed (issue #61)")
+	}
+	if tr.TLSHandshakeTimeout != 0 || tr.ForceAttemptHTTP2 {
+		t.Errorf("NewClientFor(http): carries stdlib TLS fields (TLSHandshakeTimeout=%v ForceAttemptHTTP2=%v); DialTLSContext makes them dead config", tr.TLSHandshakeTimeout, tr.ForceAttemptHTTP2)
 	}
 
 	tun, ok := c.tunneled.Transport.(*http.Transport)

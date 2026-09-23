@@ -90,6 +90,12 @@ that layer cannot prove what left the socket.
 | Response header wait                             | `net/http` | **no**    |
 | Response body                                    | `net/http` | **no**    |
 
+The two proxy-hop rows hold for **either** transport that ends at a proxy
+endpoint: the absolute-form path (an http origin) and the CONNECT tunnel (an
+https origin). The TLS hop of the absolute-form path used to be net/http's own
+and reached the record as an unattributable dial error; since issue #61 the same
+dialer owns it under the same phase.
+
 Three consequences that are easy to get wrong:
 
 1. **A pooled connection performs no dial at all.** A failure on a connection

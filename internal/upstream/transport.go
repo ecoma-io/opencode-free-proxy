@@ -21,7 +21,9 @@ import (
 //     failures surface typed.
 //   - HTTP origins through an HTTP(S) proxy: Go's own proxy support
 //     (absolute-form request line; Proxy-Authorization derived from the
-//     URL userinfo) on the main transport.
+//     URL userinfo) on the main transport, with the PROXY-side dial owned by
+//     this package whenever that proxy endpoint is https (DialProxyTLSContext,
+//     connect.go) so a proxy-hop TLS failure is attributable.
 //   - HTTPS origins through an HTTP(S) proxy: a SECOND transport whose
 //     DialTLSContext is the hand-rolled CONNECT boundary (connect.go), so a
 //     proxy refusal is a typed *proxyAuthError instead of stdlib's
@@ -81,20 +83,34 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 	}
 	switch p.Type {
 	case config.ProxyHTTP, config.ProxyHTTPS:
-		// The http-origin transport: Go proxies it in absolute form. The
-		// dialer bounds the TCP dial TO THE PROXY (stdlib otherwise dials
-		// with its unbounded zeroDialer) and TLSHandshakeTimeout the TLS
-		// hop when the proxy endpoint is itself https.
+		// The http-origin transport: Go proxies it in absolute form. Both
+		// dials this transport performs — the plain TCP dial for an http://
+		// proxy endpoint, the TCP+TLS dial for an https:// one — are TO THE
+		// PROXY, so a failure on either is a proxy-path failure, not a target
+		// one: proxy_connect and proxy_tls respectively (issue #61). Owning
+		// the TLS dial is also what makes that phase attributable at all:
+		// stdlib's own handshake reports a certificate or handshake failure as
+		// an opaque error from a dial this package never sees.
+		//
+		// Deliberately NO TLSHandshakeTimeout and NO ForceAttemptHTTP2 here:
+		// with DialTLSContext set stdlib never handshakes this hop (dialConn
+		// takes the custom-TLS branch), so a handshake timeout is dead config —
+		// dialProxy bounds the handshake with the same config.ConnectTimeout
+		// on the conn deadline, and it additionally honours the caller's
+		// context deadline, which stdlib's timer ignores. ForceAttemptHTTP2
+		// goes with it: proxyTLSConfig offers no ALPN, so no proxy can
+		// negotiate h2 and the bundled h2 transport could never engage on this
+		// hop (and must not — see proxyTLSConfig on the credentials h2 would
+		// drop).
 		viaProxy := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
 			// The dial this transport performs is TO THE PROXY (stdlib's
 			// absolute-form path), so a failure here is a proxy_connect
 			// failure, not a target one.
-			DialContext:         recordingDialer(FailurePhaseProxyConnect, (&net.Dialer{Timeout: config.DialTimeout}).DialContext),
-			TLSHandshakeTimeout: config.TLSHandshakeTimeout,
-			ForceAttemptHTTP2:   true,
-			Proxy:               http.ProxyURL(u),
+			DialContext:    recordingDialer(FailurePhaseProxyConnect, (&net.Dialer{Timeout: config.DialTimeout}).DialContext),
+			DialTLSContext: recordingDialer(FailurePhaseProxyConnect, newConnectDialer(u, func() *tls.Config { return c.TLSConfig }).DialProxyTLSContext),
+			Proxy:          http.ProxyURL(u),
 		}
 		// The https-origin transport: WE own the CONNECT (connect.go); the
 		// transport sees a direct https dial. The proxy URL rides the

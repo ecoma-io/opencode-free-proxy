@@ -9,6 +9,7 @@ package upstream
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"net/url"
 	"testing"
 )
@@ -53,6 +54,46 @@ func TestProxyHopTLSFloor(t *testing.T) {
 		d := &connectDialer{proxy: u, proxyTLS: &tls.Config{MinVersion: tls.VersionTLS13}}
 		if cfg := d.proxyTLSConfig(); cfg.MinVersion != tls.VersionTLS13 {
 			t.Fatalf("MinVersion = %x, want the injected TLS 1.3 preserved", cfg.MinVersion)
+		}
+	})
+
+	// The proxy hop speaks HTTP/1.1 in both of its forms (CONNECT for a tunnel,
+	// the absolute-form request itself) and its credentials ride stdlib's
+	// h1-only Proxy-Authorization path, so h2 must never be negotiable here —
+	// not by the literal, and not by an injected config either.
+	t.Run("no ALPN, injected or otherwise", func(t *testing.T) {
+		if cfg := (&connectDialer{proxy: u}).proxyTLSConfig(); len(cfg.NextProtos) != 0 {
+			t.Fatalf("proxy-hop NextProtos = %v, want none (h2 on this hop would drop Proxy-Authorization)", cfg.NextProtos)
+		}
+		d := &connectDialer{proxy: u, proxyTLS: &tls.Config{NextProtos: []string{"h2", "http/1.1"}}}
+		if cfg := d.proxyTLSConfig(); len(cfg.NextProtos) != 0 {
+			t.Fatalf("injected proxy-hop NextProtos = %v, want none — ALPN here is not a knob", cfg.NextProtos)
+		}
+	})
+
+	// Issue #61: with no dialer-level override, the proxy hop takes its trust
+	// anchors from the same injected config every ORIGIN handshake uses, so one
+	// pool covers a fixture (or a deployment) whose proxy endpoint is as
+	// self-signed as its origin. Production leaves both nil — system roots.
+	t.Run("the client trust seam reaches the proxy hop", func(t *testing.T) {
+		pool := x509.NewCertPool()
+		d := &connectDialer{proxy: u, tlsConfig: func() *tls.Config {
+			return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}
+		}}
+		cfg := d.proxyTLSConfig()
+		if cfg.RootCAs != pool {
+			t.Fatal("proxy-hop RootCAs did not come from the client's TLSConfig seam")
+		}
+		if cfg.ServerName != "proxy.internal" {
+			t.Fatalf("ServerName = %q, want the proxy host backfilled", cfg.ServerName)
+		}
+		if cfg.MinVersion != tls.VersionTLS13 {
+			t.Fatalf("MinVersion = %x, want the injected floor preserved", cfg.MinVersion)
+		}
+		// The dialer's own override still wins when both are set.
+		d.proxyTLS = &tls.Config{InsecureSkipVerify: true} // fixture: self-signed proxy cert
+		if cfg := d.proxyTLSConfig(); !cfg.InsecureSkipVerify {
+			t.Fatal("proxyTLS must take precedence over the client's TLSConfig")
 		}
 	})
 }
