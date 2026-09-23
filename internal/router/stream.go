@@ -47,7 +47,13 @@ const maxNonSSEBodyBytes = 1 << 20
 // recorded as a response_started phase row (never an HTTP verdict —
 // commitment was made when the executor returned the live response; no
 // fallback, no health mark).
-func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Response, cancelUpstream context.CancelFunc, ev *evidenceLog, egID string, sourceFormat, targetFormat relay.Format, body map[string]any, upstreamModel string, customToolNames map[string]bool, intent *cloak.ThinkingCfg) {
+//
+// delivered is the AUTHORSHIP of the response being relayed, as the executor
+// proved it (OriginUpstream, or OriginAmbiguous on a hop an HTTP intermediary
+// carried — issue #63). It is not a detail of the failure path: every phase
+// row below describes what became of a response this call already received, so
+// the row would otherwise blame the provider for a proxy's death.
+func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Response, cancelUpstream context.CancelFunc, ev *evidenceLog, egID string, delivered upstream.Origin, sourceFormat, targetFormat relay.Format, body map[string]any, upstreamModel string, customToolNames map[string]bool, intent *cloak.ThinkingCfg) {
 	defer cancelUpstream()
 	// Failover/error/forced paths close explicitly; this covers the relay paths
 	// (base.js consumes or cancels the body either way).
@@ -64,7 +70,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	if ct != "" && !strings.Contains(ct, "text/event-stream") && !strings.Contains(ct, "application/json") {
 		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxNonSSEBodyBytes))
 		short := shortHTMLMessage(string(bodyText), ct)
-		ev.StreamAbort(egID, resp.StatusCode, upstream.OriginUpstream, "non_sse_body", time.Since(started).Milliseconds())
+		ev.StreamAbort(egID, resp.StatusCode, delivered, "non_sse_body", time.Since(started).Milliseconds())
 		writeBareStreamError(w, resp.StatusCode, fmt.Sprintf("[%d]: %s", resp.StatusCode, short))
 		return
 	}
@@ -86,7 +92,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	// ctx cancellation releases the upstream connection on stall/teardown.
 	lineErr := upstream.ScanLines(r.Context(), resp.Body, config.StreamStall, streamRelay.ProcessLine, streamRelay.ProcessTail)
 	if lineErr != nil {
-		origin, reason := streamAbortReason(r.Context(), lineErr)
+		origin, reason := streamAbortReason(r.Context(), lineErr, delivered)
 		ev.StreamAbort(egID, resp.StatusCode, origin, reason, time.Since(started).Milliseconds())
 		// Stall, transport failure, or client disconnect mid-stream: a
 		// Responses passthrough client still needs a parseable terminal.
@@ -108,10 +114,14 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 // body read itself errored. A label, never a message — the raw error text can
 // carry topology.
 //
-// The origin is returned alongside because a mid-stream death is normally the
-// provider's (OriginUpstream) but a client disconnect is the CALLER's — and
-// the evidence row must not blame the egress for the caller leaving.
-func streamAbortReason(ctx context.Context, err error) (upstream.Origin, string) {
+// The origin is returned alongside for two reasons, and they are the same
+// reason: the row must name the side the death is attributable to. A client
+// disconnect is the CALLER's — the evidence row must not blame the egress for
+// the caller leaving. Everything else is the DELIVERING path's, which is
+// `delivered` and not a constant (issue #63): on a hop an HTTP intermediary
+// carried, a death mid-body may be the proxy's, and calling it the provider's
+// would be an inference this process cannot back.
+func streamAbortReason(ctx context.Context, err error, delivered upstream.Origin) (upstream.Origin, string) {
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return upstream.OriginClient, "client_disconnect"
 	}
@@ -119,9 +129,9 @@ func streamAbortReason(ctx context.Context, err error) (upstream.Origin, string)
 	// (upstream.ErrStreamStalled), so the watchdog is recognisable without
 	// probing a message string (issue #6 discipline).
 	if errors.Is(err, upstream.ErrStreamStalled) {
-		return upstream.OriginUpstream, "stall"
+		return delivered, "stall"
 	}
-	return upstream.OriginUpstream, "read_error"
+	return delivered, "read_error"
 }
 
 // shortHTMLMessage sanitizes an upstream HTML error page into a short

@@ -133,8 +133,46 @@ Everything else is a **hard no**:
   "some other path answered".
 - provider HTTP 5xx — the provider answered. Another egress would ask the same
   provider a second time.
+- a response of **unprovable authorship** — a reply that arrived over an
+  intermediated hop, where an HTTP-level intermediary (a forward proxy) is a
+  peer that answers for itself with its own 407, 403, 502/503 or a captive
+  portal's 200, and the wire cannot distinguish its reply from a relayed
+  origin's. Such a response is `origin = ambiguous` with
+  `request_state = unknown`, so the rule above excludes it: a re-send could
+  duplicate provider work that already happened. It is relayed verbatim
+  regardless — the status cannot be re-litigated once it exists.
 - `unknown` — by definition unproven.
 - client cancellation — there is no one left to deliver to.
+
+### Response authorship is a property of the path
+
+Reporting WHO wrote a response is a separate axis from what should be done
+with it, and it is answered by the path, never by the status (issue #63).
+
+```text
+intermediated hop      →  origin = ambiguous   state = unknown
+   (a plain-http target carried by an http/https forward proxy, i.e. the
+    absolute-form path, where the proxy received a full HTTP message)
+every other hop        →  origin = upstream    state = response_started
+   (direct, SOCKS5 tunnel, CONNECT tunnel — the intermediary moves
+    transport bytes, so it cannot author an HTTP message)
+```
+
+A status code cannot carry authorship. Nothing on the wire separates a
+forward proxy's own 502 from a 502 the origin sent through it, and content
+sniffing is banned outright (issue #6) — a proxy may forward any body. The
+honest answer on a path where nobody can prove the provider wrote the reply is
+therefore an explicit refusal to attribute, not a better guess: the label says
+_ambiguous_, and the request state says _unknown_ because the request byte
+provably reached the proxy while what became of it is not observable here.
+`not_sent` would be a fabrication (something was sent); `response_started`
+would claim a provider answer nobody proved.
+
+This changes no decision. An ambiguous response is terminal exactly like any
+other response: relayed verbatim, never replay-safe, never marking an egress
+unhealthy. It changes what a caller is TOLD — and that matters, because the
+Injector owns provider-level retry and must not be told the provider answered
+when nothing proved it did.
 
 ## Ownership split
 
@@ -154,6 +192,14 @@ Injector, which owns the logical attempt), and failing over an egress requires
 proving the request never went out (OFP, which owns the transport boundary).
 The layer that cannot prove a thing does not get to decide it.
 
+The same principle fixes what OFP may **claim** about a response it relays.
+OFP does not own provider-level retry, so its authorship label is an input to
+the Injector's decision, and it may only state what the transport boundary
+proves: `upstream` where no intermediary could have authored the reply,
+`ambiguous` where one could (issue #63). Writing `upstream` for a response a
+forward proxy may have authored would hand the Injector a false premise for
+the one decision OFP is not allowed to make.
+
 ## OFP behaviour
 
 | Upstream interaction                                   | OFP action                            | New egress? | Health  | Provider retry |
@@ -172,9 +218,14 @@ The layer that cannot prove a thing does not get to decide it.
 | request write failure                                  | gateway-origin failure, **no replay** | no          | neutral | no             |
 | response-header timeout / reset after write            | gateway-origin failure, **no replay** | no          | neutral | no             |
 | response body death after headers                      | abort downstream, commitment stands   | no          | neutral | no             |
+| response of unprovable authorship (absolute-form hop)  | relay verbatim, labelled `ambiguous`  | no          | neutral | no             |
 | client cancellation                                    | abort, nothing to deliver to          | no          | neutral | no             |
 
-"New egress?" is the safe-failover rule applied to the row's provenance.
+The three "provider" rows hold on a path that proves the origin. Where the
+hop is intermediated the label is `ambiguous` instead, and the row is the same
+in every column that is a decision — relay verbatim, no new egress, neutral
+health, no provider retry (issue #63). "New egress?" is the safe-failover rule
+applied to the row's provenance.
 "Health" is the next section. "Provider retry" is `no` everywhere by
 construction: OFP makes exactly one logical upstream call per attempt.
 
@@ -255,7 +306,7 @@ rather than from an implementation detail:
 
 Each failed interaction produces one bounded evidence row describing:
 
-- `origin` — `transport` | `upstream` | `client`
+- `origin` — `transport` | `upstream` | `ambiguous` | `client`
 - `failure_phase` — which step of the egress path (see the proof-boundary
   table; absent when attribution is impossible, which is an honest gap rather
   than a guess)
@@ -276,6 +327,12 @@ OFP exposes to the Injector, per logical provider attempt:
 - **provider response** — relayed verbatim, status and body. Terminal: the
   Injector owns every decision about what to do with it (including `429`,
   which OFP will never convert into an egress change on its own).
+- **response of unprovable authorship** — relayed verbatim under
+  `origin = ambiguous`: a reply that arrived over an intermediated hop, where
+  a forward proxy may have authored it. Terminal in the same way, but the
+  Injector is told explicitly that the provider cannot be named as its author
+  (issue #63) — a provider-level retry decision must not rest on an
+  attribution nobody proved.
 - **gateway transport failure** — OFP could not deliver the request. When the
   failure is provably pre-transmission OFP has already exhausted safe egress
   failover internally (within its own configured pool) before surfacing it.
@@ -293,17 +350,30 @@ Every response that came out of the upstream attempt path carries that
 attribution in namespaced internal headers:
 
 ```text
-X-OFP-Failure-Origin: upstream | gateway
-X-OFP-Failure-Phase:  <phase>            (gateway only; absent when unattributable)
-X-OFP-Request-State:  not_sent | unknown  (gateway only)
+X-OFP-Failure-Origin: upstream | ambiguous | gateway
+X-OFP-Failure-Phase:  <phase>                            (gateway only; absent otherwise)
+X-OFP-Request-State:  not_sent | unknown | response_started   (everything but upstream)
 ```
 
 `upstream` means the status and body are the provider's own answer, relayed
-verbatim — 2xx and every 4xx/5xx alike. `gateway` means no provider response
-exists: OFP produced this status because the egress path failed, or because no
-egress was eligible for the route. The label is read off the recorded
-provenance, **never off the status** — a provider 502 and a gateway 502 are
-the same number, and telling them apart is the entire point.
+verbatim — 2xx and every 4xx/5xx alike — on a path that proves no
+intermediary could have written it. `ambiguous` means a response exists but
+its author is unprovable: it arrived over an intermediated hop where an
+HTTP-level forward proxy answers for itself (issue #63). `gateway` means no
+provider response exists: OFP produced this status because the egress path
+failed, or because no egress was eligible for the route. The label is read off
+the recorded provenance, **never off the status** — a provider 502, an
+intermediary's 502 and a gateway 502 are the same number, and telling them
+apart is the entire point.
+
+The three origins are three different instructions to a caller, and the
+request state travels with the second and third because only they leave the
+question open: `upstream` (the provider answered — read the status), `ambiguous`
+(someone answered, not provably the provider — a re-send could duplicate
+provider work), `gateway` (OFP could not send it — safe to retry when the state
+says `not_sent`). No phase rides an `ambiguous` response: the phase vocabulary
+names the failed step of the egress path, and nothing failed — an answer
+arrived.
 
 A response with **no** provenance header is not an upstream-interaction
 outcome: a local rejection (bad body, unknown model), a draining server, or a
@@ -371,6 +441,10 @@ an intent from a provider status in its place.
 - **No status-code inference of request state.** `not_sent` is never derived
   from a status — a status means the request was received, so it can only ever
   produce `response_started`.
+- **No status-code inference of authorship.** No status, header or body shape
+  is read to decide who wrote a response: the answer is a property of the path
+  the response arrived on, and where the path cannot prove it the answer is
+  `ambiguous` (issue #63).
 - **No text-based classification.** Phases, origins and states come from the
   boundary that spoke the protocol and from Go's own error typing. Matching
   error strings to decide retryability is banned outright: transport error
@@ -389,6 +463,7 @@ an intent from a provider status in its place.
 | Proof boundary at the transport layers             | **in force** — dial phases recorded by the dialers                                                      |
 | `not_sent` never claimed without a dial            | **in force**, pinned by test                                                                            |
 | Provider HTTP responses terminal at OFP            | **in force** — one logical upstream call per attempt                                                    |
+| Response authorship is a property of the path      | **in force** — `origin = ambiguous` on an intermediated hop, never inferred from the status (issue #63) |
 | Safe-failover-only egress movement                 | **in force** — `Failure.ReplaySafe()` gates the move                                                    |
 | Health = egress-path health only                   | **in force** — `Failure.MarksEgressHealth()` gates the mark (issue #62: a separate, narrower predicate) |
 | Evidence vocabulary without retry-matrix fields    | **in force** — rows carry phase/origin/state/decisions                                                  |

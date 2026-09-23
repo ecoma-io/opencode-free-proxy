@@ -137,14 +137,20 @@ The semantics agents most often get wrong:
     Stream/forced deaths are `response_started` PHASE rows — the delivered
     status is never rewritten into an HTTP verdict. See docs/architecture.md
     "Upstream error evidence".
-11. Responses are **attributed, not inferred** (issue #55,
+11. Responses are **attributed, not inferred** (issues #55, #63,
     `internal/router/provenance_header.go`). Anything that came out of the
     upstream attempt path carries `X-OFP-Failure-Origin` (`upstream` |
-    `gateway`), with `X-OFP-Failure-Phase` and `X-OFP-Request-State` on
-    gateway-origin responses only (`not_sent` | `unknown` |
-    `response_started` — the last means the logical call had been answered
-    before the hop that failed, e.g. by a followed redirect, issue #60; all
-    three are read off the `Failure`, never off the status). The label is read off the returned
+    `ambiguous` | `gateway`), with `X-OFP-Failure-Phase` on gateway-origin
+    responses only and `X-OFP-Request-State` on everything but `upstream`
+    (`not_sent` | `unknown` | `response_started` — the last means the logical
+    call had been answered before the hop that failed, e.g. by a followed
+    redirect, issue #60; all three are read off the `Failure`, never off the
+    status). Authorship is a property of the PATH, never of the status code:
+    on an intermediated hop (a plain-http target carried by an http/https
+    forward proxy, `internal/upstream` `hopPathOf`) the proxy is an HTTP peer
+    that answers for itself, so the label is `ambiguous` with state `unknown`
+    — relayed verbatim like any response, never replay-safe, never marking an
+    egress, and never claiming the provider wrote it. The label is read off the returned
     `Failure` — NEVER off the status that is about to be written, because a
     provider 502 and a synthesized 502 are the same number. A local error
     (bad body, unknown model, draining) and a client cancellation carry no

@@ -383,24 +383,35 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		return
 	}
 	w.Header().Set(headerEgress, egID)
-	// A served request is the provider's own answer, synthetic completions
-	// excepted (they never reach here — bypass and test-connection return
-	// before the executor, and carry no provenance at all).
-	w.Header().Set(headerFailureOrigin, originUpstream)
+	// A served request's authorship is read off the SAME record a failed one's
+	// is — never off the fact that a response arrived (issue #63). A 200 on a
+	// hop an HTTP forward proxy carried may be the proxy's answer, not the
+	// provider's (a captive portal is the case that makes it matter), and the
+	// executor already said so in `failure`; this is a success, but "the
+	// provider answered" is not something a status can assert.
+	//
+	// Synthetic completions never reach here — bypass and test-connection
+	// return before the executor and carry no provenance at all.
+	setFailureProvenance(w.Header(), failure)
 	logLine(resp.StatusCode)
 	// Forced SSE→JSON needs the upstream reply to actually be SSE
 	// (sseToJsonHandler.js:185-188): when it is not, chatCore falls through to
 	// the streaming path — a non-streaming client behind a non-SSE upstream
 	// gets the stream handler (HTML guard → error; other bodies piped raw).
+	// The response about to be relayed carries the DELIVERING path's authorship
+	// into every phase row the relay can still produce: a death mid-stream is
+	// normally the provider's, but on a hop an HTTP intermediary carried it may
+	// be the intermediary's, and the record already says which is provable
+	// (failure.Origin — OriginUpstream or OriginAmbiguous; issue #63).
 	if !clientRequestedStreaming && forcedUpstreamIsSSE(resp) {
 		// The response body still streams under reqCtx — canceling before the
 		// ReadAll would abort it. forcedSSEToJson closes the body; the defer
 		// releases the context after the read completes.
 		defer cancelUpstream()
-		s.forcedSSEToJson(w, r, resp, ev, egID, sourceFormat, targetFormat, cleanModel, customToolNames, body, upstreamModel, intent)
+		s.forcedSSEToJson(w, r, resp, ev, egID, failure.Origin, sourceFormat, targetFormat, cleanModel, customToolNames, body, upstreamModel, intent)
 		return
 	}
-	s.stream(w, r, resp, cancelUpstream, ev, egID, sourceFormat, targetFormat, body, upstreamModel, customToolNames, intent)
+	s.stream(w, r, resp, cancelUpstream, ev, egID, failure.Origin, sourceFormat, targetFormat, body, upstreamModel, customToolNames, intent)
 }
 
 // captureDownstream collects the client headers the executor forwards.
