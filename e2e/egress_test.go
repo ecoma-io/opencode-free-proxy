@@ -50,12 +50,34 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 	t.Fatal(msg)
 }
 
+// waitForLog polls the spawned server's captured log until want holds on it
+// and returns that log, so an assertion about log CONTENT never has to guess
+// whether the harness has caught up (issue #67).
+//
+// The server writes its lines to stderr; the harness copies that stream into
+// sp.out on its own goroutine. A client that has just drained the response
+// body — even one that saw the connection close — can therefore read a buffer
+// that is still one scheduling quantum behind, and read a line the server DID
+// write as a line it never wrote. There is no "the log is settled" signal
+// short of the process exiting: for a stream death the evidence event is
+// emitted AFTER the completion line, so the completion line is not an anchor
+// for it, and a quiet period would be a fixed sleep. The observable itself is
+// the anchor: wait, bounded, for the line about to be asserted on.
+func waitForLog(t *testing.T, sp *proxySpawn, expected string, want func(log string) bool) string {
+	t.Helper()
+	waitFor(t, 5*time.Second, func() bool { return want(sp.out.String()) },
+		fmt.Sprintf("the server log never showed %s\nlog:\n%s", expected, sp.out.String()))
+	return sp.out.String()
+}
+
 // requestLines returns the server's per-request outcome lines. Every request
 // logs exactly one line and each carries "generation=" — the reload banner
 // says "generation N" (space, not equals), so it never matches.
-func (sp *proxySpawn) requestLines() []string {
+func (sp *proxySpawn) requestLines() []string { return requestLinesOf(sp.out.String()) }
+
+func requestLinesOf(log string) []string {
 	var out []string
-	for _, ln := range strings.Split(sp.out.String(), "\n") {
+	for _, ln := range strings.Split(log, "\n") {
 		if strings.Contains(ln, "generation=") {
 			out = append(out, ln)
 		}
@@ -68,10 +90,9 @@ func (sp *proxySpawn) requestLines() []string {
 // the line order is deterministic.
 func assertRequestLine(t *testing.T, sp *proxySpawn, idx int, want ...string) {
 	t.Helper()
-	lines := sp.requestLines()
-	if idx >= len(lines) {
-		t.Fatalf("request line %d missing (have %d):\n%s", idx, len(lines), sp.out.String())
-	}
+	log := waitForLog(t, sp, fmt.Sprintf("request line %d", idx),
+		func(log string) bool { return len(requestLinesOf(log)) > idx })
+	lines := requestLinesOf(log)
 	for _, w := range want {
 		if !strings.Contains(lines[idx], w) {
 			t.Fatalf("request line %d = %q, missing %q\nlog:\n%s", idx, lines[idx], w, sp.out.String())

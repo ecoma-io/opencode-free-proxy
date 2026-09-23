@@ -245,10 +245,12 @@ routes:
 		t.Fatalf("proxy c dialed %d times during an in-flight generation-1 request", c)
 	}
 	// The logs must attribute the fallback to the request's OWN generation.
-	if !strings.Contains(sp.out.String(), "generation=1") ||
-		!strings.Contains(sp.out.String(), "fallback=true") {
-		t.Fatalf("log lacks generation=1 fallback marker:\n%s", sp.out.String())
-	}
+	// The completion line is written while the response is still being relayed,
+	// so wait for it to reach the captured buffer rather than reading it once
+	// (issue #67): the assertion is about log CONTENT, not about copy timing.
+	waitForLog(t, sp, "the generation-1 fallback marker", func(log string) bool {
+		return strings.Contains(log, "generation=1") && strings.Contains(log, "fallback=true")
+	})
 
 	// A fresh request pins the NEW generation.
 	resp2 := sp.post(t, streamBody, nil)

@@ -16,10 +16,13 @@ import (
 	"testing"
 )
 
-// jsonEvents parses every JSON log line the spawned server emitted.
-func (sp *proxySpawn) jsonEvents() []map[string]any {
+// parseEvents parses every JSON log line in a captured log. Counting events is
+// an assertion about log CONTENT, so callers wait for the count they expect
+// (waitForLog) before asserting on it — the harness copies the process's
+// stderr on its own goroutine and a scan can otherwise outrun it (issue #67).
+func parseEvents(log string) []map[string]any {
 	var events []map[string]any
-	for _, ln := range strings.Split(sp.out.String(), "\n") {
+	for _, ln := range strings.Split(log, "\n") {
 		if !strings.Contains(ln, `"msg"`) {
 			continue
 		}
@@ -29,6 +32,12 @@ func (sp *proxySpawn) jsonEvents() []map[string]any {
 		}
 	}
 	return events
+}
+
+// upstreamErrors counts the upstream_error evidence events in a captured log —
+// the counting condition waitForLog waits on.
+func upstreamErrors(log string) int {
+	return len(withMsg(parseEvents(log), "upstream_error"))
 }
 
 // withMsg returns every parsed event whose msg starts with prefix.
@@ -95,7 +104,11 @@ routes:
 	}
 	assertRequestLine(t, sp, 0, "generation=1", "egress=a", "attempts=1", "class=upstream_429", "status=429", "fallback=false")
 
-	events := sp.jsonEvents()
+	// The 429 is an error-path failure, so the evidence is emitted before the
+	// completion line assertRequestLine just waited for; the count is asserted
+	// on a log that already carries the event rather than on the ordering.
+	events := parseEvents(waitForLog(t, sp, "exactly one upstream_error event (the 429 attempt)",
+		func(log string) bool { return upstreamErrors(log) == 1 }))
 	errs := withMsg(events, "upstream_error")
 	if len(errs) != 1 {
 		t.Fatalf("upstream_error events = %d, want exactly 1 (the 429 attempt; b's success is silent):\n%s", len(errs), sp.out.String())
@@ -178,7 +191,12 @@ routes:
 		t.Fatalf("the already-delivered delta must reach the client: %q", b)
 	}
 
-	events := sp.jsonEvents()
+	// The stream death is emitted AFTER this request's completion line (the
+	// relay dies once the status is already delivered), so the completion line
+	// proves nothing about it — wait for the event itself (issue #67; this
+	// assertion failed in CI on a log dump that already contained the event).
+	events := parseEvents(waitForLog(t, sp, "exactly one upstream_error event (the stream death)",
+		func(log string) bool { return upstreamErrors(log) == 1 }))
 	errs := withMsg(events, "upstream_error")
 	if len(errs) != 1 {
 		t.Fatalf("upstream_error events = %d, want 1 (the stream death):\n%s", len(errs), sp.out.String())
