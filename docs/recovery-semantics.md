@@ -418,6 +418,18 @@ wire protocol: OFP does not invent an RPC, and where a capability belongs to
 RPGW (selection policy, pool health) OFP does not reimplement it. See
 [Status](#status) for which side of this contract exists today.
 
+**How an egress is NAMED across the seam** (issue #64). OFP asks with the
+intent and, for `new-egress`, hands back an opaque handle the selector itself
+produced — `Selector.Next(intent, prev) (Selection, bool)`. No egress id, proxy
+URL, address or pool slot is a parameter or a return value: a caller cannot
+request a specific egress, exclude one by name, or read an identity out of a
+selection. OFP resolves the handle it was given only to learn what to dial
+(`Selection.Resolve`), which for a pool-backed selector is the transport
+through which THIS process reaches the pool, never a pool internal. `prev`
+carries the meaning "the egress that served the previous attempt" without the
+caller ever spelling it, so a selector free to define its own handles can
+honour `new-egress` on its own terms.
+
 **Cross-repo dependency (recorded, not invented):** OFP's side of this seam is
 implemented today by `routing.PlanSelector`, which answers the two intents from
 the request's own pinned plan. A pool-backed selector — one that asks RPGW
@@ -437,7 +449,9 @@ an intent from a provider status in its place.
   URL, an IP address, a proxy id, or any pool internal. Egress identity is
   RPGW's private business; across a service boundary the only currency is the
   logical intent (`normal` / `new-egress`) and the transport failure's
-  provenance.
+  provenance. Inside OFP the same rule holds at the selection seam: the
+  selection is an opaque handle, and a caller cannot name an egress even to
+  itself (issue #64).
 - **No status-code inference of request state.** `not_sent` is never derived
   from a status — a status means the request was received, so it can only ever
   produce `response_started`.

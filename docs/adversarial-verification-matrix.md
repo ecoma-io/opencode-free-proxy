@@ -121,15 +121,20 @@ recorded**.
 
 ### R5 — Safe failover moves to a DISTINCT egress, never re-dialing the failed one (and never on `unknown`/`response_started`)
 
-- **Contract:** `new-egress` skips the egress id that just failed; `unknown`
-  and `response_started` authorise nothing; a plan with all-remaining-excluded
-  entries ends the request (no re-dial).
-- **Guard seam:** `internal/routing/intent.go` — PlanSelector.Next skips the
-  excluded id structurally; plan exhaustion honours the exclusion
+- **Contract:** `new-egress` skips the egress the previous selection resolved
+  to — skipped through the opaque `Selection` handle, so no caller names an
+  id (issue #64); `unknown` and `response_started` authorise nothing; a plan
+  with all-remaining-excluded entries ends the request (no re-dial).
+- **Guard seam:** `internal/routing/intent.go` — `PlanSelector.Next` skips the
+  handle's egress structurally; plan exhaustion honours the exclusion
   (`routing.go` selector seam).
 - **Pinned by:** `internal/routing/intent_test.go`
   (TestPlanSelectorExclusionSkipsOverTheFailedEgress,
-  TestPlanSelectorExhaustionHonorsExclusion), `internal/routing/`
+  TestPlanSelectorExhaustionHonorsExclusion,
+  TestSelectorSeamIsImplementableWithoutIdentity,
+  TestForeignSelectionIsBoundedToOneSkip), `internal/upstream/intent_test.go`
+  (TestFailedEgressIsNeverRedialedThroughTheHandle — a repeated plan, a budget
+  that would allow the second dial, and exactly one dial), `internal/routing/`
   `TestNoFallbackAfterProviderStatus`, `internal/upstream/terminal_test.go`.
 - **Evidence the gates recorded:** executor's `new-egress` move lands on egress
   b after a replay-safe a failure, never back on a.
