@@ -38,6 +38,62 @@ var ErrStreamStalled = errors.New("stream stalled")
 // as connect.go's maxConnectHeaderBytes.
 const maxErrorBodyBytes = 1 << 20
 
+// ReadBoundedBody reads up to max bytes of an already-received response body,
+// within config.SecondaryReadTimeout total — whichever bound hits first. The
+// byte cap alone is not enough: once the response headers have arrived the
+// transport's response-HEADER timeout is spent and bounds nothing further, so
+// a peer that streams bytes forever below the cap would pin the caller
+// indefinitely, and the caller never expected a stream — every site reads a
+// fixed-size secondary body (an error envelope, a discarded redirect body, a
+// non-SSE guard) that is truncated either way. Go-side hardening; JS reads
+// error bodies unbounded (utils/error.js:61).
+//
+// On expiry the body is CLOSED (which unblocks the racing reader) and nil is
+// returned: nil is what these paths already mean for an unusable body, so the
+// terminal read falls into parseUpstreamError's raw-text fallback and the
+// drain path aborts the connection. The returned body is the caller's to close
+// on the normal path; the race's Close is idempotent, and http bodies' Close
+// after Close is a no-op. The returned bytes are the caller's; on error (a
+// mid-body transport failure, NOT a stall) whatever prefix arrived is what the
+// unbounded byte cap would have truncated to anyway.
+func ReadBoundedBody(ctx context.Context, body io.ReadCloser, max int) []byte {
+	return readBoundedBody(ctx, body, max, config.SecondaryReadTimeout)
+}
+
+// readBoundedBody is ReadBoundedBody with an injectable total: the callers
+// share the process-wide constant (internal/config owns every runtime
+// constant), while the test below pins the watchdog with a short deadline a
+// never-ending peer can be held against.
+func readBoundedBody(ctx context.Context, body io.ReadCloser, max int, total time.Duration) []byte {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, total)
+	defer cancel()
+	done := make(chan []byte, 1)
+	go func() {
+		raw, _ := io.ReadAll(io.LimitReader(body, int64(max)))
+		select {
+		case done <- raw:
+		case <-ctx.Done():
+		}
+	}()
+	select {
+	case raw := <-done:
+		return raw
+	case <-ctx.Done():
+		// Close unblocks the reader; the caller closes the body on its own
+		// path too, and a second Close is an idempotent no-op on http bodies.
+		// The race's partial prefix is discarded: the expiry already decided
+		// this body is unusable. Closing here is what makes the goroutine
+		// finish (net/http bodies document that Close releases a pending
+		// Read), so it is joined on the runner's own schedule; the buffered
+		// send in the runner keeps that join from ever blocking this branch.
+		_ = body.Close()
+		return nil
+	}
+}
+
 // Client performs ONE upstream call (executors/base.js execute, the
 // single-URL shape this proxy uses): it dials, sends, reads headers, and
 // returns whatever came back. There is no per-URL budget inside it — see
@@ -233,8 +289,10 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 		// real upstream error body is); an over-cap body surfaces truncated,
 		// and since the truncation is no longer valid JSON parseUpstreamError
 		// falls back to the raw capped text — the envelope stays bounded by
-		// construction. Same bound as drainAndClose.
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		// construction. Same bound as drainAndClose, plus the same total
+		// deadline: a peer streaming forever below the cap must not pin this
+		// goroutine either (issue #45 hardening, config.SecondaryReadTimeout).
+		raw := ReadBoundedBody(ctx, resp.Body, maxErrorBodyBytes)
 		_ = resp.Body.Close()
 		// Evidence capture precedes classification: the row's facts are
 		// extracted from the untouched verdict first, so classification (and
@@ -262,10 +320,11 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 
 // drainAndClose reads the rest of a rejected response so the connection can
 // be reused, then closes it. Bounded by maxErrorBodyBytes like the terminal
-// read: a hostile upstream must not be able to pin this goroutine's memory
-// past the drain either.
-func drainAndClose(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyBytes))
+// read, and by the same total deadline: a hostile upstream must not be able to
+// pin this goroutine's memory — or its attention — past the drain either
+// (config.SecondaryReadTimeout).
+func drainAndClose(ctx context.Context, resp *http.Response) {
+	ReadBoundedBody(ctx, resp.Body, maxErrorBodyBytes)
 	_ = resp.Body.Close()
 }
 
@@ -399,11 +458,11 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 		}
 		next, err := req.URL.Parse(loc)
 		if err != nil {
-			drainAndClose(resp)
+			drainAndClose(ctx, resp)
 			return nil, hop, path, fmt.Errorf("redirect: parse Location %q: %w", loc, err)
 		}
 		if next.Scheme != "http" && next.Scheme != "https" {
-			drainAndClose(resp)
+			drainAndClose(ctx, resp)
 			return nil, hop, path, fmt.Errorf("redirect: Location %q is not an HTTP(S) URL", loc)
 		}
 		// Redirect-host allow-list (GHSA-5472-vw5j-wjvg): a redirect may only
@@ -426,7 +485,7 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 		}
 		hops++
 		if hops > config.MaxRedirects {
-			drainAndClose(resp)
+			drainAndClose(ctx, resp)
 			return nil, hop, path, fmt.Errorf("redirect count exceeded (%d)", config.MaxRedirects)
 		}
 		// 301/302 on POST, 303 on anything non-GET/HEAD: the next hop is a
@@ -444,7 +503,7 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 		if !stripSensitive && next.Host != initialHost && !sameDomainOrSub(next.Hostname(), initialHostname) {
 			stripSensitive = true
 		}
-		drainAndClose(resp)
+		drainAndClose(ctx, resp)
 		current = next.String()
 	}
 }

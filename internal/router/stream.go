@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -68,7 +67,11 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	// `[status]: ` prefix (:75-78).
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	if ct != "" && !strings.Contains(ct, "text/event-stream") && !strings.Contains(ct, "application/json") {
-		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxNonSSEBodyBytes))
+		// Bounded by the byte cap AND by a total deadline: the bytes are an
+		// HTML error page the guard only reads to mine a <title>, the stream
+		// was never going to be relayed, and a peer dripping below the cap
+		// forever must not pin this goroutine (config.SecondaryReadTimeout).
+		bodyText := upstream.ReadBoundedBody(r.Context(), resp.Body, maxNonSSEBodyBytes)
 		short := shortHTMLMessage(string(bodyText), ct)
 		ev.StreamAbort(egID, resp.StatusCode, delivered, "non_sse_body", time.Since(started).Milliseconds())
 		writeBareStreamError(w, resp.StatusCode, fmt.Sprintf("[%d]: %s", resp.StatusCode, short))
