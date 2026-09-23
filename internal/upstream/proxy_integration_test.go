@@ -979,7 +979,7 @@ func TestRedirectCapIsUndiciTwenty(t *testing.T) {
 	defer chain.Close()
 
 	c := noSleepClient(NewClientFor(nil)) // direct egress client: manual walk
-	resp, err := c.attempt(context.Background(), chain.URL+"/zen/v1/chat/completions", nil, []byte("{}"))
+	resp, _, err := c.attempt(context.Background(), &callTrace{}, chain.URL+"/zen/v1/chat/completions", nil, []byte("{}"))
 	if resp != nil {
 		_ = resp.Body.Close()
 	}

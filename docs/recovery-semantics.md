@@ -39,16 +39,30 @@ on; the next section defines it.
 ```text
 not_sent          the request provably never left this process
 unknown           the request may or may not have reached the provider
-response_started  the provider answered — the request was received
+response_started  a response arrived — the provider answered, or an earlier
+                  hop of the same logical attempt was answered
 ```
+
+**The state is a property of the logical attempt, not of its last hop**
+(issue #60). An attempt that follows a redirect performs several dials and
+several writes under one intent, and the state is claimed about all of them:
+once any hop has transmitted a request byte, no later hop's failure may
+report `not_sent`, and once any hop has been answered, a later hop's transport
+failure is `response_started` — the failing hop produced no response, but the
+attempt is known to have reached a responder.
 
 The obligations are asymmetric, and deliberately so:
 
-| State              | Means                                     | Recovery                                            |
-| ------------------ | ----------------------------------------- | --------------------------------------------------- |
-| `not_sent`         | Provable. Testable. Not a guess.          | egress failover **MAY** be attempted                |
-| `unknown`          | The process cannot say.                   | **no automatic replay, ever** — surface the failure |
-| `response_started` | The provider answered; a response exists. | **never** replayable. The response is terminal      |
+| State              | Means                                                        | Recovery                                            |
+| ------------------ | ------------------------------------------------------------ | --------------------------------------------------- |
+| `not_sent`         | Provable, for the whole attempt. Testable. Not a guess.      | egress failover **MAY** be attempted                |
+| `unknown`          | The process cannot say.                                      | **no automatic replay, ever** — surface the failure |
+| `response_started` | A response existed on this attempt; the request was received | **never** replayable. The response is terminal      |
+
+The state machine is **monotonic**: an attempt never returns to `not_sent`
+after leaving it. A hop that dialed successfully and wrote nothing reports
+`not_sent` only while no earlier hop wrote either — the claim is about the
+attempt, and the attempt's history is what the classifier reads.
 
 `not_sent ⇒ failover MAY` is a permission, not an instruction. `unknown ⇒ no
 replay` is absolute: an unproven state is not a weak `not_sent`, it is the
@@ -76,18 +90,24 @@ that layer cannot prove what left the socket.
 | Response header wait                             | `net/http` | **no**    |
 | Response body                                    | `net/http` | **no**    |
 
-Two consequences that are easy to get wrong:
+Three consequences that are easy to get wrong:
 
 1. **A pooled connection performs no dial at all.** A failure on a connection
    the client already had is `unknown`, never `not_sent` — there is no phase
    to attribute and nothing to prove.
 2. **A failed write is not a pre-transmission failure.** A write that errors
    partway may have transmitted a prefix. An _attempted_ write closes the
-   `not_sent` door permanently for that attempt.
+   `not_sent` door permanently for the attempt, and for every hop after it.
+3. **A redirect hop's failure is judged with the hops before it.** A dial
+   failure on hop 2 of a chain whose hop 1 already transmitted is not
+   `not_sent`: the request has been on the wire and the provider answered it
+   with the redirect. Judging each hop on its own records would re-send a
+   request the provider has already handled (issue #60).
 
-Both are implemented as structural properties of the transport boundary, not
-as care taken by the classifier: `not_sent` is produced only from a recorded
-dial phase, and an attempt with no dial degrades to `unknown`. See
+All three are implemented as structural properties of the transport boundary,
+not as care taken by the classifier: `not_sent` is produced only from a
+recorded dial phase, an attempt with no dial degrades to `unknown`, and the
+request-byte record is monotonic across the attempt's hops. See
 [Provenance](architecture.md#transport-failure-provenance).
 
 ## Safe egress failover

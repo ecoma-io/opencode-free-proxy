@@ -95,10 +95,21 @@ The semantics agents most often get wrong:
    and ends the request on the egress that produced it; `fallback.max_attempts`
    bounds DISTINCT egresses, not provider requests. Only a failure that
    provably preceded the request byte may move the request on
-   (`Failure.ReplaySafe()`). This is a deliberate behaviour change — do not
+   (`Failure.ReplaySafe()`). The delivery record is the LOGICAL CALL's and is
+   monotonic across its hops (issue #60): once any hop has handed a request
+   byte to a connection, no later hop's dial failure may claim `not_sent`,
+   and a hop that fails after an answered redirect reports `response_started`
+   — the request is already on the wire and the provider already answered it.
+   Request bytes are observed with a per-request `httptrace.WroteRequest`
+   hook (`internal/upstream/provenance.go`), never by wrapping connections —
+   a wrap sees only the conns this call dialed, so a write over a pooled
+   connection would be invisible, and it counts proxy TLS bytes as request
+   bytes. This is a deliberate behaviour change — do not
    reintroduce status-keyed retry, shared retry budgets, or retry-delay
    tables. Pinned by `internal/upstream/terminal_test.go` (every status in
-   the table → exactly one upstream request), the router's
+   the table → exactly one upstream request), `logical_call_test.go`
+   (pooled hop 1 → 307 → hop 2 dial refusal → one attempt, no duplicate POST),
+   the router's
    `TestNoFallbackAfterProviderStatus` / `TestUpstreamErrorEvent429Terminal`,
    and the black-box `TestEgress429IsTerminalAndMarksNoHealth` /
    `TestEvidence429TerminalReconstructsFromLogs`.
@@ -130,7 +141,10 @@ The semantics agents most often get wrong:
     `internal/router/provenance_header.go`). Anything that came out of the
     upstream attempt path carries `X-OFP-Failure-Origin` (`upstream` |
     `gateway`), with `X-OFP-Failure-Phase` and `X-OFP-Request-State` on
-    gateway-origin responses only. The label is read off the returned
+    gateway-origin responses only (`not_sent` | `unknown` |
+    `response_started` — the last means the logical call had been answered
+    before the hop that failed, e.g. by a followed redirect, issue #60; all
+    three are read off the `Failure`, never off the status). The label is read off the returned
     `Failure` — NEVER off the status that is about to be written, because a
     provider 502 and a synthesized 502 are the same number. A local error
     (bad body, unknown model, draining) and a client cancellation carry no

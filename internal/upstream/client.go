@@ -192,15 +192,15 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 	// base.js:127-130, where transformRequest and buildHeaders re-run per
 	// attempt, so a fresh x-opencode-request id is forged for each one.
 	headers := buildHeaders()
-	// One dial trace per dial — it describes THIS connection. The trace reaches
-	// the dialers through the request context: net/http builds its dial context
-	// with context.WithoutCancel, which retains VALUES, so a custom
-	// DialContext/DialTLSContext sees it (provenance.go). A redirect hop's
-	// dials share the trace of the logical call, whose state is monotonic
-	// (once a request byte is written, not_sent is gone for good).
-	attemptCtx, trace := withDialTrace(ctx)
+	// One logical call, one monotonic delivery record; one trace per hop. The
+	// hop trace reaches the dialers through the request context (net/http
+	// builds its dial context with context.WithoutCancel, which retains VALUES,
+	// so a custom DialContext/DialTLSContext sees it); the call record is what
+	// keeps a later hop from re-claiming not_sent after an earlier hop already
+	// transmitted (provenance.go, issue #60).
+	call := &callTrace{}
 	started := c.Now()
-	resp, netErr := c.attempt(attemptCtx, url, headers, bodyJSON)
+	resp, hop, netErr := c.attempt(ctx, call, url, headers, bodyJSON)
 	dur := c.Now().Sub(started)
 	if netErr != nil {
 		// The [502] status is only the client-facing envelope — the class is
@@ -219,7 +219,7 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 		// fetch failures" — so the JS client envelope carries the dial address
 		// exactly as this message carries the (credential-redacted) egress
 		// host:port. Accepted parity.
-		failure := classifyTransportFailure(attemptCtx, netErr, trace)
+		failure := classifyTransportFailure(ctx, netErr, hop)
 		appendTransportRow(rec, dur, failure, netErr)
 		return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, failure
 	}
@@ -300,7 +300,13 @@ func (c *Client) CloseIdleConnections() {
 //
 // The mid-chain responses are drained bounded (drainAndClose) and closed;
 // their bodies are never surfaced.
-func (c *Client) attempt(ctx context.Context, url string, headers map[string]string, bodyJSON []byte) (*http.Response, error) {
+//
+// The last hop's dial trace is returned alongside the verdict: it is the only
+// place the hop's dial facts live, and the caller classifies the failure with
+// them (provenance.go). One hop of this chain reports its own dial, never an
+// earlier hop's — that conflation is issue #60.
+func (c *Client) attempt(ctx context.Context, call *callTrace, url string, headers map[string]string, bodyJSON []byte) (*http.Response, *dialTrace, error) {
+	var hop *dialTrace
 	method := http.MethodPost
 	// Sticky per-chain state, both mirroring net/http's do loop: once the
 	// chain leaves the initial domain the sensitive headers stay stripped
@@ -316,9 +322,14 @@ func (c *Client) attempt(ctx context.Context, url string, headers map[string]str
 		if !droppedBody && bodyJSON != nil {
 			body = bytes.NewReader(bodyJSON)
 		}
-		req, err := http.NewRequestWithContext(ctx, method, current, body)
+		// Each hop gets its own record and its own write hook; both hang off
+		// the call's monotonic record, so a hop can prove what IT did and can
+		// never claim a state the call has already moved past (issue #60).
+		hopCtx, hopTrace := withHopTrace(ctx, call)
+		hop = hopTrace
+		req, err := http.NewRequestWithContext(hopCtx, method, current, body)
 		if err != nil {
-			return nil, err
+			return nil, hop, err
 		}
 		if initialHost == "" {
 			initialHost = req.URL.Host
@@ -343,35 +354,41 @@ func (c *Client) attempt(ctx context.Context, url string, headers map[string]str
 			if req.URL.Scheme == "https" && c.tunneled != nil {
 				client = c.tunneled
 			}
-			return client.Do(req)
+			resp, err := client.Do(req)
+			return resp, hop, err
 		}
 		resp, err := c.roundTrip(req)
 		if err != nil {
-			return nil, err
+			return nil, hop, err
 		}
 		if !isRedirectStatus(resp.StatusCode) {
-			return resp, nil
+			return resp, hop, nil
 		}
+		// A redirect is a response this logical call received. Recorded before
+		// anything else looks at it, because it is a fact about the CALL: the
+		// hops that follow this one inherit it, and none of them may claim the
+		// request was never sent (issue #60).
+		call.noteResponse()
 		loc := resp.Header.Get("Location")
 		if loc == "" {
 			// A 3xx without Location is the answer, not a hop — undici
 			// returns it (fetch/index.js:1233-1237), net/http too
 			// (client.go:643-649). The caller decides what a 3xx body means.
-			return resp, nil
+			return resp, hop, nil
 		}
 		next, err := req.URL.Parse(loc)
 		if err != nil {
 			drainAndClose(resp)
-			return nil, fmt.Errorf("redirect: parse Location %q: %w", loc, err)
+			return nil, hop, fmt.Errorf("redirect: parse Location %q: %w", loc, err)
 		}
 		if next.Scheme != "http" && next.Scheme != "https" {
 			drainAndClose(resp)
-			return nil, fmt.Errorf("redirect: Location %q is not an HTTP(S) URL", loc)
+			return nil, hop, fmt.Errorf("redirect: Location %q is not an HTTP(S) URL", loc)
 		}
 		hops++
 		if hops > config.MaxRedirects {
 			drainAndClose(resp)
-			return nil, fmt.Errorf("redirect count exceeded (%d)", config.MaxRedirects)
+			return nil, hop, fmt.Errorf("redirect count exceeded (%d)", config.MaxRedirects)
 		}
 		// 301/302 on POST, 303 on anything non-GET/HEAD: the next hop is a
 		// body-less GET (undici fetch/index.js:1290-1306; net/http
