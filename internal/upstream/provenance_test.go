@@ -253,6 +253,26 @@ func TestRequestStateNeverClaimsNotSentWithoutADial(t *testing.T) {
 			wantState: RequestStateUnknown,
 		},
 		{
+			// The fixed case (F3-B): a hop served by a POOLED connection
+			// performed no dial, so its own record attributes nothing — but the
+			// call's history still forbids a fresh state. A later hop failing on
+			// a reused conn after the call was transmitted and ANSWERED inherits
+			// response_started; after an unanswered transmit, unknown is still
+			// the call's state — never a premature not_sent.
+			name:      "pooled conn failure after the call transmitted and answered",
+			trace:     &dialTrace{call: transmittedCall(true)},
+			err:       errors.New("connection reset by peer"),
+			wantPhase: FailurePhaseNone,
+			wantState: RequestStateResponseStarted,
+		},
+		{
+			name:      "pooled conn failure after the call transmitted unanswered",
+			trace:     &dialTrace{call: transmittedCall(false)},
+			err:       errors.New("connection reset by peer"),
+			wantPhase: FailurePhaseNone,
+			wantState: RequestStateUnknown,
+		},
+		{
 			name:      "no trace at all (caller bypassed the wrapper)",
 			trace:     nil,
 			err:       errors.New("connection reset by peer"),
