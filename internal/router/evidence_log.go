@@ -168,6 +168,20 @@ func (e *evidenceLog) emitError(row upstream.Row, dropped int) {
 		evt.Int("status", row.Status)
 	}
 	evt.Str("class", row.Class)
+	// Failure provenance (issue #51): which side of the wire failed, at which
+	// step of the egress path, and what the transport can prove about whether
+	// the request went out. Rendered under distinct keys — `phase` is already
+	// the ROW's lifecycle phase (response|transport|skip|stream|forced), a
+	// different axis. Absent when there is nothing to attribute.
+	if row.Origin != "" {
+		evt.Str("origin", row.Origin)
+	}
+	if row.FailurePhase != "" {
+		evt.Str("failure_phase", row.FailurePhase)
+	}
+	if row.RequestState != "" {
+		evt.Str("request_state", row.RequestState)
+	}
 	if row.Reason != "" {
 		evt.Str("reason", row.Reason)
 	}
@@ -251,14 +265,17 @@ func (e *evidenceLog) emitSkip(row upstream.Row, dropped int) {
 // the failure phase, never an HTTP verdict about the dial — no health
 // observation, no fallback, and the already-delivered status is recorded as
 // status, never rewritten into a 4xx/5xx.
-func (e *evidenceLog) StreamAbort(egress string, deliveredStatus int, reason string, durMS int64) {
+func (e *evidenceLog) StreamAbort(egress string, deliveredStatus int, origin upstream.Origin, reason string, durMS int64) {
 	e.appendAndEmit(upstream.Row{
-		Phase:      upstream.PhaseStream,
-		Egress:     egress,
-		Status:     deliveredStatus,
-		Class:      upstream.ClassResponseStarted.String(),
-		Reason:     reason,
-		DurationMS: durMS,
+		Phase:        upstream.PhaseStream,
+		Egress:       egress,
+		Status:       deliveredStatus,
+		Class:        upstream.ClassResponseStarted.String(),
+		Origin:       origin.String(),
+		FailurePhase: upstream.FailurePhaseResponseBody.String(),
+		RequestState: upstream.RequestStateResponseStarted.String(),
+		Reason:       reason,
+		DurationMS:   durMS,
 	})
 }
 
@@ -267,14 +284,17 @@ func (e *evidenceLog) StreamAbort(egress string, deliveredStatus int, reason str
 // the response STARTED with — the client keeps seeing the generic 502, but a
 // phase row records what the upstream did, never the synthesized client
 // verdict; the reason travels only here.
-func (e *evidenceLog) ForcedAbort(egress string, upstreamStatus int, reason string, durMS int64) {
+func (e *evidenceLog) ForcedAbort(egress string, upstreamStatus int, origin upstream.Origin, reason string, durMS int64) {
 	e.appendAndEmit(upstream.Row{
-		Phase:      upstream.PhaseForced,
-		Egress:     egress,
-		Status:     upstreamStatus,
-		Class:      upstream.ClassResponseStarted.String(),
-		Reason:     reason,
-		DurationMS: durMS,
+		Phase:        upstream.PhaseForced,
+		Egress:       egress,
+		Status:       upstreamStatus,
+		Class:        upstream.ClassResponseStarted.String(),
+		Origin:       origin.String(),
+		FailurePhase: upstream.FailurePhaseResponseBody.String(),
+		RequestState: upstream.RequestStateResponseStarted.String(),
+		Reason:       reason,
+		DurationMS:   durMS,
 	})
 }
 

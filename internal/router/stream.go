@@ -64,7 +64,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	if ct != "" && !strings.Contains(ct, "text/event-stream") && !strings.Contains(ct, "application/json") {
 		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxNonSSEBodyBytes))
 		short := shortHTMLMessage(string(bodyText), ct)
-		ev.StreamAbort(egID, resp.StatusCode, "non_sse_body", time.Since(started).Milliseconds())
+		ev.StreamAbort(egID, resp.StatusCode, upstream.OriginUpstream, "non_sse_body", time.Since(started).Milliseconds())
 		writeBareStreamError(w, resp.StatusCode, fmt.Sprintf("[%d]: %s", resp.StatusCode, short))
 		return
 	}
@@ -86,7 +86,8 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	// ctx cancellation releases the upstream connection on stall/teardown.
 	lineErr := upstream.ScanLines(r.Context(), resp.Body, config.StreamStall, streamRelay.ProcessLine, streamRelay.ProcessTail)
 	if lineErr != nil {
-		ev.StreamAbort(egID, resp.StatusCode, streamAbortReason(r.Context(), lineErr), time.Since(started).Milliseconds())
+		origin, reason := streamAbortReason(r.Context(), lineErr)
+		ev.StreamAbort(egID, resp.StatusCode, origin, reason, time.Since(started).Milliseconds())
 		// Stall, transport failure, or client disconnect mid-stream: a
 		// Responses passthrough client still needs a parseable terminal.
 		if isResponsesPassthrough {
@@ -101,18 +102,26 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, resp *http.Respo
 	}
 }
 
-// streamAbortReason reduces a ScanLines failure to its bounded phase label:
-// the request context died (client disconnected), the stall watchdog fired
-// (ScanLines' "stream stalled:" sentinel), or the body read itself errored.
-// A label, never a message — the raw error text can carry topology.
-func streamAbortReason(ctx context.Context, err error) string {
+// streamAbortReason reduces a ScanLines failure to the side it belongs to and
+// its bounded phase label: the request context died (client disconnected), the
+// stall watchdog fired (ScanLines' typed ErrStreamStalled sentinel), or the
+// body read itself errored. A label, never a message — the raw error text can
+// carry topology.
+//
+// The origin is returned alongside because a mid-stream death is normally the
+// provider's (OriginUpstream) but a client disconnect is the CALLER's — and
+// the evidence row must not blame the egress for the caller leaving.
+func streamAbortReason(ctx context.Context, err error) (upstream.Origin, string) {
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-		return "client_disconnect"
+		return upstream.OriginClient, "client_disconnect"
 	}
-	if strings.HasPrefix(err.Error(), "stream stalled:") {
-		return "stall"
+	// Typed, not text-matched: ScanLines wraps its own sentinel
+	// (upstream.ErrStreamStalled), so the watchdog is recognisable without
+	// probing a message string (issue #6 discipline).
+	if errors.Is(err, upstream.ErrStreamStalled) {
+		return upstream.OriginUpstream, "stall"
 	}
-	return "read_error"
+	return upstream.OriginUpstream, "read_error"
 }
 
 // shortHTMLMessage sanitizes an upstream HTML error page into a short

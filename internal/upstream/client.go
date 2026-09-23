@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,13 @@ import (
 	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/jsonx"
 )
+
+// ErrStreamStalled is ScanLines' stall sentinel: the upstream sent no bytes
+// for the whole stall window. Exported and typed so a caller can recognise the
+// watchdog without probing the message text — the phase label a stall earns in
+// the evidence stream must come from the boundary that raised it, not from
+// strings.HasPrefix on an error (issue #6 discipline).
+var ErrStreamStalled = errors.New("stream stalled")
 
 // maxErrorBodyBytes caps how much of a terminal error response is read for
 // the client-facing message (parseUpstreamError) and how much of a rejected
@@ -104,8 +112,10 @@ func NewClient() *Client {
 		Transport: &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
-			DialContext:           dialer.DialContext,
-			DialTLSContext:        originTLSDialer(dialer.DialContext, func() *tls.Config { return c.TLSConfig }),
+			// Same provenance wrapping as NewClientFor (transport.go): one
+			// wrapper per dial function, at its outermost layer.
+			DialContext:    recordingDialer(FailurePhaseTargetConnect, dialer.DialContext),
+			DialTLSContext: recordingDialer(FailurePhaseTargetConnect, originTLSDialer(dialer.DialContext, func() *tls.Config { return c.TLSConfig })),
 		},
 	}
 	return c
@@ -178,8 +188,16 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 	for {
 		headers := buildHeaders()
 		dial++
+		// One dial trace per DIAL, not per call: the matrix may dial several
+		// times inside this loop, and each dial's provenance describes its own
+		// connection (the second dial of a retried 502 must not inherit the
+		// first one's failure). The trace reaches the dialers through the
+		// request context — net/http builds its dial context with
+		// context.WithoutCancel, which retains VALUES, so a custom
+		// DialContext/DialTLSContext sees it (provenance.go).
+		attemptCtx, trace := withDialTrace(ctx)
 		started := c.Now()
-		resp, netErr := c.attempt(ctx, url, headers, bodyJSON)
+		resp, netErr := c.attempt(attemptCtx, url, headers, bodyJSON)
 		dur := c.Now().Sub(started)
 		if netErr != nil {
 			// Network/fetch exceptions map to the 502 retry rule
@@ -191,16 +209,17 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 			// errors only: a proxy CONNECT refusal carries a proxyAuthError
 			// marker from connect.go/socks5.go, so no error-text probing is
 			// involved.
-			class := classifyNetErrFor(ctx, netErr)
+			failure := classifyTransportFailure(attemptCtx, netErr, trace)
+			class := failure.Class
 			if class == ClassProxyAuthError {
 				// Deliberate divergence from the JS matrix (documented in
 				// issue #6): proxy-auth is terminal for THIS egress — one
 				// dial, no budget consumption, immediate executor fallback.
-				appendTransportRow(rec, dial, dur, used, false, 0, class, netErr)
+				appendTransportRow(rec, dial, dur, used, false, 0, failure, netErr)
 				return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 			}
 			if c.tryRetry(ctx, &used, config.RetryRules[502]) {
-				appendTransportRow(rec, dial, dur, used, true, config.RetryRules[502].Delay, class, netErr)
+				appendTransportRow(rec, dial, dur, used, true, config.RetryRules[502].Delay, failure, netErr)
 				continue
 			}
 			// Surfacing the raw transport text is PARITY, topology
@@ -212,7 +231,7 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 			// for diagnosing fetch failures" — so the JS client envelope
 			// carries the dial address exactly as this message carries the
 			// (credential-redacted) egress host:port. Accepted parity.
-			appendTransportRow(rec, dial, dur, used, false, 0, class, netErr)
+			appendTransportRow(rec, dial, dur, used, false, 0, failure, netErr)
 			return nil, &UpstreamError{Status: 502, Message: netErr.Error()}, class
 		}
 		if rule, retryable := config.RetryRules[resp.StatusCode]; retryable && rule.Attempts > 0 {
@@ -223,7 +242,7 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 				// destroys it — headers-only: the body is about to be drained
 				// unread, and re-reading it for a row the terminal dial will
 				// out-detail is not worth the second pass over the wire.
-				appendResponseRow(rec, dial, dur, used, true, rule.Delay, resp.StatusCode, resp.Header, nil, nil, classifyStatusFor(resp.StatusCode))
+				appendResponseRow(rec, dial, dur, used, true, rule.Delay, resp.StatusCode, resp.Header, nil, nil, statusFailure(resp.StatusCode))
 				drainAndClose(resp)
 				continue
 			}
@@ -246,9 +265,9 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 			// (and the error envelope reduction that follows) can never be
 			// the place upstream information is lost.
 			uerr := parseUpstreamError(resp.StatusCode, raw)
-			class := classifyStatusFor(resp.StatusCode)
-			appendResponseRow(rec, dial, dur, used, false, 0, resp.StatusCode, resp.Header, raw, uerr, class)
-			return nil, uerr, class
+			failure := statusFailure(resp.StatusCode)
+			appendResponseRow(rec, dial, dur, used, false, 0, resp.StatusCode, resp.Header, raw, uerr, failure)
+			return nil, uerr, failure.Class
 		}
 		return resp, nil, ClassSuccess
 	}
@@ -709,7 +728,8 @@ func ScanLines(ctx context.Context, body io.Reader, stall time.Duration, fn func
 			// (streamHandler.js:179,185-186): reset on byte progress alone.
 			reset()
 		case <-timer.C:
-			return fmt.Errorf("stream stalled: no SSE data for %s", stall)
+			// %w keeps the sentence byte-identical while making it typed.
+			return fmt.Errorf("%w: no SSE data for %s", ErrStreamStalled, stall)
 		case <-ctx.Done():
 			return ctx.Err()
 		}

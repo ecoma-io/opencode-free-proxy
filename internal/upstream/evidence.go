@@ -102,6 +102,22 @@ type Row struct {
 	Fingerprint string
 	RateLimit   *RateLimit
 
+	// Origin / FailurePhase / RequestState are the failure's provenance
+	// (provenance.go, issue #51): which side of the wire failed, at which step
+	// of the egress path, and what the transport can prove about whether the
+	// request went out. Origin is empty on a row that has no failure to
+	// attribute (a skip); FailurePhase is empty when attribution is
+	// impossible (a pooled-connection failure, a post-dial failure whose type
+	// carries no direction); RequestState is always one of
+	// unknown/not_sent/response_started.
+	//
+	// These fields are OBSERVATIONAL in this build: the retry/health/fallback
+	// decisions still read Class. They are recorded now because provenance
+	// cannot be reconstructed after the fact from a log that never had it.
+	Origin       string
+	FailurePhase string
+	RequestState string
+
 	// MatrixDraws is the per-egress shared retry budget consumed through
 	// this dial; Retried marks that THIS dial was retried (set only after
 	// tryRetry decided — a row never claims a retry before the matrix made
@@ -490,8 +506,11 @@ func ExtractRateLimit(h http.Header) *RateLimit {
 // class into the errType slot so a timeout and a connection refusal never
 // collide, and NormalizeMessage strips the dial address so the same logical
 // failure through a different egress fingerprints identically. retried is set
-// only by callers that already saw tryRetry succeed.
-func appendTransportRow(rec *Recorder, dial int, dur time.Duration, draws int, retried bool, delay time.Duration, class Class, err error) {
+// only by callers that already saw tryRetry succeed. failure carries the
+// provenance (origin/phase/request_state) alongside the class — the class
+// still drives the decision tables, the provenance is recorded for the
+// contract that will.
+func appendTransportRow(rec *Recorder, dial int, dur time.Duration, draws int, retried bool, delay time.Duration, failure Failure, err error) {
 	if rec == nil {
 		return
 	}
@@ -502,9 +521,12 @@ func appendTransportRow(rec *Recorder, dial int, dur time.Duration, draws int, r
 	rec.Append(Row{
 		Phase:         PhaseTransport,
 		Dial:          dial,
-		Class:         class.String(),
+		Class:         failure.Class.String(),
+		Origin:        failure.Origin.String(),
+		FailurePhase:  failure.Phase.String(),
+		RequestState:  failure.RequestState.String(),
 		Message:       sanitizeEvidence(err.Error(), config.EvidenceMessageBytes),
-		Fingerprint:   Fingerprint(0, class.String(), "", err.Error()),
+		Fingerprint:   Fingerprint(0, failure.Class.String(), "", err.Error()),
 		DurationMS:    dur.Milliseconds(),
 		MatrixDraws:   draws,
 		Retried:       retried,
@@ -524,7 +546,7 @@ func appendTransportRow(rec *Recorder, dial int, dur time.Duration, draws int, r
 // fake fields it did not see — while the terminal dial carries the full
 // status|type|code|message key. Each shape's key is stable across requests,
 // so grouping works per shape; the message field disambiguates within it.
-func appendResponseRow(rec *Recorder, dial int, dur time.Duration, draws int, retried bool, delay time.Duration, status int, h http.Header, raw []byte, uerr *UpstreamError, class Class) {
+func appendResponseRow(rec *Recorder, dial int, dur time.Duration, draws int, retried bool, delay time.Duration, status int, h http.Header, raw []byte, uerr *UpstreamError, failure Failure) {
 	if rec == nil {
 		return
 	}
@@ -544,7 +566,10 @@ func appendResponseRow(rec *Recorder, dial int, dur time.Duration, draws int, re
 		Phase:         PhaseResponse,
 		Dial:          dial,
 		Status:        status,
-		Class:         class.String(),
+		Class:         failure.Class.String(),
+		Origin:        failure.Origin.String(),
+		FailurePhase:  failure.Phase.String(),
+		RequestState:  failure.RequestState.String(),
 		ErrType:       sanitizeEvidence(et, 64),
 		ErrCode:       sanitizeEvidence(ec, 64),
 		Message:       msg,

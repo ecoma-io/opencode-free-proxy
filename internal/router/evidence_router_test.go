@@ -138,12 +138,18 @@ func TestUpstreamErrorEvent429Terminal(t *testing.T) {
 		t.Fatalf("attempt_id = %q, want %s/1", got, reqID)
 	}
 	for key, want := range map[string]any{
-		"attempt":               float64(1),
-		"phase":                 "response",
-		"egress":                "a",
-		"egress_type":           "direct",
-		"status":                float64(429),
-		"class":                 "upstream_429",
+		"attempt":     float64(1),
+		"phase":       "response",
+		"egress":      "a",
+		"egress_type": "direct",
+		"status":      float64(429),
+		"class":       "upstream_429",
+		// Provenance (issue #51): an HTTP verdict is the provider's answer, and
+		// a response existing PROVES the request was received — never a replay
+		// candidate.
+		"origin":                "upstream",
+		"failure_phase":         "response_headers",
+		"request_state":         "response_started",
 		"error_type":            "rate_limit_error",
 		"message":               "rate limited",
 		"retry_after":           "17",
