@@ -131,23 +131,19 @@ const (
 	TLSHandshakeTimeout = 60 * time.Second
 )
 
-// Retry matrix per upstream status: attempts/delay (default executor rules —
-// note 429 is deliberately NOT retried: the free tier must fail fast).
-type RetryRule struct {
-	Attempts int
-	Delay    time.Duration
-}
-
-var RetryRules = map[int]RetryRule{
-	429: {Attempts: 0, Delay: 0},
-	502: {Attempts: 3, Delay: 3 * time.Second},
-	503: {Attempts: 3, Delay: 2 * time.Second},
-	504: {Attempts: 2, Delay: 3 * time.Second},
-}
+// There is deliberately NO retry matrix here. The JS router retried upstream
+// STATUSES inside one egress (base.js:104-125, the retryAttemptsByUrl budget)
+// and this port carried that table as RetryRules until the recovery-ownership
+// split made it wrong: a provider HTTP response of any status means the
+// provider received the request and answered it, so OFP relays it. Provider-
+// level retry belongs to the Injector (docs/recovery-semantics.md), and an
+// egress is left only for a failure that provably happened before the request
+// was sent — a policy, not a table.
 
 // MaxRedirects is how many redirects ONE upstream attempt follows before
-// giving up with a network-class error (which then rides the normal 502
-// retry rule, exactly like any other fetch exception in base.js:173-178).
+// giving up with a network-class error. A redirect hop is not a retry: the
+// chain is one logical request, followed hop by hop, and the failure that
+// ends it is whatever the last hop's transport reported.
 // The JS router's fetch is undici under a ProxyAgent dispatcher
 // (utils/proxyFetch.js getDispatcher → originalFetch(url, {dispatcher})),
 // and undici caps the chain at twenty: `if (request.redirectCount === 20)
@@ -221,10 +217,10 @@ const (
 // Upstream-error evidence bounds (internal/upstream/evidence.go). These cap
 // the observational forensics layer — a hostile upstream (or a hostile error
 // body) must never be able to grow log-line or recorder memory without limit.
-// The row cap is sized for the default budget (3 egresses × full retry
-// matrices plus scheduling skips); an operator-raised fallback budget can
-// outgrow it, and overflow then lands in the dropped counter surfaced on the
-// last event — bounded by design, visible when it happens.
+// The row cap is sized for the default budget (3 egresses × one row each,
+// plus scheduling skips); an operator-raised fallback budget can outgrow it,
+// and overflow then lands in the dropped counter surfaced on the last event —
+// bounded by design, visible when it happens.
 const (
 	// EvidenceMaxRows bounds the rows one request's recorder keeps; beyond it
 	// appends are counted in a dropped counter instead of stored.

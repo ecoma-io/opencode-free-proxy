@@ -54,15 +54,15 @@ func wantProvenance(t *testing.T, row Row, origin, phase, state string) {
 	}
 }
 
-// noSleepClientFor builds an egress client whose retry sleeps are stubbed, so
-// the multi-dial hardening cases below do not pay the matrix's wall clock.
+// noSleepClientFor builds the egress client the provenance cases dial with.
+// (It used to stub the retry sleep; one call per attempt leaves nothing to
+// stub — the name is kept because it is what the cases below read as.)
 func noSleepClientFor(t *testing.T, p *config.Proxy) *Client {
 	t.Helper()
 	c, err := NewClientFor(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Sleep = func(time.Duration) {}
 	return c
 }
 
@@ -201,7 +201,7 @@ func TestResponseHeaderTimeoutIsUnknownNotNotSent(t *testing.T) {
 	// production value is config.ConnectTimeout (60s) and is not compressible
 	// from a test.
 	dialer := &net.Dialer{Timeout: config.DialTimeout}
-	c := &Client{Sleep: func(time.Duration) {}, Now: time.Now}
+	c := &Client{Now: time.Now}
 	c.HTTP = &http.Client{Transport: &http.Transport{
 		ResponseHeaderTimeout: 200 * time.Millisecond,
 		IdleConnTimeout:       config.IdleConnTimeout,

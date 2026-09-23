@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/rs/zerolog"
 
@@ -34,7 +33,6 @@ type Server struct {
 	UA        *identity.UserAgentCache
 	Draining  atomic.Bool
 
-	sleep    func(time.Duration)
 	clientMu sync.Mutex
 	clients  map[string]*upstream.Client
 	// prunedGen is the last generation whose transport cache was pruned
@@ -45,12 +43,10 @@ type Server struct {
 }
 
 // NewServer wires the multi-egress machinery. store may be a live poller
-// (OCFP_CONFIG set) or the default direct runtime. sleep nil → time.Sleep
-// (tests pass a no-op to keep retry matrices fast).
-func NewServer(store *config.Store, ua *identity.UserAgentCache, direct *upstream.Client, logger any, sleep func(time.Duration)) *Server {
-	if sleep == nil {
-		sleep = time.Sleep
-	}
+// (OCFP_CONFIG set) or the default direct runtime. There is no sleep seam any
+// more: it existed to stub the retry matrix's delays, and this proxy no
+// longer waits on purpose anywhere.
+func NewServer(store *config.Store, ua *identity.UserAgentCache, direct *upstream.Client, logger any) *Server {
 	s := &Server{
 		Store:     store,
 		Scheduler: routing.NewScheduler(),
@@ -58,7 +54,6 @@ func NewServer(store *config.Store, ua *identity.UserAgentCache, direct *upstrea
 		Slots:     upstream.NewLimiter(),
 		Upstream:  direct,
 		UA:        ua,
-		sleep:     sleep,
 		clients:   map[string]*upstream.Client{},
 		log:       logging.Resolve(logger),
 	}
@@ -103,7 +98,6 @@ func (s *Server) clientForEgress(e *config.Egress) (*upstream.Client, bool) {
 		s.log.Warn().Str("egress", e.ID).Err(err).Msg("egress transport setup failed")
 		return nil, false
 	}
-	c.Sleep = s.sleep
 	s.clients[sig] = c
 	return c, true
 }

@@ -416,7 +416,9 @@ func TestOriginHandshakeRoundTripSocks(t *testing.T) {
 	pool.AddCert(srv.Certificate())
 	c.TLSConfig = &tls.Config{RootCAs: pool}
 
-	resp, uerr, class := c.DoClassified(context.Background(), srv.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), srv.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+
+	class := failure.Class
 	if uerr != nil || class != ClassSuccess {
 		t.Fatalf("uerr=%v class=%s, want a served round-trip through the socks tunnel in the official hello", uerr, class)
 	}

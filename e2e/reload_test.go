@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -159,24 +160,15 @@ func fwdProxy(handler http.HandlerFunc) *httptest.Server {
 const streamBody = `{"model":"qwen3-coder-free","stream":true}`
 
 // TestReloadRaceKeepsInFlightPlan: request 1 pins generation 1 (route a,b);
-// while a's proxy holds the request open, the config file swaps to
+// while a's proxy holds the request's dial open, the config file swaps to
 // generation 2 (route c); the in-flight request still falls back to the
 // GENERATION-1 b and never dials c; the NEXT request uses c.
 func TestReloadRaceKeepsInFlightPlan(t *testing.T) {
 	dir := cfgDir(t)
 
-	// a: blocks until released, then 500.
-	var gateMu sync.Mutex
-	gate := make(chan struct{})
-	released := false
-	proxyA := fwdProxy(func(w http.ResponseWriter, r *http.Request) {
-		gateMu.Lock()
-		released = true
-		gateMu.Unlock()
-		<-gate
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	defer proxyA.Close()
+	// a: holds the dial until released, then fails pre-request — the only
+	// failure shape that may move the request on to b.
+	proxyA := newFailProxy(t, true)
 	var bCalls int
 	var bMu sync.Mutex
 	proxyB := fwdProxy(func(w http.ResponseWriter, r *http.Request) {
@@ -199,11 +191,11 @@ func TestReloadRaceKeepsInFlightPlan(t *testing.T) {
 	defer proxyC.Close()
 	cfg := serviceHead("http://upstream.invalid") + fmt.Sprintf(`
 egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, proxyA.URL, proxyB.URL)
+`, proxyA.url(), proxyB.URL)
 	writeCFG(t, dir, cfg)
 	sp := spawnProxy(t, dir, map[string]string{
 		"OCFP_CONFIG":         "cfg.yaml",
@@ -216,20 +208,8 @@ routes:
 		done <- sp.post(t, streamBody, nil)
 	}()
 
-	// Wait for the request to reach a and block on the gate.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		gateMu.Lock()
-		r := released
-		gateMu.Unlock()
-		if r || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if !released {
-		t.Fatalf("request never reached proxy a\nlog:\n%s", sp.out.String())
-	}
+	// Wait for the request to reach a and park inside its dial.
+	proxyA.waitDialed(t)
 
 	// Swap to generation 2 while a holds the request.
 	writeCFG(t, dir, serviceHead("http://upstream.invalid")+fmt.Sprintf(`
@@ -240,7 +220,7 @@ routes:
 `, proxyC.URL))
 	waitSwap(t, sp, "config reload: swapped to new config (generation 2")
 
-	close(gate)
+	proxyA.release()
 	var resp *http.Response
 	select {
 	case resp = <-done:
@@ -284,30 +264,30 @@ routes:
 	}
 }
 
-// TestEgress429FallsBackButStaysHealthy: a 429 must fall back to b WITHOUT
-// poisoning a — a later request is served by a again. The 500 path poisons.
-func TestEgress429FallsBackButStaysHealthy(t *testing.T) {
+// TestEgress429IsTerminalAndMarksNoHealth: a provider verdict ENDS the logical
+// call. a answers 429 with the health threshold at 1 — the harshest setting —
+// so both halves of the contract are observable at once:
+//
+//   - no fallback, whatever the budget: b is never dialed, and the client gets
+//     a's own 429 envelope verbatim;
+//   - no health mark: the round-robin comes back to a and a serves. A mark
+//     under threshold 1 would have removed a from the eligible heads and this
+//     request would have landed on b.
+//
+// The counterpart — a failure that PROVABLY happened before the request was
+// sent DOES move to b and DOES cool a — is pinned end-to-end by
+// TestPolicyOnlyReloadKeepsHealthState, TestReloadHealthPolicyPinnedPerGeneration
+// and TestConnect407ThroughRealForwardProxyFallsBack.
+func TestEgress429IsTerminalAndMarksNoHealth(t *testing.T) {
 	dir := cfgDir(t)
-	var aMu sync.Mutex
-	aCalls := 0
-	aStatus := 429
-	proxyA := fwdProxy(func(w http.ResponseWriter, r *http.Request) {
-		aMu.Lock()
-		aCalls++
-		s := aStatus
-		aMu.Unlock()
-		w.WriteHeader(s)
-	})
+
+	var aCalls atomic.Int64
+	aStatus := &atomic.Int64{}
+	aStatus.Store(http.StatusTooManyRequests)
+	proxyA := statusProxy(&aCalls, aStatus)
 	defer proxyA.Close()
-	var bCalls int
-	var bMu sync.Mutex
-	proxyB := fwdProxy(func(w http.ResponseWriter, r *http.Request) {
-		bMu.Lock()
-		bCalls++
-		bMu.Unlock()
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, chatSSE)
-	})
+	var bCalls atomic.Int64
+	proxyB := chatProxy(&bCalls)
 	defer proxyB.Close()
 
 	cfg := serviceHead("http://upstream.invalid") + fmt.Sprintf(`
@@ -335,43 +315,37 @@ health:
 		_, _ = io.Copy(io.Discard, resp.Body)
 	}
 
-	// req1: RR head a → 429 → fallback b.
-	consume("b")
-	if bCalls != 1 {
-		t.Fatalf("b calls after req1 = %d, want 1", bCalls)
+	// req1: RR head a → 429 → delivered verbatim, one attempt, no b.
+	resp := sp.post(t, streamBody, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		t.Fatalf("status = %d, want 429 (body %s)", resp.StatusCode, b)
 	}
+	e := errorEnvelope(t, decodeJSON(t, resp))
+	_ = resp.Body.Close()
+	if msg, _ := e["message"].(string); !strings.HasPrefix(msg, "[429]: ") || !strings.Contains(msg, "credentials rejected") {
+		t.Fatalf("error message = %q, want the [429]: envelope with the upstream text", msg)
+	}
+	if got := bCalls.Load(); got != 0 {
+		t.Fatalf("b dialed %d times, want 0 — a provider verdict never moves egress", got)
+	}
+	if got := aCalls.Load(); got != 1 {
+		t.Fatalf("a dialed %d times, want 1 (a verdict is not retried)", got)
+	}
+	assertRequestLine(t, sp, 0, "generation=1", "egress=a", "attempts=1", "class=upstream_429", "status=429", "fallback=false")
+
 	// req2: RR head b (cursor advanced) → 200 on b.
 	consume("b")
-	// a recovered (429 never poisons): req3 RR head a again serves 200 —
-	// X-OFP-Egress names the SERVING egress, so a must be healthy to answer.
-	aMu.Lock()
-	aStatus = 200
-	aMu.Unlock()
+
+	// req3: RR head a again — a must still be eligible. It answers 200 now,
+	// so a serves: the 429 cooled nothing.
+	aStatus.Store(http.StatusOK)
 	consume("a")
-	if aCalls != 2 {
-		t.Fatalf("a calls after req3 = %d, want 2 (req1 429 + req3 200)", aCalls)
+	if got := aCalls.Load(); got != 2 {
+		t.Fatalf("a dialed %d times, want 2 (req1 429 + req3 200) — a 429 must not health-mark the egress", got)
 	}
-	// Switch a to 500: req4 head b, req5 head a → 500 → falls back, and a
-	// is now marked unhealthy: req6 head b again (a excluded from heads).
-	aMu.Lock()
-	aStatus = 500
-	aMu.Unlock()
-	consume("b") // req4: head b serves
-	consume("b") // req5: head a → 500 → fallback b (a now unhealthy)
-	// req6: the RR cursor is 5 — even WITHOUT the health exclusion, 5%2=1
-	// heads b, so this alone cannot discriminate. req7 is the discriminator:
-	// cursor 6 → 6%2=0 = a if a were still eligible. With the exclusion
-	// working, b serves and a is NOT called: aCalls stays 3 (req1 429 +
-	// req3 200 + req5 500) only if the health filter (and the executor
-	// marking 500) actually kept a out of heads.
-	consume("b") // req6: head b again
-	consume("b") // req7: b again if a excluded → a not called
-	aMu.Lock()
-	calls := aCalls
-	aMu.Unlock()
-	if calls != 3 {
-		t.Fatalf("a called %d times, want 3 (req1 429 + req3 200 + req5 500) — 5xx did not poison a", calls)
-	}
+	assertRequestLine(t, sp, 2, "generation=1", "egress=a", "attempts=1", "class=success", "fallback=false")
 }
 
 // TestStreamingCommitmentNoFallback: after the relay has written downstream,

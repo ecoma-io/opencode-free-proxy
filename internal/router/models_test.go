@@ -116,7 +116,7 @@ func modelsServerBase(t *testing.T, base string) *Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(store.Stop)
-	return NewServer(store, identity.NewUserAgentCache(), upstream.NewClient(), nil, nil)
+	return NewServer(store, identity.NewUserAgentCache(), upstream.NewClient(), nil)
 }
 
 func modelsServer(t *testing.T) *Server {

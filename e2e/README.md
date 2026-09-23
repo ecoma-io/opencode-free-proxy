@@ -53,15 +53,18 @@ forward proxies per egress — per-egress behavior is observable on the wire
 even though `upstream.base` is a single value:
 
 - hot reload mid-request: an in-flight request keeps its generation-1 plan,
-  falls back to the OLD route's egress, never dials the new route, and logs
-  `generation=1 fallback=true`; the next request pins generation 2 and dials
-  the new egress (`X-OFP-Egress` headers prove both)
-- 429 falls back but never marks the egress unhealthy (a later round-robin
-  request is served by it again); a 5xx DOES poison it with
-  `health.failure_threshold: 1` — `TestEgress429FallsBackButStaysHealthy`
-  proves the exclusion with a final round that would round-robin onto the
-  500-egress if it were still eligible, and asserts its call count stayed 3
-  (the two 429s + the one 500 it actually served).
+  fails over to the OLD route's egress on a provably pre-request failure,
+  never dials the new route, and logs `generation=1 fallback=true`; the next
+  request pins generation 2 and dials the new egress (`X-OFP-Egress` headers
+  prove both)
+- 429 is TERMINAL and marks nothing: the client gets a's own `[429]:`
+  envelope, the other egress sees zero requests, and a later round-robin
+  request lands on a again (no cooldown) —
+  `TestEgress429IsTerminalAndMarksNoHealth`, with
+  `health.failure_threshold: 1` set so a mark would have been visible
+  immediately. The counter-direction — a provably pre-request failure MOVES
+  the request and DOES cool the egress under threshold 1 — is pinned by the
+  two tests above plus `TestConnect407ThroughRealForwardProxyFallsBack`.
 - streaming commitment: after the first byte is written, a mid-stream
   upstream death never triggers fallback
 - SIGTERM: new requests answer 503 (drain gate) while the in-flight stream
@@ -78,13 +81,14 @@ local listeners and a real CONNECT proxy:
   it stays eligible under generation 2 — while generation 2's own first
   failure arms the cooldown (`TestReloadHealthPolicyPinnedPerGeneration`)
 - a REAL local HTTP forward proxy answering `CONNECT` with 407 against a REAL
-  local https upstream: exactly ONE CONNECT (proxy-auth bypasses the 502
-  retry matrix), executor falls back to the direct egress, which completes a
-  real TLS session — the subprocess trusts the fixture cert via
-  `SSL_CERT_FILE` (`TestConnect407ThroughRealForwardProxyFallsBack`)
+  local https upstream: exactly ONE CONNECT (a typed dial-phase failure is
+  replay-safe, so the egress moves after one dial), the executor falls back to
+  the direct egress, which completes a real TLS session — the subprocess
+  trusts the fixture cert via `SSL_CERT_FILE`
+  (`TestConnect407ThroughRealForwardProxyFallsBack`)
 - a 407 arriving as a response status (http origin behind a forward proxy) is
   a client-error verdict: the client gets the `[407]:` envelope, the other
-  egress sees zero requests, no retry, no health mark
+  egress sees zero requests, no failover, no health mark
   (`TestHTTPOrigin407IsClientErrorNoFallback`)
 - health state is keyed by egress id + transport signature: swapping a dead
   proxy URL for a working one serves from the replacement immediately (no
@@ -97,17 +101,18 @@ local listeners and a real CONNECT proxy:
 The spawned server's JSON log stream must let an operator reconstruct a
 failure from the log alone (issue #45):
 
-- 429 → fallback: exactly one warn `upstream_error` event for attempt 1,
+- 429 → terminal: exactly one warn `upstream_error` event for attempt 1,
   correlated to the completion line by `request_id` / `attempt_id`
   (`reqID/1`), carrying the rate-limit observation (`retry_after`,
-  `x-ratelimit-*`), `class=upstream_429`, `health_decision=neutral`,
-  `retry_decision=fallback`, the session pseudonym and body hash — and no
-  credential material anywhere in the log
-  (`TestEvidence429FallbackReconstructsFromLogs`)
+  `x-ratelimit-*`), `origin=upstream`, `failure_phase=response_headers`,
+  `request_state=response_started`, `class=upstream_429`,
+  `health_decision=neutral`, `fallback_decision=stop`, the session pseudonym
+  and body hash — and no credential material anywhere in the log
+  (`TestEvidence429TerminalReconstructsFromLogs`)
 - mid-stream upstream death after a 200 start: a `response_started`
   STREAM row (`phase=stream`, `reason=read_error`, status stays 200) —
   never reclassified into an HTTP verdict, no attempt id, no health or
-  retry decision (`TestEvidenceStreamDeathIsPhaseNotVerdict`)
+  failover decision (`TestEvidenceStreamDeathIsPhaseNotVerdict`)
 
 ### Tool pipeline & client personas (`tools_test.go`)
 

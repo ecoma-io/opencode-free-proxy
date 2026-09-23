@@ -14,17 +14,18 @@ Closes #
 ## Port-parity impact
 
 - [ ] No upstream-shaped behavior changed (session ids, UA gate, fingerprint
-      tools, retry matrix, fail-open contracts)
+      tools, recovery semantics, fail-open contracts)
 - [ ] Upstream-shaped behavior changed — the 9router JS citation is in the
       changed comment, and AGENTS.md "Porting discipline" still holds
 
 ## Could this fail silently?
 
 <!-- The dangerous direction in this repository is the quiet one: a 429
-     retried when the contract says fail fast, a UA that silently stays
-     stale past its TTL, a fingerprint tool that stops being injected, an
-     SSE line dropped in a relay branch nobody tests. Writing "no" is fine
-     when it is true; leaving this blank is not. -->
+     moved to another egress when the contract says fail fast, a POST
+     replayed after the request may already have reached the provider, a UA
+     that silently stays stale past its TTL, a fingerprint tool that stops
+     being injected, an SSE line dropped in a relay branch nobody tests.
+     Writing "no" is fine when it is true; leaving this blank is not. -->
 
 - [ ] It cannot, and I considered the quiet direction
 - [ ] It could, and a test pins the case where it would — test name:

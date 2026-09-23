@@ -86,17 +86,13 @@ func newEvidenceLog(log zerolog.Logger, rec *upstream.Recorder, requestID string
 	}
 }
 
-// attemptID derives the attempt correlation identity: request_id/N for
-// egress attempt N, with a .M suffix when that attempt's retry matrix dialed
-// more than once (request abc → abc/1, abc/2, abc/3; a retried second
-// attempt's dials are abc/2.1, abc/2.2, …). Skips have no dial and therefore
+// attemptID derives the attempt correlation identity: request_id/N for egress
+// attempt N (request abc → abc/1, abc/2, …). One attempt is one logical
+// upstream call, so there is no dial suffix. Skips have no dial and therefore
 // no attempt id — the egress field identifies them.
 func (e *evidenceLog) attemptID(row upstream.Row) string {
 	if row.Attempt < 1 {
 		return ""
-	}
-	if row.Dial > 1 {
-		return fmt.Sprintf("%s/%d.%d", e.requestID, row.Attempt, row.Dial)
 	}
 	return fmt.Sprintf("%s/%d", e.requestID, row.Attempt)
 }
@@ -214,12 +210,6 @@ func (e *evidenceLog) emitError(row upstream.Row, dropped int) {
 			evt.Str(strings.ToLower(ent.Name), ent.Value)
 		}
 	}
-	if row.MatrixDraws > 0 {
-		evt.Int("matrix_draws", row.MatrixDraws)
-	}
-	if row.Retried {
-		evt.Bool("retried", true).Int64("retry_delay_ms", row.RetryDelayMS)
-	}
 	evt.Int64("duration_ms", row.DurationMS)
 	if row.InFlight > 0 {
 		evt.Int("in_flight", row.InFlight)
@@ -227,14 +217,14 @@ func (e *evidenceLog) emitError(row upstream.Row, dropped int) {
 	if row.HealthDecision != "" {
 		evt.Str("health_decision", row.HealthDecision)
 	}
-	if row.RetryDecision != "" {
-		evt.Str("retry_decision", row.RetryDecision)
+	if row.FallbackDecision != "" {
+		evt.Str("fallback_decision", row.FallbackDecision)
 	}
 	if dropped > 0 {
 		evt.Int("evidence_dropped", dropped)
 	}
-	evt.Msgf("upstream_error request_id=%s attempt=%q egress=%q phase=%s status=%d class=%s retry_decision=%s message=%q",
-		e.requestID, e.attemptID(row), row.Egress, row.Phase, row.Status, row.Class, row.RetryDecision, row.Message)
+	evt.Msgf("upstream_error request_id=%s attempt=%q egress=%q phase=%s status=%d class=%s fallback_decision=%s message=%q",
+		e.requestID, e.attemptID(row), row.Egress, row.Phase, row.Status, row.Class, row.FallbackDecision, row.Message)
 }
 
 // emitSkip renders a pass-over as a compact debug diagnostic — a skip is a

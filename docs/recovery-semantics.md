@@ -265,17 +265,17 @@ RPGW (selection policy, pool health) OFP does not reimplement it. See
 
 ## Status
 
-| Contract element                                   | State                                              |
-| -------------------------------------------------- | -------------------------------------------------- |
-| Provenance model (origin / phase / request_state)  | **in force** — recorded on every evidence row      |
-| Proof boundary at the transport layers             | **in force** — dial phases recorded by the dialers |
-| `not_sent` never claimed without a dial            | **in force**, pinned by test                       |
-| Provider HTTP responses terminal at OFP            | lands with the matrix removal                      |
-| Safe-failover-only egress movement                 | lands with the matrix removal                      |
-| Health = egress-path health only                   | lands with the matrix removal                      |
-| Evidence vocabulary without retry-matrix fields    | lands with the matrix removal                      |
-| `failure_origin` on the public/internal envelope   | lands with the gateway/upstream split              |
-| OFP ↔ RPGW egress intent (`normal` / `new-egress`) | lands with the gateway/upstream split              |
+| Contract element                                   | State                                                  |
+| -------------------------------------------------- | ------------------------------------------------------ |
+| Provenance model (origin / phase / request_state)  | **in force** — recorded on every evidence row          |
+| Proof boundary at the transport layers             | **in force** — dial phases recorded by the dialers     |
+| `not_sent` never claimed without a dial            | **in force**, pinned by test                           |
+| Provider HTTP responses terminal at OFP            | **in force** — one logical upstream call per attempt   |
+| Safe-failover-only egress movement                 | **in force** — `Failure.ReplaySafe()` gates the move   |
+| Health = egress-path health only                   | **in force** — the same predicate gates the mark       |
+| Evidence vocabulary without retry-matrix fields    | **in force** — rows carry phase/origin/state/decisions |
+| `failure_origin` on the public/internal envelope   | lands with the gateway/upstream split                  |
+| OFP ↔ RPGW egress intent (`normal` / `new-egress`) | lands with the gateway/upstream split                  |
 
 The revision that delivers each row is named in its pull request; this table
 is updated in the same commit as the behaviour it describes.

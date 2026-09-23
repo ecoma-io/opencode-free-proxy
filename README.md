@@ -15,9 +15,12 @@ streaming and non-streaming.
 - **Multi-egress routing**: per-egress http/https/socks5 proxies (or direct),
   routes with priorities and match conditions, round-robin and smooth
   weighted rotation.
-- **Fallback + health**: distinct-egress fallback with a per-egress retry
-  matrix, consecutive-failure cooldowns, typed 407 handling, streaming
-  commitment (no fallback once the upstream response is live).
+- **Failover + health**: distinct-egress failover for failures proven to
+  happen before the request was sent, consecutive-failure cooldowns, typed
+  407 handling, streaming commitment (no failover once the upstream
+  response is live). A provider response of any status is relayed verbatim —
+  provider-level retry belongs to the caller
+  ([docs/recovery-semantics.md](docs/recovery-semantics.md)).
 - **One config file, hot-reloaded**: every service setting lives in a single
   YAML document — upstream base, UA-sync cadence, the log level,
   egresses, routes, fallback, health. Edits hot-reload in place; requests in
@@ -71,10 +74,12 @@ Bootstrap env (the process itself — everything else lives in the file):
 
 Every request captures ONE immutable runtime generation at arrival and is
 served entirely under it — route match, health policy, egress,
-upstream base, fallback, logging — so a hot reload affects only requests
-that start after the swap. Routing picks where to start, fallback picks what
-to try after a retryable failure, health decides what may be tried at all;
-streaming responses are a commitment once started. Details:
+upstream base, failover, logging — so a hot reload affects only requests
+that start after the swap. Routing picks where to start; failover moves the
+request to another egress only when the failure provably happened before the
+request was sent; health decides what may be tried at all. One attempt is one
+logical upstream call, so a provider response of any status ends it.
+Streaming responses are a commitment once started. Details:
 [docs/architecture.md](docs/architecture.md).
 
 ## Commands

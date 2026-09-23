@@ -5,8 +5,10 @@
 // Go-side addition with no 9router counterpart: the JS router runs behind a
 // single egress. Routing, fallback, and health are kept as three separate
 // concerns — routing chooses where to start, fallback chooses what to try
-// after a retryable failure, health decides whether an egress is temporarily
-// eligible. They never collapse into one policy.
+// after a failure that PROVABLY happened before the request was sent, health
+// decides whether an egress is temporarily eligible. They never collapse into
+// one policy — fallback and health share one predicate (upstream.Failure
+// .ReplaySafe) but remain separate decisions on separate budgets.
 package config
 
 import (
@@ -167,12 +169,14 @@ type Route struct {
 	Strategy Strategy `yaml:"strategy,omitempty"`
 }
 
-// FallbackPolicy governs the executor's cross-egress retry loop.
+// FallbackPolicy governs the executor's cross-egress loop.
 type FallbackPolicy struct {
 	Enabled *bool `yaml:"enabled,omitempty"`
-	// MaxAttempts bounds the number of DISTINCT egresses one request may
-	// try (including the first). Default 3; the per-attempt upstream retry
-	// matrix (RetryRules) is unchanged and sits inside each attempt.
+	// MaxAttempts bounds the number of DISTINCT egresses one logical provider
+	// attempt may try (including the first). Default 3. Only failures that
+	// provably happened before the request was transmitted
+	// (upstream.Failure.ReplaySafe) draw on it: a provider response of any
+	// status ends the request instead — see docs/recovery-semantics.md.
 	MaxAttempts int `yaml:"max_attempts,omitempty"`
 }
 

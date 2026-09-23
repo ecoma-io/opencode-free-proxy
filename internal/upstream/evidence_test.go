@@ -278,13 +278,13 @@ func TestRecorderBoundedAndNilSafe(t *testing.T) {
 		rec := NewRecorder()
 		rec.Append(Row{Phase: PhaseSkip, Egress: "a"})
 		rec.Append(Row{Phase: PhaseResponse, Egress: "b"})
-		rec.AnnotateAt(1, func(row *Row) { row.RetryDecision = RetryStop })
+		rec.AnnotateAt(1, func(row *Row) { row.FallbackDecision = FallbackStop })
 		rec.AnnotateAt(99, func(row *Row) { row.Message = "boom" }) // out of range: no-op
 		rows := rec.Rows()
-		if rows[0].RetryDecision != "" || rows[0].Message != "" {
+		if rows[0].FallbackDecision != "" || rows[0].Message != "" {
 			t.Fatalf("AnnotateAt leaked past its row: %+v", rows[0])
 		}
-		if rows[1].RetryDecision != RetryStop || rows[1].Message != "" {
+		if rows[1].FallbackDecision != FallbackStop || rows[1].Message != "" {
 			t.Fatalf("AnnotateAt missed its row: %+v", rows[1])
 		}
 	})
@@ -317,8 +317,8 @@ func TestParseErrorFields(t *testing.T) {
 // failed dials by construction; a nil recorder must also stay silent.
 func TestSuccessProducesNoRow(t *testing.T) {
 	var rec *Recorder
-	appendTransportRow(rec, 1, 0, 0, false, 0, Failure{}, nil)
-	appendResponseRow(rec, 1, 0, 0, false, 0, 200, nil, nil, nil, Failure{})
+	appendTransportRow(rec, 1, Failure{}, nil)
+	appendResponseRow(rec, 1, 200, nil, nil, nil, Failure{})
 	if rec.Len() != 0 {
 		t.Fatal("nil recorder must remain inert")
 	}

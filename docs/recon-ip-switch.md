@@ -64,14 +64,14 @@ Run 2 — egress B = Megacore IPv6 proxy (different ASN + family):
 | R4 ask   | B again                  | fresh                          | 200    | YES                  | 256             |
 
 Non-200: none in either run (8/8 turns). First attempt succeeded on every
-turn — no retry budget was consumed by the switches.
+turn — no egress had to move.
 
 ## Conclusions
 
 1. **No block on mid-conversation IP change.** The upstream answered 200 on
    every turn regardless of which egress it came from, including the first
    turn after the switch (R2) and after switching back (R3/R4). No 403, no
-   429, no silent degradation, no retry consumption visible (first attempt
+   429, no silent degradation, no egress move visible (first attempt
    succeeded).
 2. **Conversation continuity is entirely client-side.** "Continuing" the
    conversation across an IP + identity switch works because the full history

@@ -7,6 +7,7 @@ package router
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -70,7 +71,6 @@ func snapshotRouter(t *testing.T, dir, cfgDoc string, logf func(string, ...any))
 		identity.NewUserAgentCache(),
 		upstream.NewClient(), // direct client: unused — every egress is proxied
 		logf,
-		func(time.Duration) {}, // no-op sleep: retry matrices run instantly
 	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.HandleChatCompletions)
@@ -99,10 +99,112 @@ func pxyURL(s *httptest.Server) string {
 	return s.URL
 }
 
+// failingEgressProxy is a TCP endpoint that speaks no SOCKS5: a dial that
+// lands here never gets a greeting reply, so the attempt fails INSIDE the
+// dialer this package owns (socks5.go's negotiate step) — the one failure
+// shape the recovery split lets move to another egress. It is the router-level
+// analogue of the upstream suite's deadEgress, and the reason the reload /
+// health-pin races below can still drive a fallback now that a provider
+// verdict (4xx/5xx) no longer can.
+//
+// It also gives those races their ordering primitive: `dialed` fires the
+// instant a dial arrives, so a test can hold a request inside egress a, swap
+// the config, and only then release the request into a provably pre-request
+// failure.
+//
+// The rest of the config value is deliberate:
+//
+//   - socks5h:// (remote resolve) so the dial reaches the proxy before any
+//     name lookup that could fail for an unrelated reason: the upstream base
+//     is a .invalid host on purpose (testUpstreamBasePrefix).
+//   - hold = true parks each accepted conn until Release; hold = false hangs
+//     up immediately, which is the "always fails fast" shape the health-policy
+//     tests want on every dial.
+//   - dials counts accepted connections, i.e. egress dials — the failure never
+//     produces an HTTP request anywhere, so there is nothing else to count.
+type failingEgressProxy struct {
+	ln       net.Listener
+	dialed   chan struct{} // closed by the first accepted dial
+	dialedOf sync.Once
+	hold     bool
+
+	mu    sync.Mutex
+	conns []net.Conn
+	dials int
+}
+
+func newFailingEgressProxy(t *testing.T, hold bool) *failingEgressProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &failingEgressProxy{ln: ln, dialed: make(chan struct{}), hold: hold}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			p.dialedOf.Do(func() { close(p.dialed) })
+			p.mu.Lock()
+			p.dials++
+			hold := p.hold
+			if hold {
+				p.conns = append(p.conns, c)
+			}
+			p.mu.Unlock()
+			if !hold {
+				_ = c.Close()
+			}
+		}
+	}()
+	t.Cleanup(p.Close)
+	return p
+}
+
+// url is the config proxy URL an egress points at to fail pre-request.
+func (p *failingEgressProxy) url() string { return "socks5h://" + p.ln.Addr().String() }
+
+// waitDialed blocks until a dial has reached the proxy.
+func (p *failingEgressProxy) waitDialed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.dialed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no dial reached the failing egress proxy")
+	}
+}
+
+// release hangs up every held connection and stops holding: the parked dial
+// fails pre-request now, and so does every dial after it. One-shot by design —
+// a released gate must never park a later attempt.
+func (p *failingEgressProxy) release() {
+	p.mu.Lock()
+	p.hold = false
+	for _, c := range p.conns {
+		_ = c.Close()
+	}
+	p.conns = nil
+	p.mu.Unlock()
+}
+
+func (p *failingEgressProxy) dialCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dials
+}
+
+func (p *failingEgressProxy) Close() {
+	p.release()
+	_ = p.ln.Close()
+}
+
 // TestReloadDoesNotAffectActiveRequest is the hot-reload race proof: request
-// 1 pins snapshot generation 1 (route [a, b]); while a holds the connection
-// open, the config file swaps to generation 2 (route [c]); the in-flight
-// request keeps its generation-1 plan, falls back to b, and never dials c.
+// 1 pins snapshot generation 1 (route [a, b]); while a holds the dial open,
+// the config file swaps to generation 2 (route [c]); the in-flight request
+// keeps its generation-1 plan, fails a pre-request, falls back to b, and never
+// dials c.
 func TestReloadDoesNotAffectActiveRequest(t *testing.T) {
 	dir := t.TempDir()
 	var logsMu sync.Mutex
@@ -113,17 +215,9 @@ func TestReloadDoesNotAffectActiveRequest(t *testing.T) {
 		logs = append(logs, fmt.Sprintf(format, args...))
 	}
 
-	// a: holds the request until released, then fails with 500.
-	var gateMu sync.Mutex
-	gate := make(chan struct{})
-	released := false
-	proxyA := forwardingProxy(func(w http.ResponseWriter, r *http.Request) {
-		gateMu.Lock()
-		released = true
-		gateMu.Unlock()
-		<-gate
-		w.WriteHeader(http.StatusInternalServerError)
-	})
+	// a: holds the dial until released, then fails PRE-REQUEST (the SOCKS5
+	// greeting never completes). Only such a failure may move egress.
+	proxyA := newFailingEgressProxy(t, true)
 	var bCalls int
 	var bMu sync.Mutex
 	proxyB := countProxy(&bCalls, &bMu)
@@ -135,11 +229,11 @@ func TestReloadDoesNotAffectActiveRequest(t *testing.T) {
 
 	s, mux, store := snapshotRouter(t, dir, fmt.Sprintf(`
 egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), logf)
+`, proxyA.url(), pxyURL(proxyB)), logf)
 	_ = s
 
 	done := make(chan *httptest.ResponseRecorder, 1)
@@ -147,17 +241,8 @@ routes:
 		done <- postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
 	}()
 
-	// Let the request reach proxyA and block on the gate.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		gateMu.Lock()
-		r := released
-		gateMu.Unlock()
-		if r || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	// Let the request reach proxyA and park inside its dial.
+	proxyA.waitDialed(t)
 
 	// Swap the config to generation 2 (route [c] only) while a is blocked.
 	writeCfg(t, dir, testUpstreamBasePrefix+fmt.Sprintf(`
@@ -169,7 +254,7 @@ routes:
 	waitGeneration(t, store, 2)
 
 	// Release a; the executor falls back to the SNAPSHOT's b, not the new c.
-	close(gate)
+	proxyA.release()
 	rec := <-done
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
@@ -255,23 +340,16 @@ routes:
 // config moved to a loose generation 2 (threshold 100) before the failure
 // landed — the cooldown arms, and a later generation-2 request (which could
 // never arm it itself: 100 failures needed) must see a cooling.
+//
+// The failure it observes is a pre-request transport failure: egress-path
+// health is exactly what a health mark means now (a provider verdict marks
+// nothing), so the policy under test is the one that decides whether an
+// egress-path failure is attributed.
 func TestOldRequestKeepsOldHealthPolicyAfterReload(t *testing.T) {
 	dir := t.TempDir()
 
-	// a: holds the request until released, then fails with 500.
-	var gateMu sync.Mutex
-	gate := make(chan struct{})
-	released := false
-	var aCalls int
-	proxyA := forwardingProxy(func(w http.ResponseWriter, r *http.Request) {
-		gateMu.Lock()
-		released = true
-		aCalls++
-		gateMu.Unlock()
-		<-gate
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	defer proxyA.Close()
+	// a: holds the dial until released, then fails pre-request.
+	proxyA := newFailingEgressProxy(t, true)
 	var bMu sync.Mutex
 	bCalls := 0
 	proxyB := countProxy(&bCalls, &bMu)
@@ -283,26 +361,17 @@ health:
   failure_threshold: 1
   cooldown: 1m
 egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), nil)
+`, proxyA.url(), pxyURL(proxyB)), nil)
 
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		done <- postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		gateMu.Lock()
-		r := released
-		gateMu.Unlock()
-		if r || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	proxyA.waitDialed(t)
 
 	// Reload to a LOOSE policy (100 failures to arm) while a is blocked.
 	writeCfg(t, dir, testUpstreamBasePrefix+fmt.Sprintf(`
@@ -311,25 +380,22 @@ health:
   failure_threshold: 100
   cooldown: 1m
 egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)))
+`, proxyA.url(), pxyURL(proxyB)))
 	waitGeneration(t, store, 2)
 
-	// Release a; the in-flight (generation-1) request observes its 500 under
-	// the PINNED threshold-1 policy and arms the cooldown.
-	close(gate)
+	// Release a; the in-flight (generation-1) request observes its failure
+	// under the PINNED threshold-1 policy and arms the cooldown.
+	proxyA.release()
 	rec := <-done
 	if rec.Code != http.StatusOK || rec.Header().Get("X-OFP-Egress") != "b" {
 		t.Fatalf("req1: status=%d egress=%q", rec.Code, rec.Header().Get("X-OFP-Egress"))
 	}
-	gateMu.Lock()
-	calls := aCalls
-	gateMu.Unlock()
-	if calls != 1 {
-		t.Fatalf("a calls = %d, want 1", calls)
+	if calls := proxyA.dialCount(); calls != 1 {
+		t.Fatalf("a dials = %d, want 1", calls)
 	}
 
 	// A generation-2 request must see the gen1-armed cooldown: b serves and a
@@ -339,11 +405,8 @@ routes:
 	if rec2.Code != http.StatusOK || rec2.Header().Get("X-OFP-Egress") != "b" {
 		t.Fatalf("req2: status=%d egress=%q, want b (a cooling under the gen1-armed state)", rec2.Code, rec2.Header().Get("X-OFP-Egress"))
 	}
-	gateMu.Lock()
-	calls = aCalls
-	gateMu.Unlock()
-	if calls != 1 {
-		t.Fatalf("a calls after req2 = %d, want 1 (the gen1-pinned observation armed the cooldown)", calls)
+	if calls := proxyA.dialCount(); calls != 1 {
+		t.Fatalf("a dials after req2 = %d, want 1 (the gen1-pinned observation armed the cooldown)", calls)
 	}
 }
 
@@ -353,15 +416,9 @@ routes:
 // reload enables threshold 1, the next failure arms and a stops being dialed.
 func TestNewRequestUsesNewHealthPolicyAfterReload(t *testing.T) {
 	dir := t.TempDir()
-	var aMu sync.Mutex
-	aCalls := 0
-	proxyA := forwardingProxy(func(w http.ResponseWriter, r *http.Request) {
-		aMu.Lock()
-		aCalls++
-		aMu.Unlock()
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	defer proxyA.Close()
+	// a fails on every dial, pre-request — the failure shape egress-path
+	// health is about.
+	proxyA := newFailingEgressProxy(t, false)
 	var bMu sync.Mutex
 	bCalls := 0
 	proxyB := countProxy(&bCalls, &bMu)
@@ -373,22 +430,17 @@ health:
   failure_threshold: 1
   cooldown: 1m
 egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)), nil)
+`, proxyA.url(), pxyURL(proxyB)), nil)
 
 	// Under the disabled policy a's failures must never mark it: keep making
 	// requests (rotation order is the scheduler's business) until a has been
 	// dialed a SECOND time — the direct proof that failure #1 marked nothing.
 	// If a disabled observation marked health, a would be filtered from the
-	// heads and this loop would time out with aCalls frozen at 1.
-	aCallsAt := func() int {
-		aMu.Lock()
-		defer aMu.Unlock()
-		return aCalls
-	}
+	// heads and this loop would time out with aDials frozen at 1.
 	requestB := func(stage string) {
 		t.Helper()
 		rec := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
@@ -397,10 +449,10 @@ routes:
 		}
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for aCallsAt() < 2 {
+	for proxyA.dialCount() < 2 {
 		requestB("disabled-policy phase")
 		if time.Now().After(deadline) {
-			t.Fatalf("a was never re-dialed under the disabled policy (aCalls=%d) — a disabled observation must not mark", aCallsAt())
+			t.Fatalf("a was never re-dialed under the disabled policy (dials=%d) — a disabled observation must not mark", proxyA.dialCount())
 		}
 	}
 
@@ -411,20 +463,20 @@ health:
   failure_threshold: 1
   cooldown: 1m
 egress:
-  - {id: a, proxy: {type: http, url: %q}}
+  - {id: a, proxy: {type: socks5, url: %q}}
   - {id: b, proxy: {type: http, url: %q}}
 routes:
   - {id: r, egress: [a, b]}
-`, pxyURL(proxyA), pxyURL(proxyB)))
+`, proxyA.url(), pxyURL(proxyB)))
 	waitGeneration(t, store, 2)
 
 	// Generation-2 requests: the FIRST failure a suffers under the new
 	// policy must mark it — wait for that dial.
 	deadline = time.Now().Add(5 * time.Second)
-	for aCallsAt() < 3 {
+	for proxyA.dialCount() < 3 {
 		requestB("enabled-policy phase")
 		if time.Now().After(deadline) {
-			t.Fatalf("a was never re-dialed under the enabled policy (aCalls=%d)", aCallsAt())
+			t.Fatalf("a was never re-dialed under the enabled policy (dials=%d)", proxyA.dialCount())
 		}
 	}
 
@@ -433,8 +485,8 @@ routes:
 	for i := 0; i < 4; i++ {
 		requestB("cooldown phase")
 	}
-	if calls := aCallsAt(); calls != 3 {
-		t.Fatalf("a calls = %d, want 3 (the generation-2 policy armed the cooldown)", calls)
+	if calls := proxyA.dialCount(); calls != 3 {
+		t.Fatalf("a dials = %d, want 3 (the generation-2 policy armed the cooldown)", calls)
 	}
 }
 

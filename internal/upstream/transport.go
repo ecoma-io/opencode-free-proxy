@@ -40,7 +40,7 @@ import (
 // client.go for the full rationale and the undici citations; the JS router
 // stays on its ProxyAgent for every hop the same way.
 func NewClientFor(p *config.Proxy) (*Client, error) {
-	c := &Client{Sleep: time.Sleep, Now: time.Now, followRedirects: true}
+	c := &Client{Now: time.Now, followRedirects: true}
 	if p == nil {
 		// Issue #48: the origin handshake speaks the official client's
 		// ClientHello (hello.go) via DialTLSContext. Deliberately NO

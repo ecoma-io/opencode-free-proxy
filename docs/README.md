@@ -5,11 +5,12 @@ source citations.
 
 ## Guides
 
-| Doc                                  | What it covers                                                                                                            |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| [configuration.md](configuration.md) | The full `OCFP_CONFIG` document: schema tables, defaults, `${VAR}` interpolation, hot-reload semantics, validation errors |
-| [deployment.md](deployment.md)       | Docker / Compose, config mounts, bootstrap env, healthz, graceful shutdown, production considerations                     |
-| [architecture.md](architecture.md)   | Request pipeline, immutable runtime generations, process-wide state lifecycles, package layout                            |
+| Doc                                            | What it covers                                                                                                                                                     |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [configuration.md](configuration.md)           | The full `OCFP_CONFIG` document: schema tables, defaults, `${VAR}` interpolation, hot-reload semantics, validation errors                                          |
+| [recovery-semantics.md](recovery-semantics.md) | Who may recover from what across Injector → OFP → RPGW: the request-state model, the proof boundary, safe egress failover, health, and the cross-service contracts |
+| [deployment.md](deployment.md)                 | Docker / Compose, config mounts, bootstrap env, healthz, graceful shutdown, production considerations                                                              |
+| [architecture.md](architecture.md)             | Request pipeline, immutable runtime generations, process-wide state lifecycles, package layout                                                                     |
 
 ## Investigation records
 

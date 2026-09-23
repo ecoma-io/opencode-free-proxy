@@ -52,11 +52,12 @@ func evStr(t *testing.T, ev map[string]any, key string) string {
 	return v
 }
 
-// TestEvidence429FallbackReconstructsFromLogs: egress a answers 429 with
-// rate-limit headers, b serves. The log must carry exactly one warn
-// upstream_error event for attempt 1 on a — with the rate-limit observation,
-// a health-neutral decision, and ids that correlate to the completion line.
-func TestEvidence429FallbackReconstructsFromLogs(t *testing.T) {
+// TestEvidence429TerminalReconstructsFromLogs: egress a answers 429 with
+// rate-limit headers — the provider's verdict, which ENDS the logical call.
+// The log must carry exactly one warn upstream_error event for attempt 1 on a
+// (rate-limit observation, health-neutral, STOP) and the completion line must
+// relay the 429 with no egress move; the healthy sibling b is never dialed.
+func TestEvidence429TerminalReconstructsFromLogs(t *testing.T) {
 	dir := cfgDir(t)
 
 	var aCalls atomic.Int64
@@ -82,10 +83,17 @@ routes:
 `, proxyA.URL, proxyB.URL))
 	sp := spawnProxy(t, dir, nil)
 
-	if eg := drainChat(t, sp.post(t, streamBody, nil)); eg != "b" {
-		t.Fatalf("X-OFP-Egress = %q, want b (a 429s, executor falls back)", eg)
+	resp := sp.post(t, streamBody, nil)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		t.Fatalf("status = %d, want the provider's 429 relayed (body %s)", resp.StatusCode, b)
 	}
-	assertRequestLine(t, sp, 0, "generation=1", "egress=b", "attempts=2", "class=success", "fallback=true")
+	_ = resp.Body.Close()
+	if got := bCalls.Load(); got != 0 {
+		t.Fatalf("b dialed %d times, want 0 (a provider verdict is terminal)", got)
+	}
+	assertRequestLine(t, sp, 0, "generation=1", "egress=a", "attempts=1", "class=upstream_429", "status=429", "fallback=false")
 
 	events := sp.jsonEvents()
 	errs := withMsg(events, "upstream_error")
@@ -121,7 +129,7 @@ routes:
 		"x-ratelimit-limit":     "100",
 		"x-ratelimit-remaining": "0",
 		"health_decision":       "neutral",
-		"retry_decision":        "fallback",
+		"fallback_decision":     "stop",
 		"route":                 "r",
 		"upstream_host":         "upstream.invalid",
 	} {
@@ -188,7 +196,7 @@ routes:
 			t.Fatalf("field %q = %v, want %v\nfull event: %v", key, ev[key], want, ev)
 		}
 	}
-	for _, absent := range []string{"attempt_id", "attempt", "health_decision", "retry_decision", "error_fingerprint"} {
+	for _, absent := range []string{"attempt_id", "attempt", "health_decision", "fallback_decision", "error_fingerprint"} {
 		if _, has := ev[absent]; has {
 			t.Fatalf("stream rows must not carry %q: %v", absent, ev[absent])
 		}

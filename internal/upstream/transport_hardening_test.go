@@ -39,7 +39,8 @@ import (
 func TestSocks5NoAcceptableMethodsIsProxyAuth(t *testing.T) {
 	f := newSocks5Fake(t, 0xff, 0x00, 0x00)
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -59,7 +60,8 @@ func TestSocks5NoAcceptableMethodsIsProxyAuth(t *testing.T) {
 func TestSocks5AuthDemandedWithoutCredentials(t *testing.T) {
 	f := newSocks5Fake(t, 0x02, 0x00, 0x00) // demands auth; no credentials will be sent
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -81,7 +83,8 @@ func TestSocks5HostnameArrivesAsIP(t *testing.T) {
 	// CONNECT has been recorded — the target is never dialed (port 1).
 	f := newSocks5Fake(t, 0x00, 0x00, 0x01)
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://localhost:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://localhost:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -131,7 +134,8 @@ func TestSocks5IPv6OriginArrivesAsAtyp4(t *testing.T) {
 
 	f := newSocks5Fake(t, 0x00, 0x00, 0x00) // no-auth, tunnel everything
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
-	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if uerr != nil || class != ClassSuccess {
 		t.Fatalf("uerr=%v class=%s, want a served round-trip through the v6 tunnel", uerr, class)
 	}
@@ -535,7 +539,6 @@ func TestProxyCredentialsNeverSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.Sleep = func(time.Duration) {}
 	egA, _ := fixtureRuntime(map[string]int{"a": 200}).Egress("a")
 	exec := NewExecutor(func(*config.Egress) (*Client, bool) { return a, true }, health.New(), NewLimiter())
 	plan := routing.RoutePlan{RouteID: "r", Strategy: config.StrategyRoundRobin, Attempts: []string{"a"}, Egresses: []*config.Egress{egA}}

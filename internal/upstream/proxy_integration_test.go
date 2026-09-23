@@ -23,13 +23,16 @@ import (
 	"opencode-free-proxy/internal/routing"
 )
 
-// noSleepClient stubs the retry sleep so hardening loops run instantly; every
-// failure row below exercises the 502 retry budget (1 initial + 3 retries).
+// noSleepClient unpacks NewClientFor's two-value result inline, panicking on
+// a transport-build error (a test fixture that cannot build its transport has
+// nothing to assert). It used to stub the retry sleep so the retry matrix ran
+// instantly; one Client.Do is now one logical call with nothing to wait for,
+// so there is no seam left to stub and the helper is just the compact wrapper
+// the proxy tests below are written against.
 func noSleepClient(c *Client, err error) *Client {
 	if err != nil {
 		panic(err)
 	}
-	c.Sleep = func(time.Duration) {}
 	return c
 }
 
@@ -100,7 +103,8 @@ func TestHTTPConnect407IsProxyAuth(t *testing.T) {
 	pxy, connects := connect407Proxy(t)
 
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL}))
-	resp, uerr, class := c.DoClassified(context.Background(), "https://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "https://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -164,7 +168,8 @@ func TestHTTPSOrigin407IsClientError(t *testing.T) {
 
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.URL}))
 	c.TLSConfig = &tls.Config{RootCAs: originRootPool(t, origin)}
-	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -185,8 +190,8 @@ func TestDirectOrigin407IsClientError(t *testing.T) {
 	defer origin.Close()
 
 	c := NewClient()
-	c.Sleep = func(time.Duration) {}
-	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -220,7 +225,8 @@ func TestHTTPOrigin407ThroughForwardProxyIsNotBlindlyProxyAuth(t *testing.T) {
 	defer pxy.Close()
 
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: "http://user:pass@" + strings.TrimPrefix(pxy.URL, "http://")}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -307,12 +313,10 @@ func newProxyAuthFixture(t *testing.T) *proxyAuthFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.Sleep = func(time.Duration) {}
 	// b is DIRECT; since issue #48 the Client.TLSConfig seam feeds EVERY
 	// origin handshake (direct, socks5, tunneled CONNECT alike), so the
 	// root pool rides the same seam the router uses in production.
 	b := NewClient()
-	b.Sleep = func(time.Duration) {}
 	b.TLSConfig = &tls.Config{RootCAs: pool}
 	clients := map[string]*Client{"a": a, "b": b}
 
@@ -530,7 +534,8 @@ func (e errSocks) Error() string { return string(e) }
 func TestSocks5AuthFailureIsProxyAuth(t *testing.T) {
 	f := newSocks5Fake(t, 0x02, 0x01, 0x00) // auth required, reject creds
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5://user:bad@" + strings.TrimPrefix(f.url, "socks5://")}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://origin.invalid/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -551,7 +556,8 @@ func TestSocks5Rep02NotProxyAuth(t *testing.T) {
 	// 127.0.0.1 resolves locally without DNS — the point of the test is the
 	// proxy's REP 0x02, reached only after the resolution step succeeds.
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -578,7 +584,8 @@ func TestSocks5TunnelServesUpstream(t *testing.T) {
 
 	f := newSocks5Fake(t, 0x00, 0x00, 0x00) // no-auth, tunnel everything
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
-	resp, uerr, class := c.DoClassified(context.Background(), upstream.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), upstream.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if uerr != nil || class != ClassSuccess {
 		t.Fatalf("uerr=%v class=%s, want success through the tunnel", uerr, class)
 	}
@@ -605,7 +612,8 @@ func TestSocks5hConnectCarriesHostname(t *testing.T) {
 	f := newSocks5Fake(t, 0x00, 0x00, 0x00) // no-auth, tunnel everything
 	f.resolveAtProxy("target.example", strings.TrimPrefix(upstream.URL, "http://"))
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://" + strings.TrimPrefix(f.url, "socks5://")}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://target.example:80/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://target.example:80/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if uerr != nil || class != ClassSuccess {
 		t.Fatalf("uerr=%v class=%s, want success through the hostname-form CONNECT", uerr, class)
 	}
@@ -701,7 +709,8 @@ func TestSocks5hIPLiteralStaysLiteral(t *testing.T) {
 func TestSocks5hRep05StaysConnectionError(t *testing.T) {
 	f := newSocks5Fake(t, 0x00, 0x00, 0x05) // no-auth greet, REP 0x05 refused
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://" + strings.TrimPrefix(f.url, "socks5://")}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://target.example:443/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://target.example:443/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -730,7 +739,8 @@ func TestSocks5hRep05StaysConnectionError(t *testing.T) {
 func TestSocks5hAuthFlowUnchanged(t *testing.T) {
 	f := newSocks5Fake(t, 0x02, 0x01, 0x00) // auth required, reject creds
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: "socks5h://user:bad@" + strings.TrimPrefix(f.url, "socks5://")}))
-	resp, uerr, class := c.DoClassified(context.Background(), "http://target.example/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), "http://target.example/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -885,7 +895,9 @@ func TestCrossSchemeRedirectStaysOnEgress(t *testing.T) {
 		}
 	}
 
-	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", headers, []byte(`{"model":"big-pickle"}`))
+	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", headers, []byte(`{"model":"big-pickle"}`))
+
+	class := failure.Class
 	if uerr != nil || class != ClassSuccess {
 		t.Fatalf("uerr=%v class=%s, want the followed chain served through the egress", uerr, class)
 	}
@@ -941,7 +953,9 @@ func TestCrossSchemeRedirect407IsTyped(t *testing.T) {
 	pxy := newEgressProxy(t, true) // CONNECT arm answers 407
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxyHTTP, URL: pxy.srv.URL}))
 
-	resp, uerr, class := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+
+	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
