@@ -223,6 +223,57 @@ Logs are the analysis surface for upstream failures by design: the
 proxy has no metrics subsystem, so nothing here can introduce
 high-cardinality metric labels.
 
+## Transport failure provenance
+
+`internal/upstream/provenance.go` answers the one question a relay must be
+able to answer before it re-sends anything: **did this request reach the
+provider?** Every failure carries a `Failure{Class, Origin, Phase,
+RequestState}` — where it happened, at which protocol step, and what the
+transport can _prove_ about transmission. The contract those fields serve is
+`docs/recovery-semantics.md`; this section is how they are produced.
+
+- **`RequestState` is `not_sent` | `unknown` | `response_started`**, and
+  `unknown` is deliberately the zero value: an unset state must never read as
+  proof of non-transmission. An HTTP verdict of any status is
+  `response_started` (a response existing proves the request arrived); a
+  context cancellation is `client` and proves nothing.
+- **Proof only at the boundaries this package owns.** The dialers record
+  their phase as they climb it — proxy TCP connect, proxy TLS, proxy
+  credential exchange, SOCKS5 greeting/auth/CONNECT, CONNECT request/read,
+  target TCP connect, origin TLS. A failure at a recorded dial phase is
+  `not_sent`; a failure at any phase _after_ the dial succeeded is
+  `not_sent` only if the traced connection never carried a request byte.
+- **Everything past the hand-off is `unknown`.** `net/http` owns request
+  write, header wait and body read; this package cannot prove what left the
+  socket, so a request-write failure, a response-header timeout and a reset
+  after transmission all report `unknown` — and `ReplaySafe()` is false for
+  them. A response-header timeout is the canonical case: the provider may be
+  executing the request right now.
+- **No dial means no proof.** The trace rides the attempt's request context
+  (viable because `net/http` builds its dial context with
+  `context.WithoutCancel`, which retains values), and `net/http` skips the
+  dial entirely on a pooled connection — so a failure on a reused connection
+  has no phase and degrades to `unknown`, never `not_sent`.
+- **The write flag is set on write _entry_.** The final connection handed to
+  `net/http` is wrapped (`recordingConn`), and it marks the attempt as having
+  transmitted on entry to the write, not on success — a partial write may have
+  put a prefix on the wire, and an _attempted_ write must close the `not_sent`
+  door permanently. The wrapper is applied at the outermost layer of each
+  transport path exactly once, so TLS handshake records are never counted as
+  request bytes. It is transparent when no trace is in the context.
+- **Nothing is inferred from error text.** Phases come from the boundary that
+  spoke the protocol and from Go's error typing (`net.Error.Timeout()`,
+  `*net.OpError.Op`); classifying by `strings.Contains(err.Error(), …)` is
+  banned (issue #6). The one post-hand-off inference is that a `net.http`
+  write op means the write ran — typed, not textual.
+- **Observational, like the rest of the forensics layer.** These fields are
+  recorded on evidence rows and rendered as `origin` / `failure_phase` /
+  `request_state`; they are fixed vocabulary and carry no egress identity
+  (no proxy URL, host, port or credential can reach them). Where the phase
+  cannot be attributed the field is absent, which is an honest gap rather
+  than a guess. `ReplaySafe()` is the single predicate the recovery policy
+  will read — `origin = transport ∧ request_state = not_sent`.
+
 ## Endpoints
 
 - `POST /v1/chat/completions` — OpenAI Chat Completions (SSE or JSON).

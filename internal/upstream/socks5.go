@@ -34,6 +34,12 @@ func newSocks5Dialer(proxy *url.URL) *socks5Dialer {
 // DialContext establishes the tunnel for addr ("host:port" of the UPSTREAM —
 // resolved locally). The returned conn is ready for the caller's traffic.
 func (d *socks5Dialer) DialContext(ctx context.Context, _ string, addr string) (net.Conn, error) {
+	// Phase bookkeeping (provenance.go): the whole handshake below runs before
+	// net/http owns a connection, so every failure here is provably pre-
+	// transmission and the trace only says which step it was. No-ops without a
+	// trace.
+	t := traceOf(ctx)
+	t.enter(FailurePhaseProxyConnect)
 	conn, err := d.dialer.DialContext(ctx, "tcp", proxyDialAddr(d.proxy))
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy: %w", err)
@@ -71,6 +77,8 @@ func (d *socks5Dialer) DialContext(ctx context.Context, _ string, addr string) (
 // it, authenticates (RFC 1929 §2). Credentials come from the proxy URL
 // userinfo; nothing here ever formats them into an error.
 func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
+	t := traceOf(ctx)
+	t.enter(FailurePhaseSocks5Greeting)
 	hasAuth := d.proxy.User != nil
 	methods := []byte{0x00} // no-auth is always offered
 	if hasAuth {
@@ -91,9 +99,11 @@ func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
 	case 0x00:
 		return nil
 	case 0x02:
+		t.enter(FailurePhaseProxyAuth)
 		if !hasAuth {
 			return &proxyAuthError{msg: "socks5: proxy demanded auth but none configured"}
 		}
+		t.enter(FailurePhaseSocks5Auth)
 		user := d.proxy.User.Username()
 		pass, _ := d.proxy.User.Password()
 		if len(user) > 255 || len(pass) > 255 {
@@ -118,6 +128,7 @@ func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
 		// health and allow fallback identically, so only the label differs —
 		// and only this boundary code may produce the type either way.
 		if buf[0] != 0x01 || buf[1] != 0x00 {
+			t.enter(FailurePhaseProxyAuth)
 			return &proxyAuthError{msg: "socks5: proxy authentication failed"}
 		}
 		return nil
@@ -126,7 +137,9 @@ func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
 		// method we offered — if we offered only 0x00, it demanded auth we
 		// never sent; with 0x02 offered it refused our credential mechanism.
 		// Same proxyAuthError contract as the 0x02 branch above (failure.go:
-		// "a proxy that demanded auth we never sent").
+		// "a proxy that demanded auth we never sent") and the same phase: the
+		// verdict is a credential refusal even though no credential was sent.
+		t.enter(FailurePhaseProxyAuth)
 		return &proxyAuthError{msg: "socks5: no acceptable authentication method"}
 	default:
 		return fmt.Errorf("socks5: proxy chose unknown method %d", buf[1])
@@ -144,6 +157,11 @@ func (d *socks5Dialer) negotiate(ctx context.Context, conn net.Conn) error {
 // error class — there is no silent fallback to local resolution and no
 // retry.
 func (d *socks5Dialer) connect(ctx context.Context, conn net.Conn, addr string) error {
+	// One phase covers the whole reach-the-target step: the local resolution
+	// a socks5:// proxy URL performs here, the CONNECT request, and the reply
+	// that carries the proxy's verdict (RFC 1928 §6). Every one of them is
+	// pre-transmission, so the phase split adds no decision value.
+	traceOf(ctx).enter(FailurePhaseSocks5Connect)
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("socks5: bad target %q: %w", addr, err)

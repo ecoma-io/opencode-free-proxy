@@ -185,6 +185,12 @@ func utlsConfigFrom(cfg *tls.Config) *utls.Config {
 // watcher; originTLSDialer below arms its own for the post-dial handshake),
 // so this only handshakes and hands the conn back, closed on error.
 func handshakeOrigin(ctx context.Context, conn net.Conn, cfg *tls.Config) (*utls.UConn, error) {
+	// Phase bookkeeping (provenance.go), recorded at the single point where
+	// the handshake actually happens so every caller (direct, SOCKS5-tunneled,
+	// CONNECT-tunneled) reports the same phase. Pre-transmission by
+	// construction: the request cannot be written before the handshake ends.
+	// A no-op without a trace.
+	traceOf(ctx).enter(FailurePhaseOriginTLS)
 	uconn := utls.UClient(conn, utlsConfigFrom(cfg), utls.HelloCustom)
 	spec := officialClientHelloSpec()
 	if err := uconn.ApplyPreset(&spec); err != nil {

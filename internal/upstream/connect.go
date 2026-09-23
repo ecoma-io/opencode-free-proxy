@@ -67,6 +67,12 @@ func newConnectDialer(proxy *url.URL, tlsConfig func() *tls.Config) *connectDial
 // conn. network is always "tcp"; addr is the origin "host:port" (the
 // transport passes cm.targetAddr because this transport's Proxy is nil).
 func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net.Conn, error) {
+	// Phase bookkeeping (provenance.go). This whole function runs BEFORE
+	// net/http owns a connection, so every failure below is provably pre-
+	// transmission; the trace only has to say WHICH step failed. The calls are
+	// no-ops when the attempt carries no trace (a direct caller, a test).
+	t := traceOf(ctx)
+	t.enter(FailurePhaseProxyConnect)
 	conn, err := d.dialer.DialContext(ctx, "tcp", proxyDialAddr(d.proxy))
 	if err != nil {
 		return nil, fmt.Errorf("proxy %s: dial: %w", config.RedactProxyURL(d.proxy.String()), err)
@@ -98,6 +104,7 @@ func (d *connectDialer) DialTLSContext(ctx context.Context, _, addr string) (net
 		// TLS to the proxy first (an https proxy endpoint); the CONNECT then
 		// travels inside that TLS layer. No h2 on this hop — the proxy speaks
 		// HTTP/1.1 CONNECT regardless of what the tunnel carries.
+		t.enter(FailurePhaseProxyTLS)
 		tlsConn := tls.Client(conn, d.proxyTLSConfig())
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			_ = conn.Close()
@@ -144,6 +151,8 @@ func (d *connectDialer) connect(ctx context.Context, conn net.Conn, addr string)
 		cred := base64.StdEncoding.EncodeToString([]byte(d.proxy.User.Username() + ":" + pass))
 		req.Header.Set("Proxy-Authorization", "Basic "+cred)
 	}
+	t := traceOf(ctx)
+	t.enter(FailurePhaseConnectWrite)
 	if err := req.Write(conn); err != nil {
 		return fmt.Errorf("proxy %s: connect write: %w", config.RedactProxyURL(d.proxy.String()), err)
 	}
@@ -155,6 +164,7 @@ func (d *connectDialer) connect(ctx context.Context, conn net.Conn, addr string)
 	// limit into an error, not grow memory until the conn deadline. Not an
 	// open-sse constant — Go transport-boundary hygiene, mirrored from
 	// stdlib, which is why it lives here and not in internal/config.
+	t.enter(FailurePhaseConnectRead)
 	br := bufio.NewReader(io.LimitReader(conn, maxConnectHeaderBytes))
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
@@ -176,6 +186,11 @@ func (d *connectDialer) connect(ctx context.Context, conn net.Conn, addr string)
 	// goroutine or fd, and the conn's lifetime is the caller's (closed on
 	// every error return in DialTLSContext, handed to TLS on success).
 	if resp.StatusCode == http.StatusProxyAuthRequired {
+		// The phase names the VERDICT (the proxy refused our credentials),
+		// not the step: both this and the SOCKS5 RFC 1929 rejection report
+		// proxy_auth so one failure mode reads identically on either proxy
+		// type, while class/origin stay the deciding fields.
+		t.enter(FailurePhaseProxyAuth)
 		return &proxyAuthError{msg: fmt.Sprintf("proxy %s: CONNECT refused with 407 (authentication required)", config.RedactProxyURL(d.proxy.String()))}
 	}
 	if resp.StatusCode != http.StatusOK {

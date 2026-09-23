@@ -317,8 +317,8 @@ func TestParseErrorFields(t *testing.T) {
 // failed dials by construction; a nil recorder must also stay silent.
 func TestSuccessProducesNoRow(t *testing.T) {
 	var rec *Recorder
-	appendTransportRow(rec, 1, 0, 0, false, 0, ClassSuccess, nil)
-	appendResponseRow(rec, 1, 0, 0, false, 0, 200, nil, nil, nil, ClassSuccess)
+	appendTransportRow(rec, 1, 0, 0, false, 0, Failure{}, nil)
+	appendResponseRow(rec, 1, 0, 0, false, 0, 200, nil, nil, nil, Failure{})
 	if rec.Len() != 0 {
 		t.Fatal("nil recorder must remain inert")
 	}

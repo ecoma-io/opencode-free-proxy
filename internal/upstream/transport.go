@@ -49,12 +49,20 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		// config.TLSHandshakeTimeout carries — and NO ForceAttemptHTTP2:
 		// the official client offers http/1.1 only, and stdlib never
 		// upgrades a non-*tls.Conn anyway (dead config lies).
+		// Every dialer this file installs is wrapped in recordingDialer
+		// (provenance.go): the wrapper marks the dial started/finished and
+		// wraps the conn so the first write the transport makes through it is
+		// recorded — the fact that decides whether a request is provably
+		// unsent. Two separate closures per path, because each dial function
+		// must be wrapped exactly ONCE and at its OUTERMOST layer: wrapping
+		// the raw dial under the TLS seam would count handshake records as
+		// request bytes.
 		dialer := &net.Dialer{Timeout: config.DialTimeout}
 		tr := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
-			DialContext:           dialer.DialContext,
-			DialTLSContext:        originTLSDialer(dialer.DialContext, func() *tls.Config { return c.TLSConfig }),
+			DialContext:           recordingDialer(FailurePhaseTargetConnect, dialer.DialContext),
+			DialTLSContext:        recordingDialer(FailurePhaseTargetConnect, originTLSDialer(dialer.DialContext, func() *tls.Config { return c.TLSConfig })),
 		}
 		c.HTTP = &http.Client{Transport: tr}
 		return c, nil
@@ -80,10 +88,13 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		viaProxy := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
-			DialContext:           (&net.Dialer{Timeout: config.DialTimeout}).DialContext,
-			TLSHandshakeTimeout:   config.TLSHandshakeTimeout,
-			ForceAttemptHTTP2:     true,
-			Proxy:                 http.ProxyURL(u),
+			// The dial this transport performs is TO THE PROXY (stdlib's
+			// absolute-form path), so a failure here is a proxy_connect
+			// failure, not a target one.
+			DialContext:         recordingDialer(FailurePhaseProxyConnect, (&net.Dialer{Timeout: config.DialTimeout}).DialContext),
+			TLSHandshakeTimeout: config.TLSHandshakeTimeout,
+			ForceAttemptHTTP2:   true,
+			Proxy:               http.ProxyURL(u),
 		}
 		// The https-origin transport: WE own the CONNECT (connect.go); the
 		// transport sees a direct https dial. The proxy URL rides the
@@ -99,7 +110,7 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		tunneled := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
-			DialTLSContext:        newConnectDialer(u, func() *tls.Config { return c.TLSConfig }).DialTLSContext,
+			DialTLSContext:        recordingDialer(FailurePhaseProxyConnect, newConnectDialer(u, func() *tls.Config { return c.TLSConfig }).DialTLSContext),
 		}
 		c.HTTP = &http.Client{Transport: viaProxy}
 		c.tunneled = &http.Client{Transport: tunneled}
@@ -117,8 +128,8 @@ func NewClientFor(p *config.Proxy) (*Client, error) {
 		tr := &http.Transport{
 			ResponseHeaderTimeout: config.ConnectTimeout,
 			IdleConnTimeout:       config.IdleConnTimeout,
-			DialContext:           socks.DialContext,
-			DialTLSContext:        originTLSDialer(socks.DialContext, func() *tls.Config { return c.TLSConfig }),
+			DialContext:           recordingDialer(FailurePhaseProxyConnect, socks.DialContext),
+			DialTLSContext:        recordingDialer(FailurePhaseProxyConnect, originTLSDialer(socks.DialContext, func() *tls.Config { return c.TLSConfig })),
 		}
 		c.HTTP = &http.Client{Transport: tr}
 	default:
