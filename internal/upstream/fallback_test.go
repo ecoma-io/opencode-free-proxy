@@ -220,8 +220,15 @@ func TestExecuteFirstEgressServes(t *testing.T) {
 
 // TestExecuteFallsBackOnPreRequestTransportFailure: the ONLY shape that moves
 // an egress — a dial that provably never put a request on the wire. a's
-// transport points at a closed port; b serves; a is marked unhealthy (it is
-// the side that failed) and the winner's success marks b healthy.
+// transport points at a closed port; b serves; the request moves, and the
+// winner's success marks b healthy.
+//
+// a is NOT marked unhealthy, and that is the rule rather than an oversight
+// (issue #62): `target_connect` is the DIRECT path to the destination, so this
+// failure is evidence about the destination — not about a's ability to carry a
+// request. The move and the mark are separate decisions; the health-marking
+// side of the split is pinned by health_predicate_test.go, which drives a
+// failure the EGRESS owns.
 func TestExecuteFallsBackOnPreRequestTransportFailure(t *testing.T) {
 	f := newExecutorFixture(t, map[string]int{"a": 200, "b": 200})
 	defer f.Close()
@@ -241,8 +248,8 @@ func TestExecuteFallsBackOnPreRequestTransportFailure(t *testing.T) {
 	if f.rec.count("a") != 0 || f.rec.count("b") != 1 {
 		t.Fatalf("calls a=%d b=%d, want 0/1 (a's dial never reached a server)", f.rec.count("a"), f.rec.count("b"))
 	}
-	if f.health.Healthy(healthKey("a"), testHealthPolicy) {
-		t.Fatal("a's failed dial must mark it unhealthy (egress-path health)")
+	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
+		t.Fatal("a target_connect failure is the destination's fault: it may move the request but must not quarantine the egress")
 	}
 	if !f.health.Healthy(healthKey("b"), testHealthPolicy) {
 		t.Fatal("b's success must mark it healthy")

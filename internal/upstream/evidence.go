@@ -55,8 +55,12 @@ const (
 // HealthDecision names the health observation this dial produced. There is
 // deliberately no "reset" value: a successful dial gets NO row (the completion
 // line owns success telemetry), so every row is a failure observation and only
-// marked (poisoned the streak) or neutral (429/4xx/cancel — verdicts about the
-// request, not the egress) can appear.
+// marked (poisoned the streak — the failing step was performed against the
+// egress endpoint itself) or neutral (everything else: a provider verdict, a
+// cancellation, or a destination-side transport failure like target_connect or
+// origin_tls, none of which is evidence about this egress — issue #62) can
+// appear. A row whose fallback decision is `fallback` and whose health decision
+// is `neutral` is the ordinary shape of a provider outage.
 const (
 	HealthMarked  = "marked"
 	HealthNeutral = "neutral"
@@ -118,10 +122,11 @@ type Row struct {
 	// carries no direction); RequestState is always one of
 	// unknown/not_sent/response_started.
 	//
-	// These fields ARE the decision inputs: the executor reads
-	// ReplaySafe() — origin = transport AND request_state = not_sent — for
-	// both the health mark and the fallback move (issue #53). Class says what
-	// went wrong; only these say whether re-sending is safe.
+	// These fields ARE the decision inputs: the executor reads ReplaySafe() —
+	// origin = transport AND request_state = not_sent — for the fallback move,
+	// and MarksEgressHealth() — the phase belongs to the egress endpoint — for
+	// the health mark (issue #62). Class says what went wrong; only these say
+	// whether re-sending is safe and whose fault it was.
 	Origin       string
 	FailurePhase string
 	RequestState string

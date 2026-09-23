@@ -7,8 +7,10 @@
 // concerns — routing chooses where to start, fallback chooses what to try
 // after a failure that PROVABLY happened before the request was sent, health
 // decides whether an egress is temporarily eligible. They never collapse into
-// one policy — fallback and health share one predicate (upstream.Failure
-// .ReplaySafe) but remain separate decisions on separate budgets.
+// one policy — fallback and health read separate predicates off one failure
+// (upstream.Failure.ReplaySafe for the move, the narrower
+// upstream.Failure.MarksEgressHealth for the mark, issue #62) and remain
+// separate decisions on separate budgets.
 package config
 
 import (

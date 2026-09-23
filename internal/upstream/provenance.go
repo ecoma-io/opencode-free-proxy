@@ -19,8 +19,10 @@ import (
 // ClassTimeout/ClassConnectionError, yet only the first may be replayed on
 // another egress. This file carries that second axis as a SEPARATE value
 // rather than widening the enum, so `Class` keeps the shape the JS taxonomy
-// gave it while `ReplaySafe()` is what the health mark and the egress move
-// both read (issue #53, docs/recovery-semantics.md).
+// gave it while `ReplaySafe()` is what the egress move reads (issue #53,
+// docs/recovery-semantics.md) and `MarksEgressHealth()` is what the health mark
+// reads (issue #62) — two questions, two predicates, and the same axis answers
+// both.
 //
 // The rules, stated once:
 //
@@ -220,14 +222,100 @@ type Failure struct {
 // is the provider's own answer (OriginUpstream) and is never replayable here;
 // an unproven state (unknown) is never replayable either.
 //
-// It is the ONE predicate the recovery policy reads: the executor gates the
-// egress move and the health mark on it (fallback.go), so the two can never
-// disagree about whether the egress was at fault. It is also what the router
-// attributes a response with on the wire — the phase and request state are
-// only meaningful to a caller because this definition is the contract's
-// (provenance_header.go, docs/recovery-semantics.md).
+// It is the predicate the executor gates the EGRESS MOVE on (fallback.go), and
+// the router attributes a response with it on the wire — the phase and request
+// state are only meaningful to a caller because this definition is the
+// contract's (provenance_header.go, docs/recovery-semantics.md).
+//
+// It is NOT the predicate that gates the health mark, and the two were one
+// predicate only until issue #62: "may this request be re-sent" and "is this
+// egress broken" are different questions with different answers at the
+// destination end of the path. See MarksEgressHealth.
 func (f Failure) ReplaySafe() bool {
 	return f.Origin == OriginTransport && f.RequestState == RequestStateNotSent
+}
+
+// MarksEgressHealth reports whether this failure is evidence about the EGRESS
+// PATH's own ability to carry traffic — the second question recovery asks, and
+// a different one from ReplaySafe:
+//
+//   - ReplaySafe asks about THIS REQUEST — may it be re-sent without the
+//     provider doing the work twice? It is answered by what the request byte
+//     did, so it is a property of the request.
+//   - MarksEgressHealth asks about the EGRESS — would trying this path again
+//     probably fail the same way? It is answered by WHICH STEP failed, so it
+//     is a property of the path.
+//
+// The two coincide whenever the failing step is one this process performs
+// against the egress endpoint itself, which is why one predicate covered both
+// for as long as it did (issue #53). They come apart at the destination end of
+// the path — and that difference is not academic: a failure that is replay-safe
+// but says nothing about the egress must still move the request, and must never
+// quarantine the egress (issue #62).
+//
+// The rule, stated once: a failure marks the egress exactly when the step that
+// failed is one this process performs against the EGRESS ENDPOINT ITSELF —
+// dialing it, speaking TLS to it, authenticating to it, negotiating SOCKS5 with
+// it, or writing the proxy protocol request to it. Every step at or beyond the
+// DESTINATION is neutral, because it reports on the destination:
+//
+//	proxy_connect    the egress endpoint is unreachable                marks
+//	proxy_tls        reached it, could not speak to it                 marks
+//	proxy_auth       it refused our credentials                        marks
+//	socks5_greeting  it does not speak SOCKS5 (version/method reply)   marks
+//	socks5_auth      RFC 1929 username/password exchange rejected      marks
+//	connect_write    the CONNECT request could not be written to it    marks
+//	connect_read     the CONNECT reply — see the caveat below          neutral
+//	socks5_connect   the RFC 1928 §4 CONNECT reply, and the local DNS
+//	                 resolution that precedes it                       neutral
+//	target_connect   the destination itself refused                    neutral
+//	origin_tls       the destination's own handshake failed            neutral
+//	nothing          a pooled connection, or a post-dial error whose
+//	                 type carries no direction (FailurePhaseNone)      neutral
+//
+// The four neutral transport rows are the point of the split. Marking
+// target_connect would quarantine every egress in the pool whenever the
+// DESTINATION is down — a provider outage would become a gateway outage, and
+// the cooldown would outlive the outage that armed it. Marking origin_tls
+// would do the same for the origin's certificate. Marking a CONNECT refusal
+// would do it to a proxy that is up and correct but having a bad minute
+// reaching one origin — exactly the case a shared egress pool exists to
+// absorb. None of those three says anything about whether THIS egress can
+// carry a request.
+//
+// Honest caveat, stated rather than hidden: `connect_read` and `socks5_connect`
+// each cover two failures the taxonomy does not separate — "the egress answered
+// about the destination" (neutral: the answer is about the destination) and
+// "the egress died while answering" (which would be its fault). Separating them
+// would take a new phase on each proxy protocol, and it would not change a
+// decision: both are replay-safe, so the request moves on either way. The cost
+// of the neutral choice is one wasted dial on an egress that closes CONNECTs
+// without a status line; the cost of the other choice is quarantining a healthy
+// member of a shared pool on evidence that does not implicate it. The direction
+// is deliberate, and the evidence row still names the phase and the error.
+//
+// Only OriginTransport can mark: a provider verdict (OriginUpstream) is the
+// provider's answer about a request, and a client cancellation (OriginClient)
+// has no egress fact in it — their phases are non-marking regardless.
+//
+// A phase added later is neutral by default, mirroring RequestStateUnknown: the
+// zero value of every axis in this file is the one that authorises nothing, so a
+// new step has to be argued onto the marking list rather than drifting onto it.
+func (f Failure) MarksEgressHealth() bool {
+	if f.Origin != OriginTransport {
+		return false
+	}
+	switch f.Phase {
+	case FailurePhaseProxyConnect,
+		FailurePhaseProxyTLS,
+		FailurePhaseProxyAuth,
+		FailurePhaseSocks5Greeting,
+		FailurePhaseSocks5Auth,
+		FailurePhaseConnectWrite:
+		return true
+	default:
+		return false
+	}
 }
 
 // statusFailure is the provenance of an HTTP verdict: a response exists, so

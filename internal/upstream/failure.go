@@ -98,14 +98,17 @@ func (c Class) String() string {
 // response-header timeout was wrong to include and a proxy-connect refusal
 // was right to.
 //
-// Both predicates are now the same one, on the failure's provenance:
+// The decisions now read the failure's provenance instead, and since issue #62
+// they read TWO predicates that answer two different questions:
 //
-//	Failure.ReplaySafe() == origin = transport && request_state = not_sent
+//	Failure.ReplaySafe()       == origin = transport && request_state = not_sent
+//	Failure.MarksEgressHealth() == a failing phase performed against the egress
+//	                              endpoint itself (provenance.go)
 //
-// — a failure at a dial phase this process performs itself, before any
-// request byte existed. That is exactly "the egress, not the provider,
-// failed", so it authorises BOTH the health mark and the egress move, and
-// there is no second table to keep in sync with it.
+// The first is about the REQUEST (may it be re-sent without duplicating provider
+// work) and gates the egress move; the second is about the PATH (is this egress
+// broken) and gates the health mark. Neither is a table keyed by class, and
+// there is no second table to keep in sync with either.
 
 // proxyAuthError is produced ONLY by the transport boundary speaking the
 // proxy's own protocol (connect.go: the proxy answered CONNECT with 407;

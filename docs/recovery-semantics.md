@@ -156,21 +156,23 @@ The layer that cannot prove a thing does not get to decide it.
 
 ## OFP behaviour
 
-| Upstream interaction                              | OFP action                            | New egress? | Health  | Provider retry |
-| ------------------------------------------------- | ------------------------------------- | ----------- | ------- | -------------- |
-| provider 2xx                                      | relay                                 | no          | reset   | no             |
-| provider 429                                      | relay the 429 verbatim                | no          | neutral | no             |
-| provider 4xx                                      | relay the 4xx verbatim                | no          | neutral | no             |
-| provider 5xx                                      | relay the 5xx verbatim                | no          | neutral | no             |
-| proxy TCP connect / proxy TLS failure             | gateway-origin failure                | **yes**     | marked  | no             |
-| proxy auth refusal (CONNECT 407, SOCKS5 RFC 1929) | gateway-origin failure                | **yes**     | marked  | no             |
-| SOCKS5 negotiation / CONNECT refusal              | gateway-origin failure                | **yes**     | marked  | no             |
-| target TCP connect failure                        | gateway-origin failure                | **yes**     | marked  | no             |
-| origin TLS handshake failure                      | gateway-origin failure                | **yes**     | marked  | no             |
-| request write failure                             | gateway-origin failure, **no replay** | no          | neutral | no             |
-| response-header timeout / reset after write       | gateway-origin failure, **no replay** | no          | neutral | no             |
-| response body death after headers                 | abort downstream, commitment stands   | no          | neutral | no             |
-| client cancellation                               | abort, nothing to deliver to          | no          | neutral | no             |
+| Upstream interaction                                   | OFP action                            | New egress? | Health  | Provider retry |
+| ------------------------------------------------------ | ------------------------------------- | ----------- | ------- | -------------- |
+| provider 2xx                                           | relay                                 | no          | reset   | no             |
+| provider 429                                           | relay the 429 verbatim                | no          | neutral | no             |
+| provider 4xx                                           | relay the 4xx verbatim                | no          | neutral | no             |
+| provider 5xx                                           | relay the 5xx verbatim                | no          | neutral | no             |
+| proxy TCP connect / proxy TLS failure                  | gateway-origin failure                | **yes**     | marked  | no             |
+| proxy auth refusal (CONNECT 407, SOCKS5 RFC 1929)      | gateway-origin failure                | **yes**     | marked  | no             |
+| SOCKS5 greeting / version negotiation failure          | gateway-origin failure                | **yes**     | marked  | no             |
+| CONNECT request could not be written to the proxy      | gateway-origin failure                | **yes**     | marked  | no             |
+| CONNECT refusal — the proxy could not reach the origin | gateway-origin failure                | **yes**     | neutral | no             |
+| target TCP connect failure                             | gateway-origin failure                | **yes**     | neutral | no             |
+| origin TLS handshake failure                           | gateway-origin failure                | **yes**     | neutral | no             |
+| request write failure                                  | gateway-origin failure, **no replay** | no          | neutral | no             |
+| response-header timeout / reset after write            | gateway-origin failure, **no replay** | no          | neutral | no             |
+| response body death after headers                      | abort downstream, commitment stands   | no          | neutral | no             |
+| client cancellation                                    | abort, nothing to deliver to          | no          | neutral | no             |
 
 "New egress?" is the safe-failover rule applied to the row's provenance.
 "Health" is the next section. "Provider retry" is `no` everywhere by
@@ -181,23 +183,73 @@ construction: OFP makes exactly one logical upstream call per attempt.
 The health registry measures **egress-path health only** — whether this
 egress can carry a request at all.
 
-May mark an egress unhealthy: proxy connect failure, proxy auth failure,
-SOCKS5 negotiation failure, CONNECT failure, target TCP connect failure, TLS
-handshake failure.
+May mark an egress unhealthy: a failure at the TCP dial to the proxy, the TLS
+hop to an https proxy endpoint, the proxy credential exchange (CONNECT 407 /
+SOCKS5 method or RFC 1929 exchange), the SOCKS5 greeting, or the write of the
+CONNECT request to the proxy — every step this process performs **against the
+egress endpoint itself**.
 
 Must **never** mark an egress unhealthy: any provider HTTP status (429, 4xx,
 5xx alike), a response-header timeout after transmission, a request write
-failure, a response-body failure, or a client cancellation.
+failure, a response-body failure, a client cancellation — **or a
+destination-side transport failure**: a target TCP connect refusal, an origin
+TLS handshake failure, or a CONNECT refusal by a proxy that answered for an
+origin it could not reach.
 
 The reason is the same in every case: those outcomes are verdicts about a
-**request** or about the provider's behaviour, not about the egress's ability
-to serve. Poisoning the egress on them would suppress a healthy path and
-invert the meaning of the health table.
+**request**, about the provider's behaviour, or about a **destination** — not
+about the egress's ability to serve. Poisoning the egress on them would
+suppress a healthy path and invert the meaning of the health table.
 
-Note the consequence: health and failover collapse to the **same predicate**
-— `origin = transport ∧ request_state = not_sent`. An egress is marked
-exactly when a failure proved that the egress, not the provider, failed. There
-is deliberately no second rule to keep in sync.
+### Two questions, two predicates
+
+Health and failover do **not** share a predicate (revised by issue #62). They
+answer different questions off the same recorded failure:
+
+```text
+failover MAY    ⇔  ReplaySafe()         is re-sending THIS REQUEST safe?
+                   origin = transport ∧ request_state = not_sent
+health marked   ⇔  MarksEgressHealth()  would THIS EGRESS fail the next request
+                   the failing step was performed against the egress endpoint
+```
+
+The two coincide whenever the failing step is one this process performs against
+the egress endpoint itself, which is why one predicate served both for as long
+as it did. They come apart at the destination end of the path, and they are not
+nested in either direction:
+
+- a **destination-side** failure (`target_connect`, `origin_tls`,
+  `connect_read`, `socks5_connect`) is replay-safe and marks nothing, so the
+  request moves on while the egress stays in rotation;
+- a **later hop's** egress-side failure on a call that already transmitted is
+  marked and is **not** replay-safe, so the egress leaves the rotation while
+  the request stops where it is.
+
+The second direction is safe by construction — a health mark authorises
+nothing; only replay-safety moves a request. The first direction is the one
+that matters for availability: `origin = transport ∧ not_sent` is _not_ the
+same as "the egress, not the provider, failed", because a **destination** that
+refuses the connection satisfies it exactly. Marking on it turns a provider
+outage into a gateway outage — every egress in the pool fails the same way,
+every failure arms the threshold, and the pool quarantines itself for the whole
+cooldown, outliving the outage it recorded.
+
+Two consequences worth stating outright, because they follow from the rule
+rather than from an implementation detail:
+
+- **A direct egress can never be marked unhealthy.** Its only steps are the
+  dial and the handshake to the destination; this layer cannot tell "the
+  destination is down" from "this host has no route", and a mark that cannot
+  separate those would quarantine every egress at once. The registry exists to
+  drop a _path_ that is broken relative to its siblings, which is a question
+  only a proxy egress can answer.
+- **A proxy that dies mid-CONNECT-reply is not marked** (`connect_read` /
+  `socks5_connect` cover both "the egress answered about the destination" and
+  "the egress died while answering"). Separating them would take a new phase on
+  each proxy protocol and would not change a decision — both are replay-safe,
+  so the request moves either way. The cost of the neutral choice is one wasted
+  dial; the cost of the other choice is quarantining a healthy member of a
+  shared pool on evidence that does not implicate it.
 
 ## Evidence
 
@@ -331,18 +383,18 @@ an intent from a provider status in its place.
 
 ## Status
 
-| Contract element                                   | State                                                                                               |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| Provenance model (origin / phase / request_state)  | **in force** — recorded on every evidence row                                                       |
-| Proof boundary at the transport layers             | **in force** — dial phases recorded by the dialers                                                  |
-| `not_sent` never claimed without a dial            | **in force**, pinned by test                                                                        |
-| Provider HTTP responses terminal at OFP            | **in force** — one logical upstream call per attempt                                                |
-| Safe-failover-only egress movement                 | **in force** — `Failure.ReplaySafe()` gates the move                                                |
-| Health = egress-path health only                   | **in force** — the same predicate gates the mark                                                    |
-| Evidence vocabulary without retry-matrix fields    | **in force** — rows carry phase/origin/state/decisions                                              |
-| Inbound `X-OFP-*` stripped before any stage        | **in force**, pinned by test                                                                        |
-| `failure_origin` on the internal response envelope | **in force** — `X-OFP-Failure-Origin/Phase`/`Request-State`                                         |
-| OFP ↔ RPGW egress intent                           | OFP side **in force** (selector seam + recorded intent); RPGW side a recorded cross-repo dependency |
+| Contract element                                   | State                                                                                                   |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Provenance model (origin / phase / request_state)  | **in force** — recorded on every evidence row                                                           |
+| Proof boundary at the transport layers             | **in force** — dial phases recorded by the dialers                                                      |
+| `not_sent` never claimed without a dial            | **in force**, pinned by test                                                                            |
+| Provider HTTP responses terminal at OFP            | **in force** — one logical upstream call per attempt                                                    |
+| Safe-failover-only egress movement                 | **in force** — `Failure.ReplaySafe()` gates the move                                                    |
+| Health = egress-path health only                   | **in force** — `Failure.MarksEgressHealth()` gates the mark (issue #62: a separate, narrower predicate) |
+| Evidence vocabulary without retry-matrix fields    | **in force** — rows carry phase/origin/state/decisions                                                  |
+| Inbound `X-OFP-*` stripped before any stage        | **in force**, pinned by test                                                                            |
+| `failure_origin` on the internal response envelope | **in force** — `X-OFP-Failure-Origin/Phase`/`Request-State`                                             |
+| OFP ↔ RPGW egress intent                           | OFP side **in force** (selector seam + recorded intent); RPGW side a recorded cross-repo dependency     |
 
 The revision that delivers each row is named in its pull request; this table
 is updated in the same commit as the behaviour it describes.

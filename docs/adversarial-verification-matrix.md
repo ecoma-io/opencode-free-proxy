@@ -53,18 +53,34 @@ recorded**.
 - **Evidence the gates recorded:** the e2e suite relays a real 429 from the
   fake provider and asserts no health mark and no second dial.
 
-### R2 — Replay-safety is one predicate, shared by the health mark and the egress move
+### R2 — Replay-safety gates the egress move; egress health is a separate predicate
 
-- **Contract:** a failure may drive both the health mark and the egress move
-  only under `ReplaySafe() == (Origin == transport && RequestState ==
-not_sent)`. One predicate; the executor and the health registry cannot
-  disagree.
-- **Guard seam:** `internal/upstream/provenance.go:216`
-  (`failure.ReplaySafe()`, the single predicate) and `internal/upstream/
-fallback.go:242` (the executor reads it to decide the move + health mark).
-- **Pinned by:** `internal/router/intent_router_test.go` —
-  TestEvidenceRecordsEgressIntentAcrossAReplaySafeFallback; the A-L pins in
-  `internal/upstream/provenance_test.go`, `internal/upstream/fallback_test.go`.
+> **Revised by issue #62.** As written in the session above, this row stated
+> that one predicate drove both decisions. That is no longer the contract: the
+> two answer different questions and are not nested. The row below is the
+> contract as it stands now; the revision is recorded here rather than
+> overwritten silently.
+
+- **Contract:** a failure drives an egress move only under `ReplaySafe() ==
+(Origin == transport && RequestState == not_sent)`, and marks an egress
+  unhealthy only under `MarksEgressHealth()` — the failing phase is one
+  performed against the egress endpoint itself (proxy connect/TLS/auth, SOCKS5
+  greeting/auth, CONNECT write). A destination-side failure (`target_connect`,
+  `origin_tls`, `connect_read`, `socks5_connect`) therefore moves the request
+  WITHOUT quarantining the egress, and a later hop's egress-side failure on a
+  call that already transmitted marks the egress without authorising a move.
+- **Guard seam:** `internal/upstream/provenance.go` (`Failure.ReplaySafe`,
+  `Failure.MarksEgressHealth`) and `internal/upstream/fallback.go` (the
+  executor reads one for the move, the other for the mark).
+- **Pinned by:** `internal/upstream/health_predicate_test.go` —
+  TestReplaySafetyAndEgressHealthAreSeparateDecisions (both directions, real
+  fixtures), TestOutageAttributionDecidesWhetherThePoolIsQuarantined (a
+  provider outage leaves every egress eligible; the same run with an
+  egress-side failure quarantines all three), TestMarkingFailureDoesNotMoveTheRequest,
+  TestPhaseAttributionDecidesTheHealthMark; plus
+  `internal/upstream/fallback_test.go`,
+  `internal/upstream/fallback_evidence_test.go`,
+  `internal/router/intent_router_test.go`.
 - **Adversarial note (verified absent):** grep for status-keyed retry across
   `internal/` returns **zero** non-test callers of a status-derived replay
   decision.
@@ -89,7 +105,7 @@ fallback.go:242` (the executor reads it to decide the move + health mark).
 
 - **Contract:** `internal/upstream/evidence.go` is the ONLY recorder; only it
   appends rows. `internal/router/evidence_log.go` is the ONLY emit boundary —
-  rows become log lines there and only there�乐, and each evidence event
+  rows become log lines there and only there, and each evidence event
   renders once per row with a hard `EvidenceMaxRows` cap and a `dropped`
   counter when the recorder overflows.
 - **Guard seam:** `internal/router/evidence_log.go` (emit boundary; render-
@@ -149,15 +165,15 @@ and never invented.
 
 ## Status
 
-| Contract element                                   | State                                                             | Pinned by                                 |
-| -------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------- |
-| Provider responses terminal at OFP                 | **in force**                                                      | R1 (terminal_test.go, e2e 429)            |
-| One replay-safe predicate gates move + health mark | **in force**                                                      | R2 (fallback.go:242, provenance.go:216)   |
-| Intent recorded, never derived / never inbound     | **in force**                                                      | R3 (intent tests + forged-header pins)    |
-| Single emit boundary, bounded, dropped counted     | **in force**                                                      | R4 (evidence_log.go + cap tests)          |
-| Replay-safe failover moves to distinct egress only | **in force**                                                      | R5 (intent exclusion + terminal tests)    |
-| Provenance-labelled, unforgeable inbound           | **in force**                                                      | R6 (provenance header tests)              |
-| OFP ↔ RPGW egress intent                           | OFP side **in force**; RPGW side a recorded cross-repo dependency | R7 (routing intent seam + cross-repo row) |
+| Contract element                                               | State                                                             | Pinned by                                                 |
+| -------------------------------------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------- |
+| Provider responses terminal at OFP                             | **in force**                                                      | R1 (terminal_test.go, e2e 429)                            |
+| Replay-safety gates the move; egress health is a separate mark | **in force** (revised by #62)                                     | R2 (provenance.go, fallback.go, health_predicate_test.go) |
+| Intent recorded, never derived / never inbound                 | **in force**                                                      | R3 (intent tests + forged-header pins)                    |
+| Single emit boundary, bounded, dropped counted                 | **in force**                                                      | R4 (evidence_log.go + cap tests)                          |
+| Replay-safe failover moves to distinct egress only             | **in force**                                                      | R5 (intent exclusion + terminal tests)                    |
+| Provenance-labelled, unforgeable inbound                       | **in force**                                                      | R6 (provenance header tests)                              |
+| OFP ↔ RPGW egress intent                                       | OFP side **in force**; RPGW side a recorded cross-repo dependency | R7 (routing intent seam + cross-repo row)                 |
 
 ## Adversarial review notes (honest gaps, not dodged claims)
 

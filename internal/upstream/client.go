@@ -185,8 +185,9 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 //
 // The failure is returned, not just its class: the class says what went
 // wrong, and ONLY the provenance says whether re-sending could duplicate the
-// provider's work. `Failure.ReplaySafe()` is the executor's fallback and
-// health predicate.
+// provider's work. `Failure.ReplaySafe()` is the executor's fallback
+// predicate; the health mark reads the narrower `Failure.MarksEgressHealth()`
+// (issue #62), which is a question about the egress rather than the request.
 func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, rec *Recorder) (*http.Response, *UpstreamError, Failure) {
 	// buildHeaders runs at the TOP of the dial, including the first — mirroring
 	// base.js:127-130, where transformRequest and buildHeaders re-run per
