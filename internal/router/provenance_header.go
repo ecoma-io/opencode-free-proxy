@@ -24,7 +24,7 @@ import (
 //
 //	X-OFP-Failure-Origin: upstream | gateway
 //	X-OFP-Failure-Phase:  <dial/transport phase>   (gateway only, absent if unattributable)
-//	X-OFP-Request-State:  not_sent | unknown       (gateway only)
+//	X-OFP-Request-State:  not_sent | unknown | response_started   (gateway only)
 //	X-OFP-Egress:         <configured egress id>   (existing; success only)
 //
 // Absence means "this response is not an upstream-interaction outcome" — a
@@ -57,12 +57,16 @@ const (
 //     4xx/5xx including 429), so the status and body are its own, relayed
 //     verbatim. No phase or state is emitted: those describe a REQUEST's
 //     fate, and a request that was answered has no open question about it.
-//   - OriginTransport: no provider response exists; OFP produced this status
-//     because the egress path failed. The phase and the proven request state
-//     ride along so the caller can decide whether its own retry may re-send
-//     without inferring anything from a status code. The state is one of
-//     not_sent | unknown by construction — a transport failure never has a
-//     response, which is what makes `response_started` unreachable here.
+//   - OriginTransport: the egress path failed and no provider response exists
+//     FOR THE FAILING HOP; OFP produced this status because of it. The phase
+//     and the proven request state ride along so the caller can decide whether
+//     its own retry may re-send without inferring anything from a status code.
+//     Only not_sent authorises a re-send: it says the whole logical call
+//     provably never put a request byte on the wire. unknown says the call
+//     cannot be proven either way, and response_started says a response HAD
+//     been received on this call before the hop that failed — a followed
+//     redirect on an earlier hop (issue #60). The last two both forbid a
+//     re-send, which is the only decision this header is read for.
 //   - OriginClient: the caller went away mid-attempt. No provenance is
 //     written: no upstream interaction concluded and neither side can be
 //     blamed, so the honest answer is the absent header, not a label.

@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
 )
 
 // provenance.go — WHERE an upstream failure happened, and HOW MUCH of the
@@ -22,9 +24,16 @@ import (
 //
 // The rules, stated once:
 //
+//   - The state belongs to the LOGICAL CALL, not to a hop (issue #60). One
+//     intent to obtain one model response may take several network
+//     interactions — a redirect hop, a fresh connection — and it ends exactly
+//     once (docs/recovery-semantics.md, Vocabulary). A hop that dials after an
+//     earlier hop already transmitted cannot claim the request never went out;
+//     the call's transmission record is monotonic and outlives every hop.
 //   - not_sent may be claimed ONLY from a boundary that can prove it: the
 //     dial / TLS / proxy-protocol phases this package performs itself, every
-//     one of which completes before net/http is handed a connection.
+//     one of which completes before net/http is handed a connection — and
+//     only while NO hop of the call has handed a request byte to one.
 //   - Everything after that hand-over (request write, response headers) is
 //     UNKNOWN. This layer cannot prove what left the process, so it must not
 //     guess — unknown authorises nothing.
@@ -170,10 +179,14 @@ const (
 	// RequestStateNotSent: the request provably never left this process — the dial,
 	// the proxy protocol, or the origin TLS handshake failed before net/http
 	// was given a connection, or the connection came up and the transport
-	// never wrote a byte through it.
+	// never wrote a byte through it — AND no earlier hop of the same logical
+	// call wrote one either (the claim is about the call, issue #60).
 	RequestStateNotSent
-	// RequestStateResponseStarted: the provider answered. The response is terminal
+	// RequestStateResponseStarted: a response arrived. The response is terminal
 	// for this layer; the request is not replayable under any circumstance.
+	// On a transport failure this is the state a later hop inherits from an
+	// earlier one that was already answered — the redirect that made it a
+	// multi-hop call proves a response existed on this logical call.
 	RequestStateResponseStarted
 )
 
@@ -247,28 +260,80 @@ func classifyTransportFailure(ctx context.Context, err error, trace *dialTrace) 
 	return f
 }
 
-// dialTrace is one attempt's record of what the egress path did. It is written
-// by the dialers this package owns and read once, after the attempt returns.
+// callTrace is the logical upstream call's delivery record: the facts that
+// hold for the whole call however many hops it takes. Both are monotonic —
+// once a byte or a response byte has existed, no later hop may un-know it
+// (issue #60).
 //
-// Why it exists at all: the phase must come from the code that spoke the
-// protocol, but classification happens at the call site that only sees an
-// error value. The trace is carried in the request context (net/http's dial
+// Both flags are written from goroutines the caller does not own (the dial
+// goroutine, the transport's write loop) and read once the hop has returned,
+// so they are atomic rather than plain bools.
+type callTrace struct {
+	// transmitted: a request byte was handed to a connection on SOME hop of
+	// this call. Set by the per-hop write hook.
+	transmitted atomic.Bool
+	// responded: a response was received on SOME hop — for a multi-hop call,
+	// the redirect that made it multi-hop.
+	responded atomic.Bool
+}
+
+// noteResponse records that a hop received a response. Only a hop whose
+// response was a followed redirect leaves the call running, so this is the
+// fact a LATER hop's failure inherits.
+func (c *callTrace) noteResponse() {
+	if c != nil {
+		c.responded.Store(true)
+	}
+}
+
+// state is the request state a hop's failure inherits from the call's history
+// when that history forbids not_sent: a call that was already answered reports
+// response_started, and one that transmitted without being answered (or whose
+// answer this process never saw) reports unknown. Neither authorises a replay.
+func (c *callTrace) state() RequestState {
+	if c != nil && c.responded.Load() {
+		return RequestStateResponseStarted
+	}
+	return RequestStateUnknown
+}
+
+// dialTrace is ONE HOP's record of what the egress path did. It is written by
+// the dialers this package owns, by the request-write hook, and read once,
+// after the hop returns. Every hop of a logical call gets its own: a hop's
+// dial facts describe that hop only, and the call-level monotonic facts live
+// in callTrace.
+//
+// Why the split exists at all (issue #60): the phase must come from the code
+// that spoke the protocol, but classification happens at the call site that
+// only sees an error value — and a redirect chain has several dials and
+// several writes under ONE logical call. A single trace reused across hops
+// both loses the call's history (hop 1's write is invisible to hop 2's dial
+// failure, so hop 2 claims not_sent and the request is re-sent) and corrupts
+// the hop's own facts (hop 1's successful dial masks hop 2's failed one).
+// Per-hop records plus a monotonic call record is the shape that cannot say
+// either of those things.
+//
+// The trace reaches the dialers through the request context (net/http's dial
 // context retains context VALUES — net/http/transport.go getConn builds it
-// with context.WithoutCancel — so a custom DialContext/DialTLSContext sees it),
-// and it is the dialer, not the classifier, that knows whether a dial happened
-// and how far it got.
+// with context.WithoutCancel — so a custom DialContext/DialTLSContext sees
+// it), and it is the dialer, not the classifier, that knows whether a dial
+// happened and how far it got.
 //
 // The mutex is not decoration: a transport may dial on its own goroutine, and
-// the write flag is set from within that dial's conn while the classifier
-// reads the trace on the request goroutine. Channel hand-off makes the common
-// path happen-before, but the trace outlives the dial and a redirect chain
-// reuses one trace across hops — the lock removes the question entirely at the
-// cost of one uncontended acquisition per phase.
+// the write hook fires on the transport's write loop. Channel hand-off makes
+// the common path happen-before, but the lock removes the question entirely at
+// the cost of one uncontended acquisition per phase.
+//
+// A hop's trace may also outlive the hop: a dial whose request was abandoned
+// (a context cancel, a per-hop timeout) keeps running to completion in the
+// transport, and writes into ITS OWN hop's trace. That is exactly why the
+// record is per hop — a late writer can never pollute the next hop's record.
 type dialTrace struct {
+	call   *callTrace
 	mu     sync.Mutex
-	dialed bool // a dial was STARTED in this attempt (not necessarily finished)
+	dialed bool // a dial was STARTED in this hop (not necessarily finished)
 	dialOK bool // ... and finished successfully
-	wrote  bool // the transport handed request bytes to the returned conn
+	wrote  bool // the transport handed request bytes to a conn during this hop
 	phase  FailurePhase
 }
 
@@ -308,11 +373,18 @@ func (t *dialTrace) succeeded() {
 	t.mu.Unlock()
 }
 
-// markWrite records that the transport attempted a write through the conn it
-// was handed. Set on ENTRY to the write, before the underlying write runs, and
-// deliberately conservative: a write that fails partway may still have put a
-// prefix on the wire, so an attempted write can never be followed by a
-// not_sent claim.
+// markWrite records that this hop handed request bytes to a connection. It is
+// called from the request-write hook on the transport's write loop and is
+// deliberately conservative in two ways:
+//
+//   - it is set for an ATTEMPTED write (the hook fires whether or not the
+//     write returned an error): a write that failed partway may still have put
+//     a prefix on the wire, and no evidence here can tell those apart. The
+//     cost of being wrong in that direction is a failover that did not happen;
+//     the cost of being wrong the other way is a duplicate POST.
+//   - it is set on the hop AND on the call. The hop flag is this hop's
+//     pre-transmission proof; the call flag is monotonic and survives into
+//     every later hop of the same logical call (issue #60).
 func (t *dialTrace) markWrite() {
 	if t == nil {
 		return
@@ -320,11 +392,26 @@ func (t *dialTrace) markWrite() {
 	t.mu.Lock()
 	t.wrote = true
 	t.mu.Unlock()
+	if t.call != nil {
+		t.call.transmitted.Store(true)
+	}
 }
 
-// provenance reduces the trace plus the error's own type to the phase and
-// request state the failure can be attributed. See FailurePhase/RequestState
-// and postDialPhase.
+// writeHook is the httptrace hook that feeds markWrite. It is per REQUEST, not
+// per connection — which is what makes a write over a POOLED connection
+// observable at all: the previous instrument wrapped the conns this call
+// dialed, so a hop served by an already-idle connection transmitted invisibly
+// (issue #60). It also keeps non-request traffic out of the record: a TLS
+// ClientHello is not a request byte and never reaches this hook.
+func (t *dialTrace) writeHook() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { t.markWrite() },
+	}
+}
+
+// provenance reduces the hop's record, the call's history, and the error's own
+// type to the phase and request state the failure can be attributed. See
+// FailurePhase/RequestState and postDialPhase.
 func (t *dialTrace) provenance(err error) (FailurePhase, RequestState) {
 	if t == nil {
 		return FailurePhaseNone, RequestStateUnknown
@@ -333,26 +420,36 @@ func (t *dialTrace) provenance(err error) (FailurePhase, RequestState) {
 	dialed, dialOK, wrote, phase := t.dialed, t.dialOK, t.wrote, t.phase
 	t.mu.Unlock()
 
+	var fp FailurePhase
 	switch {
 	case !dialed:
-		// A pooled connection: the transport reused a live conn, so this
-		// attempt performed no dial at all. Nothing is attributable and
-		// nothing is proven — unknown, never not_sent.
+		// A pooled connection: the transport reused a live conn, so this hop
+		// performed no dial at all. Nothing is attributable and nothing is
+		// proven — unknown, never not_sent.
 		return FailurePhaseNone, RequestStateUnknown
 	case !dialOK:
 		// The dial itself failed: a phase this package performed, entirely
-		// before net/http owned the connection. Provably unsent.
-		return phase, RequestStateNotSent
+		// before net/http owned the connection.
+		fp = phase
 	case !wrote:
-		// The connection came up and the transport never wrote through it, so
-		// nothing from this attempt reached the provider either. The recorded
-		// phase completed successfully, hence no attribution.
-		return FailurePhaseNone, RequestStateNotSent
+		// The connection came up and the transport never handed it a request
+		// byte during this hop. The recorded phase completed successfully,
+		// hence no attribution.
+		fp = FailurePhaseNone
 	default:
-		// Request bytes were handed to the wire. Whatever went wrong after
-		// that is not provably pre-transmission.
+		// Request bytes were handed to a conn during this hop. Whatever went
+		// wrong after that is not provably pre-transmission.
 		return postDialPhase(err), RequestStateUnknown
 	}
+	// fp is a phase this hop provably reached without writing. That is enough
+	// to prove the hop unsent — but not enough to prove the CALL unsent: a
+	// logical call that already transmitted on an earlier hop cannot claim
+	// not_sent for a later hop's dial failure (issue #60). The hop's phase is
+	// still the honest attribution of where THIS hop failed.
+	if t.call != nil && t.call.transmitted.Load() {
+		return fp, t.call.state()
+	}
+	return fp, RequestStateNotSent
 }
 
 // postDialPhase attributes a failure that happened after the connection was
@@ -383,47 +480,41 @@ func postDialPhase(err error) FailurePhase {
 	return FailurePhaseNone
 }
 
-// traceKey is the context key for the per-attempt dial trace. An unexported
+// traceKey is the context key for the current HOP's dial trace. An unexported
 // struct type, so no other package can collide with it.
 type traceKey struct{}
 
-// withDialTrace attaches a fresh trace to one attempt's context.
-func withDialTrace(ctx context.Context) (context.Context, *dialTrace) {
-	t := &dialTrace{}
-	return context.WithValue(ctx, traceKey{}, t), t
+// withHopTrace opens one hop of a logical call: a fresh per-hop record bound to
+// the call's monotonic record, plus the request-write hook that feeds both.
+// attempt calls it once per hop, so every dial and every write below it is
+// attributed to the hop it belongs to (issue #60).
+func withHopTrace(ctx context.Context, call *callTrace) (context.Context, *dialTrace) {
+	hop := &dialTrace{call: call}
+	// Both values must ride the request context: the trace for the dialers,
+	// which read it from net/http's dial context, and the hook for net/http
+	// itself, which reads it from the request context in Request.write.
+	ctx = context.WithValue(ctx, traceKey{}, hop)
+	return httptrace.WithClientTrace(ctx, hop.writeHook()), hop
 }
 
-// traceOf returns the attempt's dial trace, or nil when the context carries
-// none (a client driven directly, or a test exercising a dialer on its own).
-// Every method on *dialTrace is nil-safe, and recordingDialer skips the
+// traceOf returns the current hop's dial trace, or nil when the context
+// carries none (a client driven directly, or a test exercising a dialer on its
+// own). Every method on *dialTrace is nil-safe, and recordingDialer skips the
 // wrapper entirely when there is nothing to record into.
 func traceOf(ctx context.Context) *dialTrace {
 	t, _ := ctx.Value(traceKey{}).(*dialTrace)
 	return t
 }
 
-// recordingConn records that the transport wrote through the connection it was
-// handed. It wraps the FINAL conn of a dial — the one net/http speaks the
-// request into — so the flag means "request bytes were handed to the wire",
-// never "the TLS handshake started" (the handshake happens on the conn this
-// one wraps, inside the dialer).
-type recordingConn struct {
-	net.Conn
-	trace *dialTrace
-}
-
-func (c *recordingConn) Write(b []byte) (int, error) {
-	c.trace.markWrite()
-	return c.Conn.Write(b)
-}
-
-// recordingDialer wraps a dial function so its result is traceable. It brackets
-// the dial: the trace learns a dial started (with base as the baseline phase)
-// and, when the dial returns, whether it completed.
+// recordingDialer wraps a dial function so the hop's trace learns about it. It
+// brackets the dial: the trace learns a dial started (with base as the baseline
+// phase) and, when the dial returns, whether it completed. It no longer wraps
+// the returned conn — request bytes are observed by the write hook, which sees
+// every request including the ones that ride a pooled connection.
 //
-// With no trace in the context — every direct caller and every pre-migration
-// test — the wrapper is transparent: the conn is returned untouched, so no
-// caller can observe the instrumentation.
+// With no trace in the context — every direct caller and every test that
+// exercises a dialer on its own — the wrapper is transparent, so no caller can
+// observe the instrumentation.
 func recordingDialer(base FailurePhase, dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		t := traceOf(ctx)
@@ -436,6 +527,6 @@ func recordingDialer(base FailurePhase, dial func(ctx context.Context, network, 
 			return nil, err
 		}
 		t.succeeded()
-		return &recordingConn{Conn: conn, trace: t}, nil
+		return conn, nil
 	}
 }

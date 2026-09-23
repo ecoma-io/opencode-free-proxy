@@ -251,12 +251,22 @@ transport can _prove_ about transmission. The contract those fields serve is
   proof of non-transmission. An HTTP verdict of any status is
   `response_started` (a response existing proves the request arrived); a
   context cancellation is `client` and proves nothing.
+- **The state belongs to the LOGICAL CALL, and it is monotonic** (issue #60).
+  One attempt may follow redirects, and each hop gets its own dial record
+  while the transmission record — was a request byte handed to a connection,
+  was a response received — is shared and one-way. A hop-2 dial failure on a
+  chain whose hop 1 transmitted is therefore never `not_sent`: it reports the
+  hop's own phase with the call's state (`response_started` once the redirect
+  that made it multi-hop was answered, `unknown` when the call wrote and died
+  unanswered). Request bytes are observed by a per-REQUEST `httptrace`
+  hook, not by wrapping connections, so a write over a pooled connection is
+  seen and a TLS ClientHello is not counted as one.
 - **Proof only at the boundaries this package owns.** The dialers record
   their phase as they climb it — proxy TCP connect, proxy TLS, proxy
   credential exchange, SOCKS5 greeting/auth/CONNECT, CONNECT request/read,
   target TCP connect, origin TLS. A failure at a recorded dial phase is
   `not_sent`; a failure at any phase _after_ the dial succeeded is
-  `not_sent` only if the traced connection never carried a request byte.
+  `not_sent` only if no hop of the call ever carried a request byte.
 - **Everything past the hand-off is `unknown`.** `net/http` owns request
   write, header wait and body read; this package cannot prove what left the
   socket, so a request-write failure, a response-header timeout and a reset

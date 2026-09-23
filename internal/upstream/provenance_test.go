@@ -16,12 +16,23 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"testing"
 	"time"
 
 	"opencode-free-proxy/internal/config"
 )
+
+// transmittedCall is a logical call that has already handed request bytes to a
+// connection on an earlier hop, optionally one that was answered (a followed
+// redirect) or not (a hop that failed after its own write).
+func transmittedCall(responded bool) *callTrace {
+	c := &callTrace{}
+	c.transmitted.Store(true)
+	c.responded.Store(responded)
+	return c
+}
 
 // observedProvenance runs one observed call and returns every row's
 // provenance (the retry matrix may have dialed more than once).
@@ -220,6 +231,11 @@ func TestResponseHeaderTimeoutIsUnknownNotNotSent(t *testing.T) {
 // net/http skips the dial entirely when it reuses a live conn, so a failure on
 // that conn has no phase and must degrade to unknown. The trace is the only
 // place this distinction can be made, and this table is its contract.
+//
+// The last three cases are the logical-call half of it (issue #60): a hop's
+// own record can be spotless and still not authorise not_sent, because the
+// CLAIM IS ABOUT THE CALL. A call that already transmitted — whether it was
+// answered or not — never gets the state back.
 func TestRequestStateNeverClaimsNotSentWithoutADial(t *testing.T) {
 	timeout := &timeoutErr{}
 	cases := []struct {
@@ -284,6 +300,33 @@ func TestRequestStateNeverClaimsNotSentWithoutADial(t *testing.T) {
 			err:       errors.New("something opaque"),
 			wantPhase: FailurePhaseNone,
 			wantState: RequestStateUnknown,
+		},
+		{
+			// The redirect case: hop 1 transmitted and was answered with a
+			// 3xx, hop 2's dial is refused. Hop 2's own facts prove nothing
+			// about the call, which has been on the wire already.
+			name:      "later hop dial failure after the call was transmitted and answered",
+			trace:     &dialTrace{dialed: true, phase: FailurePhaseTargetConnect, call: transmittedCall(true)},
+			err:       errors.New("connection refused"),
+			wantPhase: FailurePhaseTargetConnect,
+			wantState: RequestStateResponseStarted,
+		},
+		{
+			// Same shape without a response: the call wrote and then failed
+			// before any answer. The hop's phase is still the honest
+			// attribution; the state must stop authorising a replay.
+			name:      "later hop dial failure after the call transmitted unanswered",
+			trace:     &dialTrace{dialed: true, phase: FailurePhaseProxyConnect, call: transmittedCall(false)},
+			err:       errors.New("connection refused"),
+			wantPhase: FailurePhaseProxyConnect,
+			wantState: RequestStateUnknown,
+		},
+		{
+			name:      "fresh hop that never wrote, after the call transmitted",
+			trace:     &dialTrace{dialed: true, dialOK: true, call: transmittedCall(true)},
+			err:       errors.New("use of closed network connection"),
+			wantPhase: FailurePhaseNone,
+			wantState: RequestStateResponseStarted,
 		},
 	}
 	for _, tc := range cases {
@@ -399,32 +442,80 @@ func TestProvenanceStringsAreStable(t *testing.T) {
 	}
 }
 
-// TestRecordingConnMarksTheFirstWrite: the wrapper is what makes not_sent
-// provable at all — a conn that carried request bytes must say so, before the
-// underlying write even runs.
-func TestRecordingConnMarksTheFirstWrite(t *testing.T) {
-	trace := &dialTrace{}
+// TestWriteHookMarksTheHopAndTheCall: the request-byte record is what makes
+// not_sent provable at all, and it has to reach BOTH records — the hop's own,
+// which is what proves this hop did not write, and the call's monotonic one,
+// which is what stops a LATER hop from claiming the request never went out
+// (issue #60).
+func TestWriteHookMarksTheHopAndTheCall(t *testing.T) {
+	call := &callTrace{}
+	hop := &dialTrace{call: call, dialed: true, dialOK: true}
+
+	if _, state := hop.provenance(nil); state != RequestStateNotSent {
+		t.Fatalf("a connected hop that wrote nothing = %s, want not_sent", state)
+	}
+	hop.writeHook().WroteRequest(httptrace.WroteRequestInfo{})
+
+	if !hop.wrote {
+		t.Fatal("the hop did not record the write — not_sent stays claimable after transmission")
+	}
+	if !call.transmitted.Load() {
+		t.Fatal("the call did not record the write — a later hop could claim not_sent")
+	}
+	if _, state := hop.provenance(nil); state == RequestStateNotSent {
+		t.Fatalf("state = not_sent after the hook fired")
+	}
+}
+
+// TestRecordingDialerRecordsTheDialAndItsOutcome: the dial wrapper is the only
+// thing that knows whether a dial happened in this hop and how far it got, so
+// its three facts (started, phase, completed) are pinned here. It returns the
+// dialer's conn untouched — writing is observed by the write hook now, not by
+// wrapping connections.
+func TestRecordingDialerRecordsTheDialAndItsOutcome(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
 	defer func() { _ = server.Close() }()
 
-	rc := &recordingConn{Conn: client, trace: trace}
-	go func() { _, _ = io.Copy(io.Discard, server) }()
+	hop := &dialTrace{}
+	ctx := context.WithValue(context.Background(), traceKey{}, hop)
 
-	if trace.provenance(nil); trace.wrote {
-		t.Fatal("wrote flag set before any write")
-	}
-	if _, err := rc.Write([]byte("POST / HTTP/1.1\r\n")); err != nil {
+	conn, err := recordingDialer(FailurePhaseTargetConnect, func(context.Context, string, string) (net.Conn, error) {
+		return client, nil
+	})(ctx, "tcp", "x:1")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !trace.wrote {
-		t.Fatal("write not recorded — not_sent would be claimable after transmission")
+	if conn != client {
+		t.Fatal("the conn was replaced")
+	}
+	if !hop.dialed || !hop.dialOK {
+		t.Fatalf("successful dial recorded as dialed=%t dialOK=%t", hop.dialed, hop.dialOK)
+	}
+
+	// A dial that fails at a later phase: the phase it had entered is the
+	// attribution, and completion is never recorded.
+	failed := &dialTrace{}
+	failCtx := context.WithValue(context.Background(), traceKey{}, failed)
+	boom := errors.New("refused")
+	_, err = recordingDialer(FailurePhaseProxyConnect, func(ctx context.Context, _, _ string) (net.Conn, error) {
+		traceOf(ctx).enter(FailurePhaseProxyAuth)
+		return nil, boom
+	})(failCtx, "tcp", "x:1")
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the dialer's own error", err)
+	}
+	if !failed.dialed || failed.dialOK {
+		t.Fatalf("failed dial recorded as dialed=%t dialOK=%t", failed.dialed, failed.dialOK)
+	}
+	if phase, state := failed.provenance(err); phase != FailurePhaseProxyAuth || state != RequestStateNotSent {
+		t.Fatalf("provenance = (%s, %s), want (proxy_auth, not_sent)", phase, state)
 	}
 }
 
 // TestRecordingDialerIsTransparentWithoutATrace: with no trace in the context
-// the wrapper must return the dialer's conn untouched, so a direct caller (and
-// every pre-migration test) observes no change at all.
+// the wrapper must be a pass-through, so a direct caller (and every test that
+// exercises a dialer on its own) observes no change at all.
 func TestRecordingDialerIsTransparentWithoutATrace(t *testing.T) {
 	client, server := net.Pipe()
 	defer func() { _ = client.Close() }()
@@ -434,9 +525,6 @@ func TestRecordingDialerIsTransparentWithoutATrace(t *testing.T) {
 	conn, err := recordingDialer(FailurePhaseTargetConnect, dial)(context.Background(), "tcp", "x:1")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if _, ok := conn.(*recordingConn); ok {
-		t.Fatal("conn was wrapped without a trace")
 	}
 	if conn != client {
 		t.Fatal("conn was replaced")
