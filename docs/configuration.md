@@ -397,3 +397,12 @@ only after `Execute` returns, so the guarantee is structural
 stall past the 360s SSE stall timeout — aborts the downstream response; a
 Responses passthrough client still receives a parseable `response.failed`
 terminal plus `[DONE]` (`internal/router/stream.go`).
+
+Every SECONDARY read of an already-received upstream body — the terminal
+error-envelope read, the redirect drain, and the non-SSE guard — is bounded
+by its byte cap AND a total deadline (`config.SecondaryReadTimeout`, 10 s).
+The response-HEADER timeout is spent once headers arrive and bounds nothing
+further, so a peer dripping a secondary body below the byte cap forever
+would pin the goroutine without the deadline. The SSE product read is the
+deliberate exception: it keeps the 360 s progress-reset stall, because any
+chunk proves the stream is live.

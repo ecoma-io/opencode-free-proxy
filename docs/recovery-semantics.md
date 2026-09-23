@@ -99,8 +99,12 @@ dialer owns it under the same phase.
 Three consequences that are easy to get wrong:
 
 1. **A pooled connection performs no dial at all.** A failure on a connection
-   the client already had is `unknown`, never `not_sent` — there is no phase
-   to attribute and nothing to prove.
+   the client already had has no phase to attribute and nothing to prove, so
+   it degrades to `unknown` on a clean call — **never** `not_sent`. The
+   call's monotonic history still speaks: if an earlier hop of the same
+   logical attempt already transmitted or was answered, the pooled-conn
+   failure inherits that state (`unknown`/`response_started`), so no later
+   hop can ever revive a `not_sent` a busier call already forfeited.
 2. **A failed write is not a pre-transmission failure.** A write that errors
    partway may have transmitted a prefix. An _attempted_ write closes the
    `not_sent` door permanently for the attempt, and for every hop after it.
