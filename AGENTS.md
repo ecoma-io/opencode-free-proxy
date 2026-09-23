@@ -126,6 +126,19 @@ The semantics agents most often get wrong:
     Stream/forced deaths are `response_started` PHASE rows — the delivered
     status is never rewritten into an HTTP verdict. See docs/architecture.md
     "Upstream error evidence".
+11. Responses are **attributed, not inferred** (issue #55,
+    `internal/router/provenance_header.go`). Anything that came out of the
+    upstream attempt path carries `X-OFP-Failure-Origin` (`upstream` |
+    `gateway`), with `X-OFP-Failure-Phase` and `X-OFP-Request-State` on
+    gateway-origin responses only. The label is read off the returned
+    `Failure` — NEVER off the status that is about to be written, because a
+    provider 502 and a synthesized 502 are the same number. A local error
+    (bad body, unknown model, draining) and a client cancellation carry no
+    provenance header; absence means "not an upstream-interaction outcome",
+    never "upstream". Every inbound `X-OFP-*` header is stripped at the top
+    of the pipeline, so no client can forge one. Pinned by
+    `internal/router/provenance_header_test.go` and the black-box
+    `e2e/provenance_test.go`.
 
 ## Layout
 

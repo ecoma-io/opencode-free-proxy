@@ -165,7 +165,7 @@ func TestExecuteFallbackExactPostCounts(t *testing.T) {
 	defer f.Close()
 	f.deadEgress(t, "a")
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
@@ -173,8 +173,8 @@ func TestExecuteFallbackExactPostCounts(t *testing.T) {
 		t.Fatalf("uerr=%v resp=%v, want success on b", uerr, resp)
 	}
 	_ = resp.Body.Close()
-	if id != "b" || attempts != 2 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s, want b/2/success", id, attempts, class)
+	if id != "b" || attempts != 2 || failure.Class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d failure.Class=%s, want b/2/success", id, attempts, failure.Class)
 	}
 	if got := f.rec.count("a"); got != 0 {
 		t.Fatalf("a received %d requests — a pre-request failure must never send one", got)
@@ -197,7 +197,7 @@ func TestExecuteProviderStatusConsumesNoBudgetDraw(t *testing.T) {
 	})
 	defer f.Close()
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
@@ -208,8 +208,8 @@ func TestExecuteProviderStatusConsumesNoBudgetDraw(t *testing.T) {
 	if uerr == nil || uerr.Status != http.StatusServiceUnavailable {
 		t.Fatalf("uerr = %+v, want the provider's 503", uerr)
 	}
-	if id != "a" || attempts != 1 || class != ClassUpstream5xx {
-		t.Fatalf("id=%q attempts=%d class=%s, want a/1/upstream_5xx", id, attempts, class)
+	if id != "a" || attempts != 1 || failure.Class != ClassUpstream5xx {
+		t.Fatalf("id=%q attempts=%d failure.Class=%s, want a/1/upstream_5xx", id, attempts, failure.Class)
 	}
 	if got := f.rec.count("b"); got != 0 {
 		t.Fatalf("b POSTs = %d, want 0", got)
@@ -230,15 +230,15 @@ func TestExecuteCancelledContextNeverReachesTheWire(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		ctx, f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
 	if resp != nil {
 		t.Fatal("a canceled request must not return a response")
 	}
-	if class != ClassContextCanceled {
-		t.Fatalf("class = %s, want ClassContextCanceled", class)
+	if failure.Class != ClassContextCanceled {
+		t.Fatalf("failure.Class = %s, want ClassContextCanceled", failure.Class)
 	}
 	if attempts != 1 || id != "a" {
 		t.Fatalf("attempts=%d id=%q, want the single canceled attempt on a", attempts, id)
@@ -265,12 +265,12 @@ func TestExecuteVerdictLeavesEgressHealthyAndRoutable(t *testing.T) {
 	defer f.Close()
 
 	// req 1: a → 429, terminal.
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
-	if id != "a" || attempts != 1 || class != ClassUpstream429 || uerr == nil || uerr.Status != 429 {
-		t.Fatalf("req1: id=%q attempts=%d class=%s uerr=%v, want the terminal 429 on a", id, attempts, class, uerr)
+	if id != "a" || attempts != 1 || failure.Class != ClassUpstream429 || uerr == nil || uerr.Status != 429 {
+		t.Fatalf("req1: id=%q attempts=%d failure.Class=%s uerr=%v, want the terminal 429 on a", id, attempts, failure.Class, uerr)
 	}
 	_ = resp
 	if !f.health.Healthy(healthKey("a"), testHealthPolicy) {
@@ -278,7 +278,7 @@ func TestExecuteVerdictLeavesEgressHealthyAndRoutable(t *testing.T) {
 	}
 
 	// req 2: a must serve directly — the 429 didn't poison it.
-	resp2, id2, attempts2, class2, uerr2 := f.exec.Execute(
+	resp2, id2, attempts2, failure2, uerr2 := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("a", "b"), policy(true, 3))
@@ -286,8 +286,8 @@ func TestExecuteVerdictLeavesEgressHealthyAndRoutable(t *testing.T) {
 		t.Fatalf("req2: id=%q uerr=%v, want a serving again", id2, uerr2)
 	}
 	_ = resp2.Body.Close()
-	if attempts2 != 1 || class2 != ClassSuccess {
-		t.Fatalf("req2: attempts=%d class=%s, want a single attempt", attempts2, class2)
+	if attempts2 != 1 || failure2.Class != ClassSuccess {
+		t.Fatalf("req2: attempts=%d failure.Class=%s, want a single attempt", attempts2, failure2.Class)
 	}
 	if got := f.rec.count("b"); got != 0 {
 		t.Fatalf("b POSTs = %d, want 0 (neither request may move egress)", got)

@@ -205,9 +205,14 @@ type Failure struct {
 //
 // Deliberately narrow: transport-origin AND proven-not-sent. An HTTP verdict
 // is the provider's own answer (OriginUpstream) and is never replayable here;
-// an unproven state (unknown) is never replayable either. This predicate is
-// NOT wired into any decision in this build — it exists so the contract has
-// exactly one definition to test against when it is.
+// an unproven state (unknown) is never replayable either.
+//
+// It is the ONE predicate the recovery policy reads: the executor gates the
+// egress move and the health mark on it (fallback.go), so the two can never
+// disagree about whether the egress was at fault. It is also what the router
+// attributes a response with on the wire — the phase and request state are
+// only meaningful to a caller because this definition is the contract's
+// (provenance_header.go, docs/recovery-semantics.md).
 func (f Failure) ReplaySafe() bool {
 	return f.Origin == OriginTransport && f.RequestState == RequestStateNotSent
 }

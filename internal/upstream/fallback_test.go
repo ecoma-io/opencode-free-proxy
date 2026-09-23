@@ -199,7 +199,7 @@ func TestExecuteFirstEgressServes(t *testing.T) {
 	f := newExecutorFixture(t, map[string]int{"a": 200})
 	defer f.Close()
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL+"/zen/v1/chat/completions",
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("r", "a"), policy(true, 3))
@@ -207,8 +207,8 @@ func TestExecuteFirstEgressServes(t *testing.T) {
 		t.Fatalf("uerr = %v", uerr)
 	}
 	_ = resp.Body.Close()
-	if id != "a" || attempts != 1 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s", id, attempts, class)
+	if id != "a" || attempts != 1 || failure.Class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d failure.Class=%s", id, attempts, failure.Class)
 	}
 	if f.rec.total() != 1 {
 		t.Fatalf("upstream calls = %d, want 1", f.rec.total())
@@ -227,7 +227,7 @@ func TestExecuteFallsBackOnPreRequestTransportFailure(t *testing.T) {
 	defer f.Close()
 	f.deadEgress(t, "a")
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
@@ -235,8 +235,8 @@ func TestExecuteFallsBackOnPreRequestTransportFailure(t *testing.T) {
 		t.Fatalf("uerr = %v", uerr)
 	}
 	_ = resp.Body.Close()
-	if id != "b" || attempts != 2 || class != ClassSuccess {
-		t.Fatalf("id=%q attempts=%d class=%s", id, attempts, class)
+	if id != "b" || attempts != 2 || failure.Class != ClassSuccess {
+		t.Fatalf("id=%q attempts=%d failure.Class=%s", id, attempts, failure.Class)
 	}
 	if f.rec.count("a") != 0 || f.rec.count("b") != 1 {
 		t.Fatalf("calls a=%d b=%d, want 0/1 (a's dial never reached a server)", f.rec.count("a"), f.rec.count("b"))
@@ -259,7 +259,7 @@ func TestExecuteProviderVerdictStopsOnItsEgress(t *testing.T) {
 			f := newExecutorFixture(t, map[string]int{"a": status, "b": 200})
 			defer f.Close()
 
-			resp, id, attempts, class, uerr := f.exec.Execute(
+			resp, id, attempts, failure, uerr := f.exec.Execute(
 				context.Background(), f.servers["a"].URL,
 				func() map[string]string { return map[string]string{} },
 				[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
@@ -273,8 +273,8 @@ func TestExecuteProviderVerdictStopsOnItsEgress(t *testing.T) {
 			if id != "a" || attempts != 1 {
 				t.Fatalf("id=%q attempts=%d, want exactly one attempt on a", id, attempts)
 			}
-			if class == ClassSuccess {
-				t.Fatal("class must not be success for a terminal verdict")
+			if failure.Class == ClassSuccess {
+				t.Fatal("failure.Class must not be success for a terminal verdict")
 			}
 			if got := f.rec.count("b"); got != 0 {
 				t.Fatalf("b was dialed %d times — a provider verdict never moves egress", got)
@@ -303,7 +303,7 @@ func TestExecutePlanExhaustionReturnsLastRealVerdict(t *testing.T) {
 	f.deadEgress(t, "a")
 	f.deadEgress(t, "b")
 
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
@@ -313,8 +313,8 @@ func TestExecutePlanExhaustionReturnsLastRealVerdict(t *testing.T) {
 	if uerr == nil || uerr.Status != http.StatusBadGateway {
 		t.Fatalf("uerr = %+v, want the last real transport verdict (502)", uerr)
 	}
-	if attempts != 2 || class != ClassConnectionError {
-		t.Fatalf("attempts=%d class=%s", attempts, class)
+	if attempts != 2 || failure.Class != ClassConnectionError {
+		t.Fatalf("attempts=%d failure.Class=%s", attempts, failure.Class)
 	}
 	if id != "b" {
 		t.Fatalf("last id = %q, want b", id)
@@ -464,15 +464,15 @@ func TestExecuteContextCanceledShortCircuits(t *testing.T) {
 
 	// Force the transport to honor the canceled ctx via a closed server.
 	f.servers["a"].Close()
-	resp, id, attempts, class, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		ctx, f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("r", "a", "b"), policy(true, 3))
 	if resp != nil {
 		t.Fatal("canceled request must not return a response")
 	}
-	if class != ClassContextCanceled {
-		t.Fatalf("class = %s, want ClassContextCanceled", class)
+	if failure.Class != ClassContextCanceled {
+		t.Fatalf("failure.Class = %s, want ClassContextCanceled", failure.Class)
 	}
 	if attempts != 1 || id != "a" {
 		t.Fatalf("attempts=%d id=%q; a canceled attempt must not fall back", attempts, id)

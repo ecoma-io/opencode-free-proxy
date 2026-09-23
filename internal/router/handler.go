@@ -91,6 +91,10 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // (translator/formats.js detectFormatByEndpoint: /v1/responses is always
 // responses, /v1/chat/completions is openai — even with an input[] body).
 func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat relay.Format) {
+	// The internal namespace is dropped before ANY stage runs: no public
+	// client may forge provenance, impersonate the trusted boundary, or reach
+	// a decision through an X-OFP-* header (issue #55).
+	stripInternalHeaders(r)
 	// ONE immutable snapshot for the WHOLE request, captured at ARRIVAL: the
 	// single store read this handler ever makes. Everything downstream —
 	// route matching, the health policy, egress resolution, upstream.base,
@@ -299,6 +303,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	s.onGeneration(rt)
 	heads := s.routeHeads(rt, route, profile, hp)
 	if len(heads) == 0 {
+		setGatewayNotSent(w.Header())
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("No eligible egress for route %q", route.ID))
 		return
 	}
@@ -347,7 +352,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	rec := upstream.NewRecorder()
 	ev := newEvidenceLog(s.log, rec, reqID, rt.Generation, plan.RouteID, cleanModel,
 		profile.Endpoint, clientRequestedStreaming, session, url, policy.Budget(), len(bodyJSON), bodyJSON)
-	resp, egID, attempts, class, uerr := s.Exec.ExecuteObserved(reqCtx, url, buildHeaders, bodyJSON, plan, policy, rec)
+	resp, egID, attempts, failure, uerr := s.Exec.ExecuteObserved(reqCtx, url, buildHeaders, bodyJSON, plan, policy, rec)
 	latency := time.Since(start)
 	ev.Emit()
 	// Completion is one event per request at Info: the black-box e2e suite
@@ -357,13 +362,17 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	logLine := func(status int) {
 		s.log.Info().Str("request_id", reqID).Uint64("generation", rt.Generation).
 			Str("route", plan.RouteID).Str("egress", egID).Int("attempts", attempts).
-			Str("class", class.String()).Int("status", status).Int64("latency_ms", latency.Milliseconds()).
+			Str("class", failure.Class.String()).Int("status", status).Int64("latency_ms", latency.Milliseconds()).
 			Str("model", cleanModel).Str("endpoint", profile.Endpoint).Bool("fallback", attempts > 1).
 			Msgf("request completed generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
-				rt.Generation, plan.RouteID, egID, attempts, class, status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
+				rt.Generation, plan.RouteID, egID, attempts, failure.Class, status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
 	}
 	if uerr != nil {
 		cancelUpstream()
+		// The status is about to be written; WHERE it came from is read off
+		// the recorded failure, never off the status itself — a synthesized
+		// 502 and a provider 502 are the same number (issue #55).
+		setFailureProvenance(w.Header(), failure)
 		// model=%q, not %s: the model id is client-controlled and survives
 		// cloak.BaseModelID verbatim — an embedded newline (or any control
 		// byte) would forge extra log lines (CWE-117). %q escapes them for the
@@ -373,7 +382,11 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		writeError(w, uerr.Status, fmt.Sprintf("[%d]: %s", uerr.Status, uerr.Message))
 		return
 	}
-	w.Header().Set("X-OFP-Egress", egID)
+	w.Header().Set(headerEgress, egID)
+	// A served request is the provider's own answer, synthetic completions
+	// excepted (they never reach here — bypass and test-connection return
+	// before the executor, and carry no provenance at all).
+	w.Header().Set(headerFailureOrigin, originUpstream)
 	logLine(resp.StatusCode)
 	// Forced SSE→JSON needs the upstream reply to actually be SSE
 	// (sseToJsonHandler.js:185-188): when it is not, chatCore falls through to

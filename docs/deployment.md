@@ -175,8 +175,13 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
   logs one completion line at info with `generation`, `route`, `egress`,
   `attempts`, `class`, `status`, `latency_ms`, `model`, `endpoint`,
   `fallback`; set `log-level: debug` to also see opencode UA warm-up.
-  Responses carry `X-OFP-Egress: <id>`. Logs never contain credentials
-  (proxy userinfo).
+  Responses carry `X-OFP-Egress: <id>`, plus the failure attribution on
+  anything that came out of the upstream attempt path —
+  `X-OFP-Failure-Origin: upstream | gateway`, with `X-OFP-Failure-Phase` and
+  `X-OFP-Request-State` on gateway-origin responses
+  ([recovery-semantics.md → Injector ↔ OFP](recovery-semantics.md#injector--ofp)).
+  All `X-OFP-*` headers are stripped from inbound requests. Logs never
+  contain credentials (proxy userinfo).
 - **Egress sizing.** `max_concurrency` per egress bounds in-flight
   requests/streams; an egress at capacity is skipped (not failed) at dial
   time. Size it to what the upstream proxy vendor tolerates.

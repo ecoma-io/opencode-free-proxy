@@ -40,12 +40,11 @@ func TestSocks5NoAcceptableMethodsIsProxyAuth(t *testing.T) {
 	f := newSocks5Fake(t, 0xff, 0x00, 0x00)
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassProxyAuthError {
-		t.Fatalf("class = %s, want ClassProxyAuthError", class)
+	if failure.Class != ClassProxyAuthError {
+		t.Fatalf("failure.Class = %s, want ClassProxyAuthError", failure.Class)
 	}
 	if uerr == nil || !strings.Contains(uerr.Message, "no acceptable authentication method") {
 		t.Fatalf("uerr.Message = %q, want the no-acceptable-method text", uerr.Message)
@@ -56,17 +55,16 @@ func TestSocks5NoAcceptableMethodsIsProxyAuth(t *testing.T) {
 // username/password although the egress carried NO userinfo (the socks5.go
 // negotiate 0x02/!hasAuth branch). A credential demand we cannot answer is a
 // typed proxyAuthError — the proxy will refuse us identically on every
-// retry, so the class ends the egress's turn after one dial.
+// retry, so the failure.Class ends the egress's turn after one dial.
 func TestSocks5AuthDemandedWithoutCredentials(t *testing.T) {
 	f := newSocks5Fake(t, 0x02, 0x00, 0x00) // demands auth; no credentials will be sent
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://127.0.0.1:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassProxyAuthError {
-		t.Fatalf("class = %s, want ClassProxyAuthError", class)
+	if failure.Class != ClassProxyAuthError {
+		t.Fatalf("failure.Class = %s, want ClassProxyAuthError", failure.Class)
 	}
 	if uerr == nil || !strings.Contains(uerr.Message, "demanded auth but none configured") {
 		t.Fatalf("uerr.Message = %q, want the demanded-auth text", uerr.Message)
@@ -84,12 +82,11 @@ func TestSocks5HostnameArrivesAsIP(t *testing.T) {
 	f := newSocks5Fake(t, 0x00, 0x00, 0x01)
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
 	resp, uerr, failure := c.DoClassified(context.Background(), "http://localhost:1/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if class != ClassConnectionError || uerr == nil || !strings.Contains(uerr.Message, "general failure") {
-		t.Fatalf("class=%s uerr=%v, want the REP 0x01 terminal (this test only reads the CONNECT bytes)", class, uerr)
+	if failure.Class != ClassConnectionError || uerr == nil || !strings.Contains(uerr.Message, "general failure") {
+		t.Fatalf("failure.Class=%s uerr=%v, want the REP 0x01 terminal (this test only reads the CONNECT bytes)", failure.Class, uerr)
 	}
 	got := f.gotConnect.Load()
 	if got == nil {
@@ -135,9 +132,8 @@ func TestSocks5IPv6OriginArrivesAsAtyp4(t *testing.T) {
 	f := newSocks5Fake(t, 0x00, 0x00, 0x00) // no-auth, tunnel everything
 	c := noSleepClient(NewClientFor(&config.Proxy{Type: config.ProxySOCKS5, URL: f.url}))
 	resp, uerr, failure := c.DoClassified(context.Background(), origin.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
-	class := failure.Class
-	if uerr != nil || class != ClassSuccess {
-		t.Fatalf("uerr=%v class=%s, want a served round-trip through the v6 tunnel", uerr, class)
+	if uerr != nil || failure.Class != ClassSuccess {
+		t.Fatalf("uerr=%v failure.Class=%s, want a served round-trip through the v6 tunnel", uerr, failure.Class)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
@@ -542,12 +538,12 @@ func TestProxyCredentialsNeverSurface(t *testing.T) {
 	egA, _ := fixtureRuntime(map[string]int{"a": 200}).Egress("a")
 	exec := NewExecutor(func(*config.Egress) (*Client, bool) { return a, true }, health.New(), NewLimiter())
 	plan := routing.RoutePlan{RouteID: "r", Strategy: config.StrategyRoundRobin, Attempts: []string{"a"}, Egresses: []*config.Egress{egA}}
-	_, id, attempts, class, uerr := exec.Execute(
+	_, id, attempts, failure, uerr := exec.Execute(
 		context.Background(), "https://origin.invalid/zen/v1/chat/completions",
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), plan, policy(true, 3))
-	if class != ClassProxyAuthError || attempts != 1 || id != "a" || uerr == nil {
-		t.Fatalf("class=%s attempts=%d id=%q, want one typed dial and no more", class, attempts, id)
+	if failure.Class != ClassProxyAuthError || attempts != 1 || id != "a" || uerr == nil {
+		t.Fatalf("failure.Class=%s attempts=%d id=%q, want one typed dial and no more", failure.Class, attempts, id)
 	}
 	assertNoCredentialMaterial(t, "executor-surfaced 407", uerr.Message)
 

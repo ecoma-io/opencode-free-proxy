@@ -289,6 +289,19 @@ transport can _prove_ about transmission. The contract those fields serve is
   reads — `origin = transport ∧ request_state = not_sent` — and it gates
   both halves of recovery: whether the attempt may move to another egress
   and whether the egress is marked unhealthy.
+- **The same record labels the response on the wire** (issue #55,
+  `internal/router/provenance_header.go`). The executor returns the terminal
+  `Failure`, not just its `Class`, because a caller cannot act on a status
+  alone: a 502 the provider sent and a 502 this process synthesized because
+  the egress path failed demand opposite responses. `X-OFP-Failure-Origin:
+upstream | gateway` is written from the recorded `Origin` — never from the
+  status — with `X-OFP-Failure-Phase` and `X-OFP-Request-State` riding along
+  on `gateway` only. `OriginClient` writes nothing: no interaction concluded,
+  so there is nothing to attribute. Absence means "not an upstream-interaction
+  outcome" (a local rejection, a draining server, a synthetic completion),
+  never "upstream". Every inbound `X-OFP-*` header is stripped at the top of
+  the pipeline, so a public client can neither forge provenance nor reach a
+  decision through the namespace.
 
 ## Endpoints
 
