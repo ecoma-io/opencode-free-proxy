@@ -201,7 +201,7 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 	// transmitted (provenance.go, issue #60).
 	call := &callTrace{}
 	started := c.Now()
-	resp, hop, netErr := c.attempt(ctx, call, url, headers, bodyJSON)
+	resp, hop, path, netErr := c.attempt(ctx, call, url, headers, bodyJSON)
 	dur := c.Now().Sub(started)
 	if netErr != nil {
 		// The [502] status is only the client-facing envelope — the class is
@@ -241,11 +241,23 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 		// the error envelope reduction that follows) can never be the place
 		// upstream information is lost.
 		uerr := parseUpstreamError(resp.StatusCode, raw)
-		failure := statusFailure(resp.StatusCode)
+		// Authorship comes from the PATH, never from the status that arrived on
+		// it (issue #63): an HTTP forward proxy is an answering peer for a
+		// plain-http hop, so a 502/503/407/403 on that path may be its own
+		// answer rather than the provider's, and nothing in the response
+		// separates the two.
+		failure := statusFailure(resp.StatusCode, path)
 		appendResponseRow(rec, dur, resp.StatusCode, resp.Header, raw, uerr, failure)
 		return nil, uerr, failure
 	}
-	return resp, nil, Failure{}
+	// A live response is served, not failed, so its CLASS is ClassSuccess and
+	// its client-facing envelope is untouched — but its AUTHORSHIP is still the
+	// path's, for the same reason a failed one's is: this response is about to
+	// be labelled on the wire and relayed as the provider's answer, and a hop an
+	// HTTP intermediary carried cannot promise that (a captive portal's 200 is
+	// the case that makes it visible — issue #63). The router reads this record
+	// to label the response; nothing else about the success path changes.
+	return resp, nil, Failure{Origin: path.responseOrigin(), RequestState: path.responseState()}
 }
 
 // drainAndClose reads the rest of a rejected response so the connection can
@@ -302,11 +314,14 @@ func (c *Client) CloseIdleConnections() {
 // The mid-chain responses are drained bounded (drainAndClose) and closed;
 // their bodies are never surfaced.
 //
-// The last hop's dial trace is returned alongside the verdict: it is the only
-// place the hop's dial facts live, and the caller classifies the failure with
-// them (provenance.go). One hop of this chain reports its own dial, never an
-// earlier hop's — that conflation is issue #60.
-func (c *Client) attempt(ctx context.Context, call *callTrace, url string, headers map[string]string, bodyJSON []byte) (*http.Response, *dialTrace, error) {
+// The last hop's dial trace and the last hop's PATH are returned alongside the
+// verdict. The trace is the only place the hop's dial facts live, and the
+// caller classifies the failure with them (provenance.go). The path is the only
+// place the hop's authorship lives, and the caller labels the response with it
+// (hopPath) — both belong to the delivering hop, never to an earlier one: the
+// conflation that would make a redirect chain's tail inherit its head's facts
+// is issue #60 for the trace and would be the same error for the path.
+func (c *Client) attempt(ctx context.Context, call *callTrace, url string, headers map[string]string, bodyJSON []byte) (*http.Response, *dialTrace, hopPath, error) {
 	var hop *dialTrace
 	method := http.MethodPost
 	// Sticky per-chain state, both mirroring net/http's do loop: once the
@@ -330,8 +345,13 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 		hop = hopTrace
 		req, err := http.NewRequestWithContext(hopCtx, method, current, body)
 		if err != nil {
-			return nil, hop, err
+			return nil, hop, hopPath{}, err
 		}
+		// The path THIS hop takes, re-picked per hop like the transport below
+		// (a redirect may cross schemes and land on a different kind of path —
+		// the last assignment before a response is returned is the delivering
+		// hop's).
+		path := c.hopPathOf(req.URL.Scheme)
 		if initialHost == "" {
 			initialHost = req.URL.Host
 			initialHostname = req.URL.Hostname()
@@ -356,14 +376,14 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 				client = c.tunneled
 			}
 			resp, err := client.Do(req)
-			return resp, hop, err
+			return resp, hop, path, err
 		}
 		resp, err := c.roundTrip(req)
 		if err != nil {
-			return nil, hop, err
+			return nil, hop, path, err
 		}
 		if !isRedirectStatus(resp.StatusCode) {
-			return resp, hop, nil
+			return resp, hop, path, nil
 		}
 		// A redirect is a response this logical call received. Recorded before
 		// anything else looks at it, because it is a fact about the CALL: the
@@ -375,21 +395,21 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 			// A 3xx without Location is the answer, not a hop — undici
 			// returns it (fetch/index.js:1233-1237), net/http too
 			// (client.go:643-649). The caller decides what a 3xx body means.
-			return resp, hop, nil
+			return resp, hop, path, nil
 		}
 		next, err := req.URL.Parse(loc)
 		if err != nil {
 			drainAndClose(resp)
-			return nil, hop, fmt.Errorf("redirect: parse Location %q: %w", loc, err)
+			return nil, hop, path, fmt.Errorf("redirect: parse Location %q: %w", loc, err)
 		}
 		if next.Scheme != "http" && next.Scheme != "https" {
 			drainAndClose(resp)
-			return nil, hop, fmt.Errorf("redirect: Location %q is not an HTTP(S) URL", loc)
+			return nil, hop, path, fmt.Errorf("redirect: Location %q is not an HTTP(S) URL", loc)
 		}
 		hops++
 		if hops > config.MaxRedirects {
 			drainAndClose(resp)
-			return nil, hop, fmt.Errorf("redirect count exceeded (%d)", config.MaxRedirects)
+			return nil, hop, path, fmt.Errorf("redirect count exceeded (%d)", config.MaxRedirects)
 		}
 		// 301/302 on POST, 303 on anything non-GET/HEAD: the next hop is a
 		// body-less GET (undici fetch/index.js:1290-1306; net/http
@@ -419,6 +439,30 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 // (net/http/client.go send).
 func (c *Client) roundTrip(req *http.Request) (*http.Response, error) {
 	return c.transportFor(req.URL.Scheme).RoundTrip(req)
+}
+
+// hopPathOf is the scheme→path table — the sibling of transportFor, asked the
+// other question: not WHICH transport carries this hop, but WHO on the way can
+// answer for it (provenance.go, hopPath).
+//
+// A plain-http hop on a client that HAS a tunneled transport is necessarily the
+// absolute-form proxy path: transportFor sends https through the CONNECT
+// boundary and everything else through c.HTTP, and c.HTTP is only a proxy
+// transport when NewClientFor built it from an http/https proxy. That hop has
+// an HTTP intermediary in it, so its responses are only ever attributable to
+// "somewhere on the path". Every other hop is end-to-end: direct and SOCKS5
+// hand the request bytes to the target, and the CONNECT tunnel carries https
+// the proxy cannot read.
+//
+// The tunneled client's OWN responses (a 407 at CONNECT time) never reach here
+// as a response at all — connect.go types them as a transport failure — which
+// is why this table only has to answer for hops that produced one.
+//
+// Re-evaluated per hop by attempt, like the transport pick next to it: a
+// redirect may cross the boundary (http→https leaves the proxy's reach), and
+// the authorship of the final response belongs to the hop that delivered it.
+func (c *Client) hopPathOf(scheme string) hopPath {
+	return hopPath{intermediated: c.tunneled != nil && scheme == "http"}
 }
 
 // transportFor is the scheme→transport table: https rides the tunneled

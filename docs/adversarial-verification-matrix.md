@@ -138,12 +138,17 @@ recorded**.
 
 - **Contract:** every upstream-interaction response carries
   `X-OFP-Failure-Origin/Phase/Request-State` recorded from the row (never from
-  the about-to-write status); a local error / client-cancel carries no
-  provenance; every inbound `X-OFP-*` is stripped.
+  the about-to-write status); the origin is `upstream | ambiguous | gateway`,
+  where `ambiguous` refuses to name the provider as the author of a response
+  that arrived over an intermediated hop (issue #63); a local error /
+  client-cancel carries no provenance; every inbound `X-OFP-*` is stripped.
 - **Guard seam:** `internal/router/provenance_header.go` (read from row, never
   from wire), `internal/router/provenance_header_test.go`
   (TestInboundInternalHeadersAreStripped, TestStripInternalHeadersCaseInsensitive,
-  TestTransportFailureIsLabelledGateway).
+  TestTransportFailureIsLabelledGateway,
+  TestForwardProxiedResponseIsLabelledAmbiguous,
+  TestServedResponseThroughAForwardProxyIsLabelledAmbiguous),
+  `internal/upstream/response_ownership_test.go` (path-vs-status authorship).
 - **Pinned by:** `internal/router/provenance_header_test.go`,
   `internal/router/provenance_log_test.go`, plus black-box
   `e2e/provenance_test.go`.

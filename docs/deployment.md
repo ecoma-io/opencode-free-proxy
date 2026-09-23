@@ -177,8 +177,10 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
   `fallback`; set `log-level: debug` to also see opencode UA warm-up.
   Responses carry `X-OFP-Egress: <id>`, plus the failure attribution on
   anything that came out of the upstream attempt path —
-  `X-OFP-Failure-Origin: upstream | gateway`, with `X-OFP-Failure-Phase` and
-  `X-OFP-Request-State` on gateway-origin responses
+  `X-OFP-Failure-Origin: upstream | ambiguous | gateway`, with
+  `X-OFP-Failure-Phase` on gateway-origin responses and `X-OFP-Request-State`
+  on everything but `upstream` (`ambiguous` marks a response carried by an
+  intermediated hop, whose author this process cannot prove)
   ([recovery-semantics.md → Injector ↔ OFP](recovery-semantics.md#injector--ofp)).
   All `X-OFP-*` headers are stripped from inbound requests. Logs never
   contain credentials (proxy userinfo).

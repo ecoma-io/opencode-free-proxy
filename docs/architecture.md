@@ -199,9 +199,13 @@ unchanged).
   `neutral` + `stop`: the provider answered, so nothing about the egress
   failed and there is nothing to move past. Only a replay-safe transport
   failure can be `marked` + `fallback`.
-- **Provenance rides the row**: `origin` (`upstream` | `transport` |
-  `client`), `failure_phase` and `request_state`. An HTTP verdict is
-  `upstream` / `response_headers` / `response_started`; a pre-request
+- **Provenance rides the row**: `origin` (`upstream` | `ambiguous` |
+  `transport` | `client`), `failure_phase` and `request_state`. An HTTP
+  verdict on a path that proves the origin is `upstream` /
+  `response_headers` / `response_started`; the same verdict arriving over an
+  intermediated hop is `ambiguous` / `response_headers` / `unknown` — a
+  forward proxy is an HTTP peer that answers for itself, so authorship is a
+  property of the path, not of the status (issue #63); a pre-request
   transport failure is `transport` / its dial phase / `not_sent` — the
   same evidence the failover decision was made from, rendered for the
   operator.
@@ -285,6 +289,20 @@ transport can _prove_ about transmission. The contract those fields serve is
   door permanently. The wrapper is applied at the outermost layer of each
   transport path exactly once, so TLS handshake records are never counted as
   request bytes. It is transparent when no trace is in the context.
+- **Authorship comes from the PATH, never from the status** (issue #63). A
+  response that arrives over an intermediated hop — a plain-http target
+  carried by an http/https forward proxy, Go's absolute-form path — could have
+  been written by the proxy itself: its own 407, a policy 403, its own 502/503,
+  a captive portal's 200. Nothing on the wire separates those from a relayed
+  origin verdict, and content sniffing is banned (issue #6), so the record says
+  `OriginAmbiguous` with `RequestStateUnknown` rather than guessing a parent.
+  Every other path (direct, SOCKS5 tunnel, CONNECT tunnel) carries transport
+  bytes through the intermediary, which therefore cannot author an HTTP
+  message, and reports `OriginUpstream` / `ResponseStarted`. The rule is
+  `hopPathOf(scheme)`, read from the transport the attempt actually used, and it
+  applies to a served response exactly as it does to a failure. It decides
+  nothing: an ambiguous response is relayed verbatim, is not replay-safe and
+  marks no egress.
 - **Nothing is inferred from error text.** Phases come from the boundary that
   spoke the protocol and from Go's error typing (`net.Error.Timeout()`,
   `*net.OpError.Op`); classifying by `strings.Contains(err.Error(), …)` is
@@ -307,9 +325,11 @@ not_sent` — decides whether the attempt may move to another egress, and
   `Failure`, not just its `Class`, because a caller cannot act on a status
   alone: a 502 the provider sent and a 502 this process synthesized because
   the egress path failed demand opposite responses. `X-OFP-Failure-Origin:
-upstream | gateway` is written from the recorded `Origin` — never from the
-  status — with `X-OFP-Failure-Phase` and `X-OFP-Request-State` riding along
-  on `gateway` only. `OriginClient` writes nothing: no interaction concluded,
+upstream | ambiguous | gateway` is written from the recorded `Origin` — never
+  from the status. `X-OFP-Failure-Phase` rides `gateway` only; the state rides
+  everything but `upstream` — including `ambiguous`, where the response is
+  relayed verbatim but the provider cannot be named as its author (issue #63).
+  `OriginClient` writes nothing: no interaction concluded,
   so there is nothing to attribute. Absence means "not an upstream-interaction
   outcome" (a local rejection, a draining server, a synthetic completion),
   never "upstream". Every inbound `X-OFP-*` header is stripped at the top of

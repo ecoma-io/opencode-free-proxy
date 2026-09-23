@@ -39,6 +39,11 @@ import (
 //   - Everything after that hand-over (request write, response headers) is
 //     UNKNOWN. This layer cannot prove what left the process, so it must not
 //     guess — unknown authorises nothing.
+//   - WHO AUTHORED a response is a property of the path, never of its status
+//     (issue #63). An HTTP forward proxy carrying a plain-http hop in absolute
+//     form is a peer that answers for itself, and its replies are
+//     indistinguishable from relayed origin ones; such a response is
+//     OriginAmbiguous with an unknown request state. See hopPath.
 //   - An attempt that reused a POOLED connection dialed nothing at all, so it
 //     has no phase and degrades to unknown. That is the case a naive "the
 //     error came out of DialContext" reading gets wrong.
@@ -54,14 +59,39 @@ import (
 // Origin names the side of the wire a failure came from.
 type Origin int
 
+// The numeric values are internal and never persisted (evidence rows and wire
+// headers carry String()); the ORDER is the logical one: the two response
+// origins sit together, then the transport and the caller.
 const (
 	// OriginNone: no failure to attribute — a success, or a row that has no
 	// origin (a skip is a scheduling fact, not a failure).
 	OriginNone Origin = iota
-	// OriginUpstream: an HTTP response existed. Any status, including the
-	// 4xx/5xx verdicts — the provider answered, so the request was received
-	// and the response is the provider's.
+	// OriginUpstream: an HTTP response existed AND the path proves only the
+	// target can have authored it. Any status, including the 4xx/5xx verdicts
+	// — the provider answered, so the request was received and the response is
+	// the provider's.
 	OriginUpstream
+	// OriginAmbiguous: an HTTP response existed on a path where something
+	// other than the target may have authored it — a plain-http hop carried in
+	// absolute form by an HTTP forward proxy, which is an HTTP-level peer that
+	// answers for itself (its own 407, its own 502/503 when it cannot reach
+	// the origin, a policy 403, a captive portal's 200) and whose replies are
+	// indistinguishable on the wire from the origin's own (issue #63).
+	//
+	// This is deliberately NOT a claim that the proxy answered. It is the
+	// refusal to claim that the provider did. A status code cannot carry that
+	// information — 407 is normally the proxy's and can also be the origin's,
+	// 502/503 are normally the origin's and can also be the proxy's — and
+	// nothing in the message separates them (issue #6 rejects content
+	// sniffing). Authorship is therefore read off the PATH, which can say who
+	// COULD have written the response, and this is what it says when the
+	// answer is "not provably the provider, not provably the proxy".
+	//
+	// Consequences, both already true of any transport-derived origin: it is
+	// never replay-safe (a re-send on another egress is the one action that
+	// cannot be taken on a maybe-answered request), and it is never egress
+	// evidence (MarksEgressHealth is OriginTransport-only).
+	OriginAmbiguous
 	// OriginTransport: the egress path itself failed and no HTTP response
 	// exists. Only this origin can ever be a replay candidate, and only when
 	// RequestState proves the request never went out.
@@ -75,6 +105,8 @@ func (o Origin) String() string {
 	switch o {
 	case OriginUpstream:
 		return "upstream"
+	case OriginAmbiguous:
+		return "ambiguous"
 	case OriginTransport:
 		return "transport"
 	case OriginClient:
@@ -218,9 +250,12 @@ type Failure struct {
 // was transmitted — the single condition under which re-sending the request on
 // another egress cannot duplicate provider work.
 //
-// Deliberately narrow: transport-origin AND proven-not-sent. An HTTP verdict
-// is the provider's own answer (OriginUpstream) and is never replayable here;
-// an unproven state (unknown) is never replayable either.
+// Deliberately narrow: transport-origin AND proven-not-sent. A response of
+// ANY authorship is terminal here — the provider's own answer
+// (OriginUpstream) and the forward proxy's possible answer (OriginAmbiguous)
+// alike, because a request that produced a response may have produced work at
+// the provider, and only a boundary that proves otherwise may say so. An
+// unproven state (unknown) is never replayable either.
 //
 // It is the predicate the executor gates the EGRESS MOVE on (fallback.go), and
 // the router attributes a response with it on the wire — the phase and request
@@ -294,9 +329,13 @@ func (f Failure) ReplaySafe() bool {
 // member of a shared pool on evidence that does not implicate it. The direction
 // is deliberate, and the evidence row still names the phase and the error.
 //
-// Only OriginTransport can mark: a provider verdict (OriginUpstream) is the
-// provider's answer about a request, and a client cancellation (OriginClient)
-// has no egress fact in it — their phases are non-marking regardless.
+// Only OriginTransport can mark: a response (OriginUpstream, or the
+// unprovable-authorship OriginAmbiguous) is an answer ABOUT a request, and a
+// client cancellation (OriginClient) has no egress fact in it — their phases
+// are non-marking regardless. The egress a forward proxy answered FOR is not
+// evidence that it cannot carry traffic: a proxy 502 while reaching one origin
+// is the canonical case a shared pool exists to absorb, and it is exactly the
+// kind of destination-side fact this predicate already refuses to read.
 //
 // A phase added later is neutral by default, mirroring RequestStateUnknown: the
 // zero value of every axis in this file is the one that authorises nothing, so a
@@ -318,15 +357,82 @@ func (f Failure) MarksEgressHealth() bool {
 	}
 }
 
-// statusFailure is the provenance of an HTTP verdict: a response exists, so
-// the provider received the request and answered it. The phase is
-// response_headers because that is the moment a response first exists.
-func statusFailure(status int) Failure {
+// hopPath is the KIND of path one hop of a logical call took. It exists because
+// authorship of an HTTP response is a property of the path, never of the status
+// code that came back on it (issue #63): a forward proxy is an HTTP-level peer
+// and answers for itself — its own 407, its own 502/503 when it cannot reach
+// the origin, its own policy 403, a captive portal's 200 — with responses a
+// relayed origin answer is indistinguishable from. The status can only say
+// WHAT the answer was; the path is the only thing that can say WHO could have
+// written it.
+//
+// It is deliberately one bit, and it is not a model of trust: it does not
+// measure how likely an intermediary is to answer, only whether one is in a
+// position to.
+type hopPath struct {
+	// intermediated reports that an HTTP-level forward proxy carried this hop
+	// as a proxy, i.e. the request went to it in absolute form and it read and
+	// wrote the message itself. True exactly for a plain-http target on a
+	// client that HAS a CONNECT transport (an http/https proxy egress —
+	// transport.go); false for every other path:
+	//
+	//   - direct and SOCKS5-tunnelled hops hand the request bytes to the
+	//     origin over a transport-level tunnel that cannot author an HTTP
+	//     message (RFC 1928 §4 is opaque payload);
+	//   - the CONNECT-tunnelled hop (https through an http/https proxy) is
+	//     end-to-end: the proxy moves bytes and sees ciphertext, so a response
+	//     on it is the origin's by construction. A proxy that refuses the
+	//     tunnel produces a typed transport failure and no response at all
+	//     (connect.go), which is a different question entirely.
+	intermediated bool
+}
+
+// responseOrigin is who may have authored a response delivered on this path.
+func (p hopPath) responseOrigin() Origin {
+	if p.intermediated {
+		return OriginAmbiguous
+	}
+	return OriginUpstream
+}
+
+// responseState is what this process can prove about the request, given an
+// HTTP response that exists on this path.
+//
+// On an end-to-end path the response is the target's, so it proves the request
+// was received and answered: response_started, terminal and never replayable.
+//
+// On an intermediated path it proves less, and the difference matters in
+// exactly one direction — no consumer may conclude that the PROVIDER saw the
+// request. The proxy may have answered without forwarding it at all (a 407
+// gate, a captive portal, a policy refusal), so the fact that a response
+// exists is not evidence about the origin. It is not not_sent either, and
+// claiming that would be a fabrication in the dangerous direction: the request
+// byte provably DID leave this process — it reached the proxy. unknown is the
+// only honest answer, and unknown authorises nothing.
+func (p hopPath) responseState() RequestState {
+	if p.intermediated {
+		return RequestStateUnknown
+	}
+	return RequestStateResponseStarted
+}
+
+// statusFailure is the provenance of an HTTP response this layer RELAYS: a
+// response exists and it ends the logical call here, whatever authored it.
+// The class keeps naming the status family (429 / 5xx / other 4xx) — a
+// consumer sorting on severity still can — and the ORIGIN names authorship,
+// which the path decides and the status never may (hopPath).
+//
+// The phase is response_headers because that is the moment a response first
+// exists. It is a forensic attribution of WHERE the observation lives, not a
+// claim that a step failed: on an intermediated path nothing failed at all —
+// an HTTP intermediary this process cannot see through simply may have been
+// the one that answered.
+func statusFailure(status int, p hopPath) Failure {
 	return Failure{
 		Class:        classifyStatusFor(status),
-		Origin:       OriginUpstream,
+		Origin:       p.responseOrigin(),
 		Phase:        FailurePhaseResponseHeaders,
-		RequestState: RequestStateResponseStarted,
+		RequestState: p.responseState(),
 	}
 }
 

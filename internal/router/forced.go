@@ -43,7 +43,13 @@ func forcedUpstreamIsSSE(resp *http.Response) bool {
 // site (forcedUpstreamIsSSE above); reaching this function with a non-SSE
 // body is the JS parse-failure case, which answers 502 below
 // (sseToJsonHandler.js "Failed to convert streaming response to JSON").
-func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *http.Response, ev *evidenceLog, egID string, sourceFormat, targetFormat relay.Format, model string, customToolNames map[string]bool, reqBody map[string]any, upstreamModel string, intent *cloak.ThinkingCfg) {
+//
+// delivered is the authorship of the response being read, as the executor
+// proved it (OriginUpstream, or OriginAmbiguous on a hop an HTTP intermediary
+// carried — issue #63): every abort row below describes what became of a
+// response this call already received, so a constant would blame the provider
+// for a proxy's death.
+func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *http.Response, ev *evidenceLog, egID string, delivered upstream.Origin, sourceFormat, targetFormat relay.Format, model string, customToolNames map[string]bool, reqBody map[string]any, upstreamModel string, intent *cloak.ThinkingCfg) {
 	defer func() { _ = resp.Body.Close() }()
 	started := time.Now()
 
@@ -59,7 +65,7 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	// to the evidence stream only.
 	raw, err := readBoundedSSE(r.Context(), resp.Body, config.MaxForcedSSEBytes, config.StreamStall)
 	if err != nil {
-		origin, reason := forcedAbortReason(r, err)
+		origin, reason := forcedAbortReason(r, err, delivered)
 		ev.ForcedAbort(egID, resp.StatusCode, origin, reason, time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, "Failed to convert streaming response to JSON")
 		return
@@ -85,14 +91,14 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	// Standard Chat Completions SSE path.
 	parsed, errBody, ok := relay.ParseSSEToOpenAIResponse(string(raw), model)
 	if !ok {
-		ev.ForcedAbort(egID, resp.StatusCode, upstream.OriginUpstream, "convert", time.Since(started).Milliseconds())
+		ev.ForcedAbort(egID, resp.StatusCode, delivered, "convert", time.Since(started).Milliseconds())
 		writeError(w, http.StatusBadGateway, "Invalid SSE response for non-streaming request")
 		return
 	}
 	if errBody != nil {
 		// The stream itself carried an error frame — an upstream failure that
 		// began mid-stream (after the 200 headers), recorded as such.
-		ev.ForcedAbort(egID, resp.StatusCode, upstream.OriginUpstream, "sse_error_frame", time.Since(started).Milliseconds())
+		ev.ForcedAbort(egID, resp.StatusCode, delivered, "sse_error_frame", time.Since(started).Milliseconds())
 		msg, _ := errBody["message"].(string)
 		if msg == "" {
 			msg = "Upstream SSE stream failed"
@@ -143,18 +149,19 @@ var (
 // and its phase label: stall, size cap, client cancel (the request context
 // died), or a read error from the body itself. Every one of these happens
 // after the upstream's headers were already delivered, so the response is the
-// provider's — except a cancel, which is the caller's and must not be
-// recorded against the egress.
-func forcedAbortReason(r *http.Request, err error) (upstream.Origin, string) {
+// DELIVERING path's (issue #63: normally the provider's, but a hop an HTTP
+// intermediary carried may be the proxy's) — except a cancel, which is the
+// caller's and must not be recorded against the egress.
+func forcedAbortReason(r *http.Request, err error, delivered upstream.Origin) (upstream.Origin, string) {
 	switch {
 	case errors.Is(err, errForcedSSEStall):
-		return upstream.OriginUpstream, "stall"
+		return delivered, "stall"
 	case errors.Is(err, errForcedSSETooLarge):
-		return upstream.OriginUpstream, "too_large"
+		return delivered, "too_large"
 	case r.Context().Err() != nil || errors.Is(err, context.Canceled):
 		return upstream.OriginClient, "cancel"
 	default:
-		return upstream.OriginUpstream, "read"
+		return delivered, "read"
 	}
 }
 

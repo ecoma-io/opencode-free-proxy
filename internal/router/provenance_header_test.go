@@ -12,9 +12,11 @@ package router
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -73,6 +75,91 @@ func TestServedResponseIsLabelledUpstream(t *testing.T) {
 	}
 	if got := res.Header().Get("X-OFP-Failure-Origin"); got != "upstream" {
 		t.Fatalf("X-OFP-Failure-Origin = %q, want upstream", got)
+	}
+}
+
+// TestForwardProxiedResponseIsLabelledAmbiguous: on the absolute-form path the
+// forward proxy is an HTTP peer that answers for itself, so a response that
+// arrived through it names no author (issue #63) — and the wire says exactly
+// that. The status is still relayed verbatim, including the 502/503 that this
+// proxy also emits itself: a caller must be able to tell "someone answered"
+// from "this process failed".
+//
+// The base is upstream.invalid: nothing here can reach an origin, so the
+// response provably came from the proxy while the CALLER cannot prove it — the
+// gap the label refuses to paper over.
+func TestForwardProxiedResponseIsLabelledAmbiguous(t *testing.T) {
+	for _, status := range []int{403, 407, 429, 502, 503} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			dir := t.TempDir()
+			var seen int32
+			proxy := forwardingProxy(func(w http.ResponseWriter, _ *http.Request) {
+				atomic.AddInt32(&seen, 1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"error":{"message":"answered by the proxy"}}`)
+			})
+			defer proxy.Close()
+
+			_, mux, _ := snapshotRouter(t, dir, fmt.Sprintf(`
+egress:
+  - {id: a, proxy: {type: http, url: %q}}
+routes:
+  - {id: r, egress: [a]}
+`, proxy.URL), nil)
+
+			res := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free"}`, nil)
+			if res.Code != status {
+				t.Fatalf("status = %d, want %d relayed verbatim", res.Code, status)
+			}
+			if got := res.Header().Get("X-OFP-Failure-Origin"); got != "ambiguous" {
+				t.Fatalf("X-OFP-Failure-Origin = %q, want ambiguous", got)
+			}
+			if got := res.Header().Get("X-OFP-Request-State"); got != "unknown" {
+				t.Fatalf("X-OFP-Request-State = %q, want unknown", got)
+			}
+			if got := res.Header().Get("X-OFP-Failure-Phase"); got != "" {
+				t.Fatalf("X-OFP-Failure-Phase = %q, want absent — no step of the egress path failed, an answer arrived", got)
+			}
+			if got := atomic.LoadInt32(&seen); got != 1 {
+				t.Fatalf("proxy saw %d requests, want exactly 1 — a response is terminal whatever its author", got)
+			}
+		})
+	}
+}
+
+// TestServedResponseThroughAForwardProxyIsLabelledAmbiguous is the same rule on
+// the success path: the label is not "the response failed", it is "this process
+// cannot name the author". A captive portal's 200 is the case that makes it
+// matter, and a served response is where a fixed `upstream` would have hidden
+// it.
+func TestServedResponseThroughAForwardProxyIsLabelledAmbiguous(t *testing.T) {
+	dir := t.TempDir()
+	proxy := forwardingProxy(func(w http.ResponseWriter, _ *http.Request) {
+		// A 200 whose body is not a completion at all — exactly what a portal
+		// or an interception layer returns, and what OFP must not present as
+		// the provider's answer.
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "<html><title>Sign in to the network</title></html>")
+	})
+	defer proxy.Close()
+
+	_, mux, _ := snapshotRouter(t, dir, fmt.Sprintf(`
+egress:
+  - {id: a, proxy: {type: http, url: %q}}
+routes:
+  - {id: r, egress: [a]}
+`, proxy.URL), nil)
+
+	res := postJSON(t, mux, "/v1/chat/completions", `{"model":"qwen3-coder-free","stream":true}`, nil)
+	if got := res.Header().Get("X-OFP-Failure-Origin"); got != "ambiguous" {
+		t.Fatalf("X-OFP-Failure-Origin = %q, want ambiguous on a served response through an HTTP intermediary", got)
+	}
+	if got := res.Header().Get("X-OFP-Request-State"); got != "unknown" {
+		t.Fatalf("X-OFP-Request-State = %q, want unknown", got)
+	}
+	if got := res.Header().Get("X-OFP-Egress"); got != "a" {
+		t.Fatalf("X-OFP-Egress = %q, want a", got)
 	}
 }
 

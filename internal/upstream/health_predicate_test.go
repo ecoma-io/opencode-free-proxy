@@ -359,8 +359,9 @@ func TestPhaseAttributionDecidesTheHealthMark(t *testing.T) {
 			t.Fatalf("%s: MarksEgressHealth = %v, want %v (%s)", tc.phase, got, tc.marks, tc.why)
 		}
 		// Origin gates the mark independently of the phase: neither a provider
-		// verdict nor the caller hanging up is evidence about the egress.
-		for _, o := range []Origin{OriginNone, OriginUpstream, OriginClient} {
+		// verdict, nor an answer of unprovable authorship (issue #63), nor the
+		// caller hanging up is evidence about the egress.
+		for _, o := range []Origin{OriginNone, OriginUpstream, OriginAmbiguous, OriginClient} {
 			f := Failure{Origin: o, Phase: tc.phase, RequestState: RequestStateNotSent}
 			if f.MarksEgressHealth() {
 				t.Fatalf("%s with origin %q must never mark the egress", tc.phase, o)

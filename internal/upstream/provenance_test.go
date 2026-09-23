@@ -344,8 +344,9 @@ func TestRequestStateNeverClaimsNotSentWithoutADial(t *testing.T) {
 }
 
 // TestReplaySafeIsExactlyTransportNotSent: the one predicate the recovery
-// contract is built on. Anything else — an HTTP verdict, an unproven state, a
-// caller that went away — is not replayable.
+// contract is built on. Anything else — an HTTP verdict, an answer whose author
+// this process cannot name, an unproven state, a caller that went away — is not
+// replayable.
 func TestReplaySafeIsExactlyTransportNotSent(t *testing.T) {
 	cases := []struct {
 		f    Failure
@@ -356,6 +357,12 @@ func TestReplaySafeIsExactlyTransportNotSent(t *testing.T) {
 		{Failure{Origin: OriginTransport, RequestState: RequestStateResponseStarted}, false},
 		{Failure{Origin: OriginUpstream, RequestState: RequestStateNotSent}, false},
 		{Failure{Origin: OriginUpstream, RequestState: RequestStateResponseStarted}, false},
+		// The ambiguity of issue #63 must never buy a re-send, whatever state
+		// it is paired with: the request byte reached the proxy, and whether it
+		// went further is precisely what this process cannot see.
+		{Failure{Origin: OriginAmbiguous, RequestState: RequestStateUnknown}, false},
+		{Failure{Origin: OriginAmbiguous, RequestState: RequestStateNotSent}, false},
+		{Failure{Origin: OriginAmbiguous, RequestState: RequestStateResponseStarted}, false},
 		{Failure{Origin: OriginClient}, false},
 		{Failure{}, false},
 	}
@@ -398,7 +405,7 @@ func TestClassifyTransportFailureContextCancelIsClient(t *testing.T) {
 // what the evidence rows and the cross-service contract are written in.
 func TestProvenanceStringsAreStable(t *testing.T) {
 	origins := map[Origin]string{
-		OriginNone: "", OriginUpstream: "upstream",
+		OriginNone: "", OriginUpstream: "upstream", OriginAmbiguous: "ambiguous",
 		OriginTransport: "transport", OriginClient: "client",
 	}
 	for o, want := range origins {
