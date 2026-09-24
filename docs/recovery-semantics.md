@@ -176,9 +176,16 @@ would claim a provider answer nobody proved.
 
 This changes no decision. An ambiguous response is terminal exactly like any
 other response: relayed verbatim, never replay-safe, never marking an egress
-unhealthy. It changes what a caller is TOLD — and that matters, because the
-Injector owns provider-level retry and must not be told the provider answered
-when nothing proved it did.
+unhealthy. What it changes is this process's OWN record — and that matters,
+because the record is what stops OFP from acting on a premise nobody proved.
+An attribution of `upstream` for a reply a forward proxy may have authored
+would let a later stage treat an intermediary's answer as the provider's; the
+refusal to attribute is what keeps every internal decision (the replay
+predicate, the health predicate, the evidence rows) honest.
+
+Since issue #77 that refusal is **internal only**. It is not a label a caller
+receives: the response is relayed verbatim and carries no authorship, which is
+the whole of the caller contract.
 
 ## Ownership split
 
@@ -198,13 +205,16 @@ Injector, which owns the logical attempt), and failing over an egress requires
 proving the request never went out (OFP, which owns the transport boundary).
 The layer that cannot prove a thing does not get to decide it.
 
-The same principle fixes what OFP may **claim** about a response it relays.
-OFP does not own provider-level retry, so its authorship label is an input to
-the Injector's decision, and it may only state what the transport boundary
-proves: `upstream` where no intermediary could have authored the reply,
-`ambiguous` where one could (issue #63). Writing `upstream` for a response a
-forward proxy may have authored would hand the Injector a false premise for
-the one decision OFP is not allowed to make.
+The same principle fixes what OFP may **claim** about a response it relays —
+which, since issue #77, it claims only to itself. OFP does not own
+provider-level retry, so authorship is not a premise it may pass on: the
+internal attribution may state only what the transport boundary proves —
+`upstream` where no intermediary could have authored the reply, `ambiguous`
+where one could (issue #63). That record decides OFP's own health/replay
+predicates and fills the evidence rows; it does not travel to the caller, so
+there is no longer any way for OFP to hand the Injector a false premise. What
+the Injector gets is an OpenAI-compatible response, and the retry decision it
+builds from that is its own.
 
 ## OFP behaviour
 
@@ -224,14 +234,16 @@ the one decision OFP is not allowed to make.
 | request write failure                                  | gateway-origin failure, **no replay** | no          | neutral | no             |
 | response-header timeout / reset after write            | gateway-origin failure, **no replay** | no          | neutral | no             |
 | response body death after headers                      | abort downstream, commitment stands   | no          | neutral | no             |
-| response of unprovable authorship (absolute-form hop)  | relay verbatim, labelled `ambiguous`  | no          | neutral | no             |
+| response of unprovable authorship (absolute-form hop)  | relay verbatim, recorded `ambiguous`  | no          | neutral | no             |
 | client cancellation                                    | abort, nothing to deliver to          | no          | neutral | no             |
 
 The three "provider" rows hold on a path that proves the origin. Where the
-hop is intermediated the label is `ambiguous` instead, and the row is the same
-in every column that is a decision — relay verbatim, no new egress, neutral
-health, no provider retry (issue #63). "New egress?" is the safe-failover rule
-applied to the row's provenance.
+hop is intermediated the record says `ambiguous` instead, and the row is the
+same in every column that is a decision — relay verbatim, no new egress,
+neutral health, no provider retry (issue #63). "New egress?" is the
+safe-failover rule applied to the row's provenance. Every cell above describes
+what this process does and what it records; since issue #77 none of it is
+published to the caller.
 "Health" is the next section. "Provider retry" is `no` everywhere by
 construction: OFP makes exactly one logical upstream call per attempt.
 
@@ -328,32 +340,23 @@ request bodies, tool arguments, or raw session ids. Fine-grained phases are
 
 ### Injector ↔ OFP
 
-OFP exposes to the Injector, per logical provider attempt:
+**OFP exposes an OpenAI-compatible HTTP API.** A caller — the Injector
+included — treats this process like any other OpenAI-compatible upstream: it
+POSTs to `/v1/chat/completions` or `/v1/responses`, it reads the status, the
+body and the content type, and it decides its own retry and fallback policy
+from those. No OFP-specific failure header is part of that surface, and a
+caller never has to know that OFP exists to be correct against it.
 
-- **provider response** — relayed verbatim, status and body. Terminal: the
-  Injector owns every decision about what to do with it (including `429`,
-  which OFP will never convert into an egress change on its own).
-- **response of unprovable authorship** — relayed verbatim under
-  `origin = ambiguous`: a reply that arrived over an intermediated hop, where
-  a forward proxy may have authored it. Terminal in the same way, but the
-  Injector is told explicitly that the provider cannot be named as its author
-  (issue #63) — a provider-level retry decision must not rest on an
-  attribution nobody proved.
-- **gateway transport failure** — OFP could not deliver the request. When the
-  failure is provably pre-transmission OFP has already exhausted safe egress
-  failover internally (within its own configured pool) before surfacing it.
-  The Injector sees one failed logical attempt, never a partially recovered
-  one.
-- **request state** — `not_sent` when provable, `unknown` otherwise. Carried
-  in the internal response envelope so the Injector can decide whether
-  _its_ retry may re-send, without ever having to infer it from a status code.
+**Failure provenance is an internal implementation detail.** Where a status
+came from, which step of the egress path failed, and whether a request byte
+provably left this process are all recorded and all used — for transport
+classification, internal egress recovery, health tracking, and the
+evidence/forensics layer — and none of it is published. **Callers must not
+depend on OFP-specific failure headers to determine retry or fallback
+behaviour.**
 
-The request state is the only thing the Injector needs from OFP that it
-cannot determine itself, and it is the one thing OFP can prove and the
-Injector cannot.
-
-Every response that came out of the upstream attempt path carries that
-attribution in namespaced internal headers:
+That was not always true. Until issue #77 every response off the upstream
+attempt path carried a namespaced three-header recovery contract:
 
 ```text
 X-OFP-Failure-Origin: upstream | ambiguous | gateway
@@ -361,37 +364,58 @@ X-OFP-Failure-Phase:  <phase>                            (gateway only; absent o
 X-OFP-Request-State:  not_sent | unknown | response_started   (everything but upstream)
 ```
 
-`upstream` means the status and body are the provider's own answer, relayed
-verbatim — 2xx and every 4xx/5xx alike — on a path that proves no
-intermediary could have written it. `ambiguous` means a response exists but
-its author is unprovable: it arrived over an intermediated hop where an
-HTTP-level forward proxy answers for itself (issue #63). `gateway` means no
-provider response exists: OFP produced this status because the egress path
-failed, or because no egress was eligible for the route. The label is read off
-the recorded provenance, **never off the status** — a provider 502, an
-intermediary's 502 and a gateway 502 are the same number, and telling them
-apart is the entire point.
+It is **removed**, and it is not coming back: it made provenance a protocol,
+it forced a caller to be coupled to a vocabulary that is free to change shape
+(it has, several times: #53, #60, #63, #72), and it is the opposite of
+exposing an OpenAI-compatible API. There is no reserved inbound `X-OFP-*`
+namespace either — with the contract gone there is nothing for such a
+namespace to guard, and a blanket inbound strip would only imply a protocol
+that no longer exists.
 
-The three origins are three different instructions to a caller, and the
-request state travels with the second and third because only they leave the
-question open: `upstream` (the provider answered — read the status), `ambiguous`
-(someone answered, not provably the provider — a re-send could duplicate
-provider work), `gateway` (OFP could not send it — safe to retry when the state
-says `not_sent`). No phase rides an `ambiguous` response: the phase vocabulary
-names the failed step of the egress path, and nothing failed — an answer
-arrived.
+Everything the contract described survives, internally and unchanged:
 
-A response with **no** provenance header is not an upstream-interaction
-outcome: a local rejection (bad body, unknown model), a draining server, or a
-synthetic completion (bypass, test-connection). It never means "upstream". A
-client cancellation carries none either — no interaction concluded, so there
-is nothing to attribute.
+- **provider response** — relayed verbatim, status and body. Terminal: the
+  caller owns every decision about what to do with it (including `429`, which
+  OFP will never convert into an egress change on its own).
+- **response of unprovable authorship** — relayed verbatim, recorded
+  internally as `OriginAmbiguous`: a reply that arrived over an intermediated
+  hop, where an HTTP-level forward proxy answers for itself and may have
+  authored the reply (issue #63). Terminal in exactly the same way; the record
+  is simply not published, so a caller that wants to detect the case must
+  validate the body it can parse — which is what it would do against any
+  upstream.
+- **gateway transport failure** — OFP could not deliver the request. When the
+  failure is provably pre-transmission OFP has already exhausted safe egress
+  failover internally (within its own configured pool) before surfacing it.
+  The caller sees one failed logical attempt, never a partially recovered one.
+- **request state** — `not_sent` when provable, `unknown` otherwise (and
+  `response_started` once a response existed, including one a followed
+  redirect produced — issue #60). It gates this process's own internal
+  decisions (`Failure.ReplaySafe()`); it is never serialized.
 
-The values are fixed enums. No proxy URL, host, port, address, egress id, pool
-fact or session id travels in them, and every inbound `X-OFP-*` header is
-stripped before any stage runs, so a public client can neither forge
-provenance nor reach a decision through the namespace. `X-OFP-Egress` (the
-configured egress _id_, on a served request) is unchanged.
+The read-off-the-record rule is unchanged and is what makes the removal safe:
+attribution is read off the returned `Failure`, **never off the status** — a
+provider 502, an intermediary's 502 and a gateway 502 are the same number.
+Removing the publication does not touch that; it removes the reader.
+
+`X-OFP-Egress` is **not** part of any of this and is unchanged: it is an
+operational diagnostic naming the configured egress that served a request (id
+only — never a URL, address or credential), written on the served path, and it
+carries no origin, phase or request state.
+
+### Ownership
+
+```text
+Injector = provider-level retry/fallback policy
+OFP      = OpenCode relay + transformation + transport classification
+           + internal egress recovery + evidence
+RPGW     = shared egress infrastructure
+```
+
+A caller that wants to know whether _its_ retry may re-send a request it sent
+to OFP must answer that itself — from its own transport classification, as the
+Injector does (`internal/transport` `ClassifyAttempt`). OFP's answer stays
+inside OFP.
 
 ### Injector ↔ RPGW
 
@@ -470,26 +494,30 @@ an intent from a provider status in its place.
   error strings to decide retryability is banned outright: transport error
   text carries hostnames, ports and version-shaped tokens that defeat
   substring classification, and it is attacker-influenced.
-- **Any internal header between Injector and OFP is namespaced, trusted-
-  boundary only**, and stripped from inbound public traffic. On the wire these
-  are the `X-OFP-*` response headers above; a public client cannot set one,
-  cannot influence one, and cannot use one to select an egress.
+- **No OFP-specific header is part of the caller contract.** There is no
+  internal request/response namespace between Injector and OFP any more (issue
+  #77 removed the one there was), so nothing needs reserving out of inbound
+  public traffic and nothing needs stripping. The ONE header this process adds
+  to a served response is `X-OFP-Egress` — a diagnostic naming the selected
+  egress. A client cannot set it, cannot influence it, and cannot use it to
+  select an egress: it is written on the response from this process's own plan,
+  and a client-supplied request header is a different map that nothing reads.
 
 ## Status
 
-| Contract element                                   | State                                                                                                   |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Provenance model (origin / phase / request_state)  | **in force** — recorded on every evidence row                                                           |
-| Proof boundary at the transport layers             | **in force** — dial phases recorded by the dialers                                                      |
-| `not_sent` never claimed without a dial            | **in force**, pinned by test                                                                            |
-| Provider HTTP responses terminal at OFP            | **in force** — one logical upstream call per attempt                                                    |
-| Response authorship is a property of the path      | **in force** — `origin = ambiguous` on an intermediated hop, never inferred from the status (issue #63) |
-| Safe-failover-only egress movement                 | **in force** — `Failure.ReplaySafe()` gates the move                                                    |
-| Health = egress-path health only                   | **in force** — `Failure.MarksEgressHealth()` gates the mark (issue #62: a separate, narrower predicate) |
-| Evidence vocabulary without retry-matrix fields    | **in force** — rows carry phase/origin/state/decisions                                                  |
-| Inbound `X-OFP-*` stripped before any stage        | **in force**, pinned by test                                                                            |
-| `failure_origin` on the internal response envelope | **in force** — `X-OFP-Failure-Origin/Phase`/`Request-State`                                             |
-| OFP ↔ RPGW egress intent                           | OFP side **in force** (selector seam + recorded intent); RPGW side a recorded cross-repo dependency     |
+| Contract element                                  | State                                                                                                   |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Provenance model (origin / phase / request_state) | **in force** — recorded on every evidence row                                                           |
+| Proof boundary at the transport layers            | **in force** — dial phases recorded by the dialers                                                      |
+| `not_sent` never claimed without a dial           | **in force**, pinned by test                                                                            |
+| Provider HTTP responses terminal at OFP           | **in force** — one logical upstream call per attempt                                                    |
+| Response authorship is a property of the path     | **in force** — `origin = ambiguous` on an intermediated hop, never inferred from the status (issue #63) |
+| Safe-failover-only egress movement                | **in force** — `Failure.ReplaySafe()` gates the move                                                    |
+| Health = egress-path health only                  | **in force** — `Failure.MarksEgressHealth()` gates the mark (issue #62: a separate, narrower predicate) |
+| Evidence vocabulary without retry-matrix fields   | **in force** — rows carry phase/origin/state/decisions                                                  |
+| No vendor failure header on the public API        | **in force** — the `X-OFP-Failure-*` / `X-OFP-Request-State` contract was removed (issue #77)           |
+| `X-OFP-Egress` diagnostic on a served response    | **in force** — the selected egress id, never provenance                                                 |
+| OFP ↔ RPGW egress intent                          | OFP side **in force** (selector seam + recorded intent); RPGW side a recorded cross-repo dependency     |
 
 The revision that delivers each row is named in its pull request; this table
 is updated in the same commit as the behaviour it describes.

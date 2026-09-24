@@ -198,7 +198,7 @@ Upstream-failure forensics (`upstream_error` events — see
 [architecture.md](architecture.md#upstream-error-evidence-forensics)) are
 shaped so the default level is already investigative:
 
-- **info (default)** — one completion line per request, plus one warn
+- **info (default)** — one completion line per routed request, plus one warn
   `upstream_error` event per failed upstream interaction (dial, stream
   death, forced-conversion failure) with rate limits, classification,
   health and failover decisions. Successful requests emit nothing extra.
@@ -308,9 +308,18 @@ Under the issue #53 contract that case can no longer arise — a 429 never
 moves egress at all — but the divergence stands as the reason this proxy
 keeps the last real verdict instead of a synthesized one. The synthetic
 `502 none of the eligible egresses could serve the request` appears only when
-NOTHING was dialed — every plan entry was skipped (slot-full, unknown
-egress, transport build failed) or the head set was empty (`attempts=0` in
-that request's log line).
+NOTHING was dialed — every plan entry was skipped (slot-full, unknown egress,
+transport build failed) or the plan had no schedulable head (a
+`weighted_round_robin` route whose positive-weight members were all
+temporarily ineligible). Its sibling, the pre-plan
+`502 No eligible egress for route "r"`, is written when the route's head set
+filtered to empty before a plan existed at all. Both dialed nothing, so both
+report the same way: `attempts=0`, an empty `egress`, and the no-dial
+classification `class=connection_error` on that request's completion line. The
+completion line is emitted for every request that matched a route, so these two
+nothing-dialed 502s are explained; a request rejected before routing (405,
+draining 503, an unreadable or non-JSON body, an unknown model, a
+`x-test-connection` reply, a bypass) returns earlier and logs no line.
 
 ## Health
 

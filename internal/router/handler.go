@@ -91,10 +91,6 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 // (translator/formats.js detectFormatByEndpoint: /v1/responses is always
 // responses, /v1/chat/completions is openai — even with an input[] body).
 func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat relay.Format) {
-	// The internal namespace is dropped before ANY stage runs: no public
-	// client may forge provenance, impersonate the trusted boundary, or reach
-	// a decision through an X-OFP-* header (issue #55).
-	stripInternalHeaders(r)
 	// ONE immutable snapshot for the WHOLE request, captured at ARRIVAL: the
 	// single store read this handler ever makes. Everything downstream —
 	// route matching, the health policy, egress resolution, upstream.base,
@@ -301,9 +297,48 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		defer releaseHealth()
 	}
 	s.onGeneration(rt)
+	// The request id and the clock start here, before the head selection, so a
+	// request rejected before a plan existed and a served request measure their
+	// latency over the same span (planning onward) rather than over two
+	// different ones.
+	reqID := newRequestID()
+	start := time.Now()
+	// Completion is one event per ROUTED request at Info: the black-box e2e
+	// suite and the snapshot tests assert the outcome facts (generation,
+	// egress, attempts, fallback) on the default info level, so Debug would
+	// hide the very line the contract is observed through.
+	//
+	// "Routed" is the honest scope: a request rejected before routing (405,
+	// draining 503, unreadable/!JSON/missing-model 400, test-connection,
+	// bypass, translate failure, no-route-matched 400) returns above this
+	// point and logs no completion line. What this line IS guaranteed for is
+	// every request that matched a route — including the one rejected just
+	// below with no eligible egress, which dialed nothing at all and would
+	// otherwise leave a client-visible 502 with no line explaining it.
+	//
+	// routeID/egress/attempts/failure are the caller's, so the pre-plan
+	// rejection below emits the same line shape as a served request. The
+	// failure record is INTERNAL (response_headers.go): it classifies the
+	// outcome here and on the evidence rows, and is never serialized.
+	logCompletion := func(routeID, egID string, attempts int, failure upstream.Failure, status int, latencyMs int64) {
+		s.log.Info().Str("request_id", reqID).Uint64("generation", rt.Generation).
+			Str("route", routeID).Str("egress", egID).Int("attempts", attempts).
+			Str("class", failure.Class.String()).Int("status", status).Int64("latency_ms", latencyMs).
+			Str("model", cleanModel).Str("endpoint", profile.Endpoint).Bool("fallback", attempts > 1).
+			Msgf("request completed generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
+				rt.Generation, routeID, egID, attempts, failure.Class, status, latencyMs, cleanModel, profile.Endpoint, attempts > 1)
+	}
 	heads := s.routeHeads(rt, route, profile, hp)
 	if len(heads) == 0 {
-		setGatewayNotSent(w.Header())
+		// No egress was eligible, so no plan existed and nothing was dialed.
+		// The 502 is this process's own: an ordinary OpenAI-compatible gateway
+		// error, with no provenance on the wire and no evidence row (a row
+		// describes an upstream interaction, and there was none). The fact
+		// that nothing was dialed survives the only way it now can — as the
+		// canonical no-dial record on the completion line (NoDialFailure),
+		// exactly as the executor's own never-dialed envelope reports it.
+		latencyMs := time.Since(start).Milliseconds()
+		logCompletion(route.ID, "", 0, upstream.NoDialFailure(), http.StatusBadGateway, latencyMs)
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("No eligible egress for route %q", route.ID))
 		return
 	}
@@ -342,8 +377,6 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		}
 	}
 
-	reqID := newRequestID()
-	start := time.Now()
 	// Evidence wiring: the recorder collects rows inside the executor/client
 	// boundaries; the renderer adds the request-scoped facts only known here
 	// (correlation ids, model/endpoint, session pseudonym, body hash) and is
@@ -355,24 +388,23 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	resp, egID, attempts, failure, uerr := s.Exec.ExecuteObserved(reqCtx, url, buildHeaders, bodyJSON, plan, policy, rec)
 	latency := time.Since(start)
 	ev.Emit()
-	// Completion is one event per request at Info: the black-box e2e suite
-	// and the snapshot tests assert the outcome facts (generation, egress,
-	// attempts, fallback) on the default info level, so Debug would hide
-	// the very line the contract is observed through.
+	// The completion line, with the executor's own outcome facts: latency is
+	// read here, after Execute and the evidence emit, so it covers the whole
+	// upstream interaction and not the renderer's work that follows. It is
+	// measured from the shared clock above (planning onward), so the value is
+	// comparable across every line this handler emits.
 	logLine := func(status int) {
-		s.log.Info().Str("request_id", reqID).Uint64("generation", rt.Generation).
-			Str("route", plan.RouteID).Str("egress", egID).Int("attempts", attempts).
-			Str("class", failure.Class.String()).Int("status", status).Int64("latency_ms", latency.Milliseconds()).
-			Str("model", cleanModel).Str("endpoint", profile.Endpoint).Bool("fallback", attempts > 1).
-			Msgf("request completed generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
-				rt.Generation, plan.RouteID, egID, attempts, failure.Class, status, latency.Milliseconds(), cleanModel, profile.Endpoint, attempts > 1)
+		logCompletion(plan.RouteID, egID, attempts, failure, status, latency.Milliseconds())
 	}
 	if uerr != nil {
 		cancelUpstream()
-		// The status is about to be written; WHERE it came from is read off
-		// the recorded failure, never off the status itself — a synthesized
-		// 502 and a provider 502 are the same number (issue #55).
-		setFailureProvenance(w.Header(), failure)
+		// The recorded failure stays internal: it classifies this outcome for
+		// the completion line below and for the evidence rows already emitted,
+		// and it is never serialized into the response. The client sees one
+		// OpenAI-compatible error envelope and nothing else — the status is
+		// whatever the attempt produced, and attributing it is this process's
+		// business, not the caller's (see response_headers.go).
+		//
 		// model=%q, not %s: the model id is client-controlled and survives
 		// cloak.BaseModelID verbatim — an embedded newline (or any control
 		// byte) would forge extra log lines (CWE-117). %q escapes them for the
@@ -382,17 +414,18 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		writeError(w, uerr.Status, fmt.Sprintf("[%d]: %s", uerr.Status, uerr.Message))
 		return
 	}
-	w.Header().Set(headerEgress, egID)
-	// A served request's authorship is read off the SAME record a failed one's
-	// is — never off the fact that a response arrived (issue #63). A 200 on a
-	// hop an HTTP forward proxy carried may be the proxy's answer, not the
-	// provider's (a captive portal is the case that makes it matter), and the
-	// executor already said so in `failure`; this is a success, but "the
-	// provider answered" is not something a status can assert.
+	// The one header a served request carries: the configured egress it went
+	// out through. Operational diagnostic only — no authorship, no phase, no
+	// request state. A served request's authorship IS still recorded on
+	// `failure` (issue #63): a 200 on a hop an HTTP forward proxy carried may
+	// be the proxy's answer rather than the provider's — a captive portal is
+	// the case that makes it matter — and that record rides into the evidence
+	// rows and into the phase rows the relay can still produce below. It is
+	// simply not published.
 	//
 	// Synthetic completions never reach here — bypass and test-connection
-	// return before the executor and carry no provenance at all.
-	setFailureProvenance(w.Header(), failure)
+	// return before the executor.
+	w.Header().Set(headerEgress, egID)
 	logLine(resp.StatusCode)
 	// Forced SSE→JSON needs the upstream reply to actually be SSE
 	// (sseToJsonHandler.js:185-188): when it is not, chatCore falls through to

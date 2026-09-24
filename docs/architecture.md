@@ -352,21 +352,25 @@ not_sent` — decides whether the attempt may move to another egress, and
   against the egress endpoint itself — decides whether the egress is marked
   unhealthy. They answer different questions and are not nested; see
   `docs/recovery-semantics.md` ("Two questions, two predicates").
-- **The same record labels the response on the wire** (issue #55,
-  `internal/router/provenance_header.go`). The executor returns the terminal
-  `Failure`, not just its `Class`, because a caller cannot act on a status
-  alone: a 502 the provider sent and a 502 this process synthesized because
-  the egress path failed demand opposite responses. `X-OFP-Failure-Origin:
-upstream | ambiguous | gateway` is written from the recorded `Origin` — never
-  from the status. `X-OFP-Failure-Phase` rides `gateway` only; the state rides
-  everything but `upstream` — including `ambiguous`, where the response is
-  relayed verbatim but the provider cannot be named as its author (issue #63).
-  `OriginClient` writes nothing: no interaction concluded,
-  so there is nothing to attribute. Absence means "not an upstream-interaction
-  outcome" (a local rejection, a draining server, a synthetic completion),
-  never "upstream". Every inbound `X-OFP-*` header is stripped at the top of
-  the pipeline, so a public client can neither forge provenance nor reach a
-  decision through the namespace.
+- **The record never leaves the process; the response is a plain
+  OpenAI-compatible answer** (issues #55, #77,
+  `internal/router/response_headers.go`). OFP exposes an OpenAI-compatible
+  HTTP API: a caller reads the status and the body and decides its own retry
+  policy, and never has to know this process exists. The record is what makes
+  that safe — the executor returns the terminal `Failure`, not just its
+  `Class`, so this process can tell a provider's 502 from one it synthesized
+  over a failed egress path — but that distinction is read HERE, off the
+  recorded `Origin` (never off the status) and never written to the wire.
+  Until issue #77 it was published as `X-OFP-Failure-Origin` /
+  `X-OFP-Failure-Phase` / `X-OFP-Request-State`; that contract is removed, and
+  with it the reserved inbound `X-OFP-*` namespace and the blanket strip that
+  defended it. `OriginAmbiguous` (issue #63) is unaffected: the response over
+  an intermediated hop is still relayed verbatim and still refuses to name the
+  provider as its author — the refusal just happens internally, where it feeds
+  the evidence rows and the phase rows a live relay can still produce.
+  `OriginClient` likewise records nothing for the caller. The ONE header a
+  served response carries is `X-OFP-Egress`, an operational diagnostic naming
+  the configured egress that served it — no origin, no phase, no state.
 
 ## Endpoints
 
