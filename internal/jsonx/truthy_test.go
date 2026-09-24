@@ -7,6 +7,7 @@ package jsonx
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 )
 
@@ -39,6 +40,19 @@ func TestTruthy(t *testing.T) {
 		{"nonempty string is truthy", decode(`"x"`), true},
 		{"empty object is truthy", decode(`{}`), true},
 		{"empty array is truthy", decode(`[]`), true},
+		// IEEE edge values are unreachable through encoding/json (JSON has no
+		// NaN/Inf literals), and +-Inf are truthy in both JS and Go. NaN is
+		// the one genuinely wedged corner: JS ToBoolean(NaN) is false, but
+		// Truthy's float64 arm (`t != 0`) answers true because NaN != 0 holds
+		// in IEEE. The divergence is DEAD ON THE WIRE — NaN cannot enter a
+		// decoded JSON value, and jsonx.NumCoerce neutralizes NaN inputs to 0
+		// before anything downstream reads them — so the Go answer is pinned
+		// here (with the JS truthy spelling in the name) rather than
+		// "fixed" into a false nobody can observe.
+		{"NaN is truthy in Go, falsy in unreachable JS", float64NaN(), true},
+		{"+Inf is truthy", float64Inf(false), true},
+		{"-Inf is truthy", float64Inf(true), true},
+		{"negative zero is falsy (direct)", float64NegZero(), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,4 +61,25 @@ func TestTruthy(t *testing.T) {
 			}
 		})
 	}
+}
+
+// float64NaN / float64Inf / float64NegZero build the IEEE edge values the
+// JSON decoder can never emit from the wire, so the tests can exercise
+// Truthy's float64 arm directly.
+func float64NaN() float64 {
+	var z float64
+	return z / z // 0/0 = NaN
+}
+
+func float64Inf(neg bool) float64 {
+	var one float64 = 1
+	var zero float64
+	if neg {
+		return -one / zero
+	}
+	return one / zero
+}
+
+func float64NegZero() float64 {
+	return math.Copysign(0, -1)
 }

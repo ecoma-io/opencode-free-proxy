@@ -580,6 +580,57 @@ func TestInterpolate(t *testing.T) {
 	}
 }
 
+// TestInterpolateEdgeCases pins the reference grammar beyond the single-var
+// happy path: empty references are errors, a lone "$" is literal, multiple
+// references expand in one pass, a set-but-empty variable expands to nothing,
+// and an unset variable names itself in the error.
+func TestInterpolateEdgeCases(t *testing.T) {
+	t.Run("empty reference is an error", func(t *testing.T) {
+		if _, err := Interpolate([]byte("${}")); err == nil {
+			t.Fatal("${} must error")
+		}
+	})
+	t.Run("lone dollar passes through", func(t *testing.T) {
+		t.Setenv("A", "1")
+		got, err := Interpolate([]byte("cost is $5 and ${A} here"))
+		if err != nil {
+			t.Fatalf("interpolate: %v", err)
+		}
+		if string(got) != "cost is $5 and 1 here" {
+			t.Fatalf("got %q", got)
+		}
+	})
+	t.Run("multiple references expand in one pass", func(t *testing.T) {
+		t.Setenv("A", "1")
+		t.Setenv("B", "2")
+		got, err := Interpolate([]byte("${A}-${B}-${A}"))
+		if err != nil || string(got) != "1-2-1" {
+			t.Fatalf("interpolate = %q, %v", got, err)
+		}
+	})
+	t.Run("set-but-empty expands to nothing", func(t *testing.T) {
+		t.Setenv("EMPTY", "")
+		got, err := Interpolate([]byte("x${EMPTY}y"))
+		if err != nil {
+			t.Fatalf("interpolate: %v", err)
+		}
+		if string(got) != "xy" {
+			t.Fatalf("got %q, want xy", got)
+		}
+	})
+	t.Run("unset names the variable", func(t *testing.T) {
+		_, err := Interpolate([]byte("${SOME_UNSET_VAR}"))
+		if err == nil || !strings.Contains(err.Error(), "SOME_UNSET_VAR") || !strings.Contains(err.Error(), "not set") {
+			t.Fatalf("unset variable error must name the variable: %v", err)
+		}
+	})
+	t.Run("unclosed after a dollar", func(t *testing.T) {
+		if _, err := Interpolate([]byte("${A")); err == nil {
+			t.Fatal("unclosed reference after a dollar must error")
+		}
+	})
+}
+
 func TestRedactProxyURL(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"http://user:secret@h:8080", "http://h:8080"},

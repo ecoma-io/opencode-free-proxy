@@ -500,3 +500,63 @@ func TestConcurrentHealthObserveAndIdentityGC(t *testing.T) {
 	// whatever is unused; nothing panics and the map stays walkable.
 	r.Reclaim(stale)
 }
+
+// TestSameEgressTwoTransportsIsolation: the same logical egress id under two
+// different transport signatures (a proxy URL swap) must keep two separate
+// failure states, and a Reclaim driven by the current runtime's active set
+// must not mix them — the abandoned transport is reclaimed, the live one
+// keeps its history.
+func TestSameEgressTwoTransportsIsolation(t *testing.T) {
+	r, c := newTest(time.Unix(100, 0))
+	p := policy(true, 1, time.Minute)
+
+	direct := (&config.Egress{ID: "a"}).HealthKey()
+	proxied := (&config.Egress{
+		ID: "a",
+		Proxy: &config.Proxy{
+			Type: config.ProxyHTTP,
+			URL:  "http://proxy:8080",
+		},
+	}).HealthKey()
+	if direct == proxied {
+		t.Fatal("the two transport signatures must differ")
+	}
+
+	// The proxied transport fails and arms a cooldown.
+	r.Observe(proxied, false, p)
+	if r.Healthy(proxied, p) {
+		t.Fatal("proxied transport must be cooling")
+	}
+	// The direct transport was never observed — still healthy, and observing
+	// a success on it must NOT clear the proxied cooldown.
+	if !r.Healthy(direct, p) {
+		t.Fatal("direct transport must stay healthy")
+	}
+	r.Observe(direct, true, p)
+	if r.Healthy(proxied, p) {
+		t.Fatal("a success on direct must not clear the proxied cooldown")
+	}
+
+	// Time moves past the proxied cooldown; both are healthy again.
+	c.Advance(2 * time.Minute)
+	if !r.Healthy(proxied, p) || !r.Healthy(direct, p) {
+		t.Fatal("cooldown must expire for the proxied transport only")
+	}
+
+	// A Reclaim naming only the direct transport drops the proxied state but
+	// preserves the direct one.
+	dropped := r.Reclaim(map[string]struct{}{direct: {}})
+	if dropped != 1 {
+		t.Fatalf("Reclaim dropped %d, want exactly 1 (the abandoned transport)", dropped)
+	}
+	r.mu.Lock()
+	_, proxiedAlive := r.states[proxied]
+	_, directAlive := r.states[direct]
+	r.mu.Unlock()
+	if proxiedAlive {
+		t.Fatal("abandoned transport must be reclaimed")
+	}
+	if !directAlive {
+		t.Fatal("active transport must survive reclaim")
+	}
+}
