@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.8.0...v0.9.0) (2026-09-24)
+
+
+### Features
+
+* **router:** remove the vendor-specific wire recovery contract from the public API ([#78](https://github.com/ecoma-io/opencode-free-proxy/issues/78)) ([8b6195c](https://github.com/ecoma-io/opencode-free-proxy/commit/8b6195cc1e312853e58eb18889c18c33f8203afe)), closes [#77](https://github.com/ecoma-io/opencode-free-proxy/issues/77)
+* **routing:** attribute responses and express egress selection as intents ([#58](https://github.com/ecoma-io/opencode-free-proxy/issues/58)) ([87d1899](https://github.com/ecoma-io/opencode-free-proxy/commit/87d1899750fd1feb357509279521d2273657fbef))
+* **upstream:** make provider responses terminal and drop the retry matrix ([#54](https://github.com/ecoma-io/opencode-free-proxy/issues/54)) ([f31cae0](https://github.com/ecoma-io/opencode-free-proxy/commit/f31cae089bfb57a613337b67397cf426304716d6)), closes [#53](https://github.com/ecoma-io/opencode-free-proxy/issues/53)
+
+
+### Bug Fixes
+
+* **e2e:** wait for the asserted log line before scanning the captured log ([#67](https://github.com/ecoma-io/opencode-free-proxy/issues/67)) ([ab87d98](https://github.com/ecoma-io/opencode-free-proxy/commit/ab87d98dd7ba68eb8c1c08ee44a19ea2c36d4e7b))
+* **e2e:** wait for the asserted log line before scanning the captured log ([#69](https://github.com/ecoma-io/opencode-free-proxy/issues/69)) ([ab87d98](https://github.com/ecoma-io/opencode-free-proxy/commit/ab87d98dd7ba68eb8c1c08ee44a19ea2c36d4e7b))
+* **router:** label forced-conversion 502s as gateway, not upstream ([#72](https://github.com/ecoma-io/opencode-free-proxy/issues/72)) ([#74](https://github.com/ecoma-io/opencode-free-proxy/issues/74)) ([d9bf4c7](https://github.com/ecoma-io/opencode-free-proxy/commit/d9bf4c74d08236fa8b5299bec48ef394f764994d))
+* **upstream:** attribute the https-proxy TLS hop on both proxy transports ([#66](https://github.com/ecoma-io/opencode-free-proxy/issues/66)) ([96f79ff](https://github.com/ecoma-io/opencode-free-proxy/commit/96f79ff6445ccfd77f734881d2024fdcc1a63c7e))
+* **upstream:** audit-phase body/time provenance and flake fixes ([#76](https://github.com/ecoma-io/opencode-free-proxy/issues/76)) ([cb946bd](https://github.com/ecoma-io/opencode-free-proxy/commit/cb946bdfe69653c28b2f71e2939d7df3f31719b8))
+* **upstream:** constrain redirects to the trusted origin ([#75](https://github.com/ecoma-io/opencode-free-proxy/issues/75)) ([decbed1](https://github.com/ecoma-io/opencode-free-proxy/commit/decbed1cb97489f08108b16837857e9f6b563609))
+* **upstream:** make request state a property of the logical call, not the last hop ([#65](https://github.com/ecoma-io/opencode-free-proxy/issues/65)) ([ce62afa](https://github.com/ecoma-io/opencode-free-proxy/commit/ce62afa8f4e33f8b5b904f719d52e21e7507c6de)), closes [#60](https://github.com/ecoma-io/opencode-free-proxy/issues/60)
+* **upstream:** refuse cross-host redirects beyond the trusted origin (GHSA-5472-vw5j-wjvg) ([decbed1](https://github.com/ecoma-io/opencode-free-proxy/commit/decbed1cb97489f08108b16837857e9f6b563609))
+* **upstream:** refuse to attribute a proxied response to the provider ([#70](https://github.com/ecoma-io/opencode-free-proxy/issues/70)) ([bbf3ceb](https://github.com/ecoma-io/opencode-free-proxy/commit/bbf3ceb1d72a267c255f3e7057c99a37484ef2ba)), closes [#63](https://github.com/ecoma-io/opencode-free-proxy/issues/63)
+* **upstream:** separate replay safety from egress health ([#62](https://github.com/ecoma-io/opencode-free-proxy/issues/62)) ([7b1c448](https://github.com/ecoma-io/opencode-free-proxy/commit/7b1c448fc89ca02f325d4bdb6ddd4cd8a935d310))
+* **upstream:** separate replay safety from egress health ([#68](https://github.com/ecoma-io/opencode-free-proxy/issues/68)) ([7b1c448](https://github.com/ecoma-io/opencode-free-proxy/commit/7b1c448fc89ca02f325d4bdb6ddd4cd8a935d310))
+
 ## [0.8.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.7.0...v0.8.0) (2026-09-22)
 
 
