@@ -218,24 +218,24 @@ builds from that is its own.
 
 ## OFP behaviour
 
-| Upstream interaction                                   | OFP action                            | New egress? | Health  | Provider retry |
-| ------------------------------------------------------ | ------------------------------------- | ----------- | ------- | -------------- |
-| provider 2xx                                           | relay                                 | no          | reset   | no             |
-| provider 429                                           | relay the 429 verbatim                | no          | neutral | no             |
-| provider 4xx                                           | relay the 4xx verbatim                | no          | neutral | no             |
-| provider 5xx                                           | relay the 5xx verbatim                | no          | neutral | no             |
-| proxy TCP connect / proxy TLS failure                  | gateway-origin failure                | **yes**     | marked  | no             |
-| proxy auth refusal (CONNECT 407, SOCKS5 RFC 1929)      | gateway-origin failure                | **yes**     | marked  | no             |
-| SOCKS5 greeting / version negotiation failure          | gateway-origin failure                | **yes**     | marked  | no             |
-| CONNECT request could not be written to the proxy      | gateway-origin failure                | **yes**     | marked  | no             |
-| CONNECT refusal — the proxy could not reach the origin | gateway-origin failure                | **yes**     | neutral | no             |
-| target TCP connect failure                             | gateway-origin failure                | **yes**     | neutral | no             |
-| origin TLS handshake failure                           | gateway-origin failure                | **yes**     | neutral | no             |
-| request write failure                                  | gateway-origin failure, **no replay** | no          | neutral | no             |
-| response-header timeout / reset after write            | gateway-origin failure, **no replay** | no          | neutral | no             |
-| response body death after headers                      | abort downstream, commitment stands   | no          | neutral | no             |
-| response of unprovable authorship (absolute-form hop)  | relay verbatim, recorded `ambiguous`  | no          | neutral | no             |
-| client cancellation                                    | abort, nothing to deliver to          | no          | neutral | no             |
+| Upstream interaction                                   | OFP action                           | New egress? | Health  | Provider retry |
+| ------------------------------------------------------ | ------------------------------------ | ----------- | ------- | -------------- |
+| provider 2xx                                           | relay                                | no          | reset   | no             |
+| provider 429                                           | relay the 429 verbatim               | no          | neutral | no             |
+| provider 4xx                                           | relay the 4xx verbatim               | no          | neutral | no             |
+| provider 5xx                                           | relay the 5xx verbatim               | no          | neutral | no             |
+| proxy TCP connect / proxy TLS failure                  | recorded `transport` failure         | **yes**     | marked  | no             |
+| proxy auth refusal (CONNECT 407, SOCKS5 RFC 1929)      | recorded `transport` failure         | **yes**     | marked  | no             |
+| SOCKS5 greeting / version negotiation failure          | recorded `transport` failure         | **yes**     | marked  | no             |
+| CONNECT request could not be written to the proxy      | recorded `transport` failure         | **yes**     | marked  | no             |
+| CONNECT refusal — the proxy could not reach the origin | recorded `transport` failure         | **yes**     | neutral | no             |
+| target TCP connect failure                             | recorded `transport` failure         | **yes**     | neutral | no             |
+| origin TLS handshake failure                           | recorded `transport` failure         | **yes**     | neutral | no             |
+| request write failure                                  | `transport`, **no replay**           | no          | neutral | no             |
+| response-header timeout / reset after write            | `transport`, **no replay**           | no          | neutral | no             |
+| response body death after headers                      | abort downstream, commitment stands  | no          | neutral | no             |
+| response of unprovable authorship (absolute-form hop)  | relay verbatim, recorded `ambiguous` | no          | neutral | no             |
+| client cancellation                                    | abort, nothing to deliver to         | no          | neutral | no             |
 
 The three "provider" rows hold on a path that proves the origin. Where the
 hop is intermediated the record says `ambiguous` instead, and the row is the
@@ -399,9 +399,12 @@ provider 502, an intermediary's 502 and a gateway 502 are the same number.
 Removing the publication does not touch that; it removes the reader.
 
 `X-OFP-Egress` is **not** part of any of this and is unchanged: it is an
-operational diagnostic naming the configured egress that served a request (id
-only — never a URL, address or credential), written on the served path, and it
-carries no origin, phase or request state.
+operational diagnostic naming the configured egress an attempt went out
+through (id only — never a URL, address or credential), written on every
+outcome that DIALED something — including the forced-conversion 502 — and
+absent from every path that never dialed (a transport-failure 502, the
+pre-plan "no eligible egress" 502); it carries no origin, phase or request
+state.
 
 ### Ownership
 
@@ -450,10 +453,10 @@ RPGW (selection policy, pool health) OFP does not reimplement it. See
 
 **How an egress is NAMED across the seam** (issue #64). OFP asks with the
 intent and, for `new-egress`, hands back an opaque handle the selector itself
-produced — `Selector.Next(intent, prev) (Selection, bool)`. No egress id, proxy
-URL, address or pool slot is a parameter or a return value: a caller cannot
-request a specific egress, exclude one by name, or read an identity out of a
-selection. OFP resolves the handle it was given only to learn what to dial
+produced — `Selector.Next(intent, prev) (sel Selection, ok bool)`. No egress
+id, proxy URL, address or pool slot is a parameter or a return value: a caller
+cannot request a specific egress, exclude one by name, or read an identity out
+of a selection. OFP resolves the handle it was given only to learn what to dial
 (`Selection.Resolve`), which for a pool-backed selector is the transport
 through which THIS process reaches the pool, never a pool internal. `prev`
 carries the meaning "the egress that served the previous attempt" without the
@@ -497,11 +500,13 @@ an intent from a provider status in its place.
 - **No OFP-specific header is part of the caller contract.** There is no
   internal request/response namespace between Injector and OFP any more (issue
   #77 removed the one there was), so nothing needs reserving out of inbound
-  public traffic and nothing needs stripping. The ONE header this process adds
-  to a served response is `X-OFP-Egress` — a diagnostic naming the selected
-  egress. A client cannot set it, cannot influence it, and cannot use it to
-  select an egress: it is written on the response from this process's own plan,
-  and a client-supplied request header is a different map that nothing reads.
+  public traffic and nothing needs stripping. The ONE OFP-specific header
+  this process adds to a response is `X-OFP-Egress` — a diagnostic naming the
+  selected egress an attempt went out through, present on any outcome that
+  DIALED something and absent from every path that never dialed. A client
+  cannot set it, cannot influence it, and cannot use it to select an egress:
+  it is written on the response from this process's own plan, and a
+  client-supplied request header is a different map that nothing reads.
 
 ## Status
 

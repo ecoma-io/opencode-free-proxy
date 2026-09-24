@@ -1,16 +1,18 @@
 # Adversarial verification matrix
 
 End-to-end proof that the recovery architecture is **applied**, not just
-declared: every row below is pinned to a real seam on disk — the file and line
-of the guard that enforces it, and the exact gate output that exercised it.
+declared: every row below is pinned to a real seam on disk — the file and
+symbol of the guard that enforces it, and the exact gate output that exercised
+it. (Identifiers, not line numbers: line citations rot on the next edit;
+grep the symbol named.)
 
 > Scope
 > This document answers one question: _after removing the per-egress retry
 > matrix (PR B, issue #53/#55), does the recovery contract actually govern the
 > wire?_ It is written the way the recovery contract demands — "never say done
 > because tests pass": each row names the seam on the wire, the executable
-> proof that pins it, the file:line of the guard, the bookkeeping row that
-> proves the admission, and the gate that ran green.
+> proof that pins it, the guard symbol that enforces it, the bookkeeping row
+> that proves the admission, and the gate that ran green.
 >
 > Where the code on disk is the only source — the provenance seam, the intent
 > seam, the health predicate — rows cite the actual identifiers and comment

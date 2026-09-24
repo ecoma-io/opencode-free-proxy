@@ -2,9 +2,10 @@
 
 ## Docker
 
-The image is a static Go binary on `scratch` — no shell, no curl. The
-`HEALTHCHECK` runs the entrypoint binary itself against its own `/healthz`
-(`opencode-free-proxy healthcheck`, 5 s timeout).
+The image is a static Go binary on `scratch` — no shell, no curl — and runs as
+the unprivileged numeric user `65532:65532`. The `HEALTHCHECK` runs the
+entrypoint binary itself against its own `/healthz` (`opencode-free-proxy
+healthcheck`, 5 s timeout).
 
 ```sh
 docker build -t opencode-free-proxy .
@@ -151,6 +152,10 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
   with no inbound auth by design — an internal sidecar. Keep it on a private
   network, or front it with your own ingress/reverse proxy if it must be
   reachable more widely.
+- **Listener timeouts preserve streams.** Header reads are bounded at 10 s and
+  idle keep-alives between requests at 120 s. `ReadTimeout` and `WriteTimeout`
+  intentionally remain unset: their whole-request deadline would terminate a
+  slow permitted body upload or a long-lived SSE response mid-flight.
 - **TLS termination is not this proxy's job.** It serves plain HTTP by
   design; front it with your ingress/reverse proxy for TLS. The egress side
   supports `https` proxy types (TLS-to-the-proxy CONNECT hop) and `socks5`
@@ -175,9 +180,11 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
   logs one completion line at info with `generation`, `route`, `egress`,
   `attempts`, `class`, `status`, `latency_ms`, `model`, `endpoint`,
   `fallback`; set `log-level: debug` to also see opencode UA warm-up.
-  The API is plain OpenAI-compatible: a served response adds only
-  `X-OFP-Egress: <id>`, naming the configured egress it went out through, so a
-  multi-egress deployment is diagnosable from the client side. Failure
+  The API is plain OpenAI-compatible: any outcome that DIALED something
+  adds only `X-OFP-Egress: <id>` — including the forced-conversion 502, and
+  absent from every path that never dialed — naming the configured egress the
+  attempt went out through, so a multi-egress deployment is diagnosable from
+  the client side. Failure
   provenance — where a status came from, which step failed, whether a request
   byte provably left — is internal and is never published as a header; it
   reaches you through the completion line's `class`/`status`/`attempts` and

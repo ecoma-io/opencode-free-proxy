@@ -15,6 +15,7 @@ export default {
       "always",
       [
         "identity",
+        "logging",
         "cloak",
         "translate",
         "relay",

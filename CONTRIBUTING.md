@@ -73,7 +73,7 @@ pull-request title in CI:
 
 - Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
   `build`, `ci`, `chore`, `revert`.
-- Scopes name the area: `identity`, `cloak`, `translate`, `relay`,
+- Scopes name the area: `identity`, `logging`, `cloak`, `translate`, `relay`,
   `upstream`, `router`, `routing`, `health`, `caps`, `usage`, `jsonx`,
   `config`, `cmd`, `e2e`, `docs`, `deps`, `ci`, `workspace`, `release`.
   The scope is optional; `deps` and `ci` exist so that dependency-automation

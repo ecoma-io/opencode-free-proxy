@@ -78,8 +78,10 @@ Events are leveled:
 - **info** — lifecycle (listening, config loaded, shutdown) and one
   per-request completion line (the black-box suite asserts its facts at this
   level, so it cannot be demoted);
-- **debug** — opencode UA warm-up; per-request completion carries extra
-  structured fields for correlation;
+- **debug** — opencode UA warm-up; `egress_skipped` diagnostics (slot-full
+  / transport build / unknown-egress pass-overs). Completion lines are
+  info-only with a fixed field set — no level adds correlation fields to
+  them;
 - **warn** — fault signals a request survived (reload read/rejection,
   transport-setup failure, forced SSE→JSON abort, shutdown grace forced
   close);
@@ -93,10 +95,12 @@ Events are leveled:
 | ------ | ------ | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `base` | string | `https://opencode.ai` | Zen upstream base, all routes; must be an absolute http/https URL with a host (userinfo, query and fragment rejected); trailing `/` normalized at `Resolve` |
 
-Every endpoint (`/zen/v1/chat/completions`, `/zen/v1/responses`,
-`/zen/v1/models`) is derived from `base` — no other upstream URL appears in
-config or code. A non-default base is how tests and self-hosted gateways
-redirect the whole proxy.
+Every provider endpoint (`/zen/v1/chat/completions`,
+`/zen/v1/responses`, `/zen/v1/models`) is derived from `base`. The background
+User-Agent identity sync separately fetches OpenCode release metadata from
+GitHub; it is not a provider endpoint and never changes where provider traffic
+goes. A non-default base is how tests and self-hosted gateways redirect the
+whole proxy.
 
 ### `user_agent`
 
@@ -256,9 +260,11 @@ Three separate decisions, in this order:
 `weight` never decides eligibility: every eligible egress stays in the
 attempt list whatever its weight. A `weight: 0` egress contributes nothing to
 the smooth-WRR totals and never heads the plan while any positive-weight
-sibling is eligible; only when every eligible head is weight 0 does the first
-listed one serve (deterministically). Under `round_robin`, weight is ignored
-entirely.
+sibling is eligible. It is a **configuration stance, not a scheduling
+question**: a weight-0 egress is never a route head at all — if every head is
+weight 0 the WRR plan is **empty** and the request fails with the synthetic
+502 (see the fallback section below), it does not "serve the first listed
+one". Under `round_robin`, weight is ignored entirely.
 
 ## Body limits
 
@@ -273,6 +279,16 @@ Three different layers — do not conflate them:
 3. **`max_body_bytes` on an egress** — eligibility only: an over-limit
    egress is filtered out of the head set (all egresses filtered → 502), and
    `0` = unlimited. It never rejects a request by itself.
+
+Forced SSE→JSON aggregation has separate upstream-response bounds. A
+non-streaming client whose upstream answered SSE buffers at most **64 MiB**
+(`config.MaxForcedSSEBytes`) and enforces the normal **360 s progress-reset
+stall** deadline; either breach returns the normal forced-conversion 502. For
+the Responses aggregate, an `output_index` above **4096**
+(`config.MaxResponsesOutputIndex`) is dropped before dense placeholder fill,
+so an upstream-controlled index cannot force an unbounded allocation. These
+limits apply after a live upstream response begins; they are not inbound request
+limits and do not authorise fallback.
 
 ## Attempt budget (there is no retry budget)
 
@@ -318,8 +334,11 @@ report the same way: `attempts=0`, an empty `egress`, and the no-dial
 classification `class=connection_error` on that request's completion line. The
 completion line is emitted for every request that matched a route, so these two
 nothing-dialed 502s are explained; a request rejected before routing (405,
-draining 503, an unreadable or non-JSON body, an unknown model, a
-`x-test-connection` reply, a bypass) returns earlier and logs no line.
+draining 503, an unreadable or non-JSON body, a missing `body.model`, a
+`x-test-connection` reply, a bypass) returns earlier and logs no line. An
+unknown-but-present model is NOT rejected: it is routed like any other (it
+generally matches the catch-all route, or fails with `No route matched` if
+none does).
 
 ## Health
 
