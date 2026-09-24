@@ -257,10 +257,10 @@ type Failure struct {
 // the provider, and only a boundary that proves otherwise may say so. An
 // unproven state (unknown) is never replayable either.
 //
-// It is the predicate the executor gates the EGRESS MOVE on (fallback.go), and
-// the router attributes a response with it on the wire — the phase and request
-// state are only meaningful to a caller because this definition is the
-// contract's (provenance_header.go, docs/recovery-semantics.md).
+// It is the predicate the executor gates the EGRESS MOVE on (fallback.go). It
+// is an internal decision and nothing else: issue #77 removed the wire
+// contract that once published the phase and request state, so no caller sees
+// this value (docs/recovery-semantics.md).
 //
 // It is NOT the predicate that gates the health mark, and the two were one
 // predicate only until issue #62: "may this request be re-sent" and "is this
@@ -433,6 +433,38 @@ func statusFailure(status int, p hopPath) Failure {
 		Origin:       p.responseOrigin(),
 		Phase:        FailurePhaseResponseHeaders,
 		RequestState: p.responseState(),
+	}
+}
+
+// NoDialFailure is the canonical record of the one outcome no transport can
+// report: nothing was ever dialed. No provider answered and no request byte
+// existed, so the origin is transport and the state is not_sent by
+// construction rather than by inference — there is no observation to read,
+// only the absence of one. The class stays ClassConnectionError, the label
+// this envelope has always carried.
+//
+// There is exactly one such envelope, produced at two places that must never
+// diverge:
+//
+//   - the executor's never-dialed return (fallback.go): the plan ran out
+//     without a dial (every entry skipped, or the head set produced no
+//     schedulable head), so the 502 is this process's own;
+//   - the router's pre-plan rejection (router/handler.go): no egress was
+//     eligible for the matched route at all, so no plan existed to run.
+//
+// Both are RECORDS, not authorisations, and the distinction is load-bearing
+// here in a way it is not for a transport failure. ReplaySafe() is TRUE for
+// this value — no request byte ever left, so a re-send would duplicate
+// nothing — but no caller may ever act on that: by the time either envelope
+// exists the failover walk is over (the executor has returned) or never began
+// (the router rejected before planning). Nothing reads this value to make a
+// move; it exists so a completion line can say what happened.
+func NoDialFailure() Failure {
+	return Failure{
+		Class:        ClassConnectionError,
+		Origin:       OriginTransport,
+		Phase:        FailurePhaseNone,
+		RequestState: RequestStateNotSent,
 	}
 }
 

@@ -175,15 +175,15 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
   logs one completion line at info with `generation`, `route`, `egress`,
   `attempts`, `class`, `status`, `latency_ms`, `model`, `endpoint`,
   `fallback`; set `log-level: debug` to also see opencode UA warm-up.
-  Responses carry `X-OFP-Egress: <id>`, plus the failure attribution on
-  anything that came out of the upstream attempt path —
-  `X-OFP-Failure-Origin: upstream | ambiguous | gateway`, with
-  `X-OFP-Failure-Phase` on gateway-origin responses and `X-OFP-Request-State`
-  on everything but `upstream` (`ambiguous` marks a response carried by an
-  intermediated hop, whose author this process cannot prove)
+  The API is plain OpenAI-compatible: a served response adds only
+  `X-OFP-Egress: <id>`, naming the configured egress it went out through, so a
+  multi-egress deployment is diagnosable from the client side. Failure
+  provenance — where a status came from, which step failed, whether a request
+  byte provably left — is internal and is never published as a header; it
+  reaches you through the completion line's `class`/`status`/`attempts` and
+  through the `upstream_error` evidence events
   ([recovery-semantics.md → Injector ↔ OFP](recovery-semantics.md#injector--ofp)).
-  All `X-OFP-*` headers are stripped from inbound requests. Logs never
-  contain credentials (proxy userinfo).
+  Logs never contain credentials (proxy userinfo).
 - **Egress sizing.** `max_concurrency` per egress bounds in-flight
   requests/streams; an egress at capacity is skipped (not failed) at dial
   time. Size it to what the upstream proxy vendor tolerates.

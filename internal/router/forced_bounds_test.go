@@ -210,28 +210,27 @@ func TestForcedSSEToJsonOversizedUpstreamReturns502(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), "Failed to convert streaming response to JSON") {
 			t.Fatalf("body = %s, want the forced-conversion 502 envelope", rec.Body.String())
 		}
-		assertForced502Provenance(t, rec.Header())
+		assertForced502CarriesNoProvenance(t, rec.Header())
 	case <-time.After(60 * time.Second):
 		t.Fatal("oversized forced body did not abort — the byte cap is not enforced")
 	}
 }
 
-// assertForced502Provenance pins issue #72 on a forced-conversion 502: the
-// gateway synthesized this status over a live 2xx stream, so the success-path
-// label (upstream/ambiguous, handler.go:395) must have been replaced with
-// gateway, and the request state must say response_started — the fact that
-// forbids a caller from re-sending a call that was already answered.
-func assertForced502Provenance(t *testing.T, h http.Header) {
+// assertForced502CarriesNoProvenance pins issue #72's fact where it now lives.
+// The forced-conversion 502 is this process's own, synthesized over a live 2xx
+// stream: the response predates the failure, which is exactly why no caller
+// may re-send it. Until issue #77 that fact was published as
+// gateway/response_started headers; it now lives on the evidence row
+// (ev.ForcedAbort — the row's own shape is pinned by
+// TestUpstreamErrorForcedConvertFailure in evidence_router_test.go, and its
+// delivered-origin plumbing by TestAmbiguousOriginReachesTheRelayPhaseRows in
+// response_headers_test.go), and the response carries the bare gateway error.
+// What THIS helper pins on the wire is the removal: the success-path
+// provenance that used to be attached before the forced path took over must
+// not be visible either.
+func assertForced502CarriesNoProvenance(t *testing.T, h http.Header) {
 	t.Helper()
-	if got := h.Get("X-OFP-Failure-Origin"); got != "gateway" {
-		t.Fatalf("X-OFP-Failure-Origin = %q, want gateway — this 502 is OFP's, synthesized over a live 2xx stream (issue #72)", got)
-	}
-	if got := h.Get("X-OFP-Failure-Phase"); got != "" {
-		t.Fatalf("X-OFP-Failure-Phase = %q, want absent — the transcript's 200 arrived; attribution of that detail is the evidence layer's, not the caller's", got)
-	}
-	if got := h.Get("X-OFP-Request-State"); got != "response_started" {
-		t.Fatalf("X-OFP-Request-State = %q, want response_started — a response predates this failure, so a re-send is forbidden", got)
-	}
+	assertNoWireProvenance(t, h)
 }
 
 // TestForcedSSEToJsonUnparseableStreamIsLabelledGateway covers the second
@@ -254,7 +253,7 @@ func TestForcedSSEToJsonUnparseableStreamIsLabelledGateway(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "Invalid SSE response for non-streaming request") {
 		t.Fatalf("body = %s, want the generic invalid-SSE 502 envelope", rec.Body.String())
 	}
-	assertForced502Provenance(t, rec.Header())
+	assertForced502CarriesNoProvenance(t, rec.Header())
 }
 
 // TestForcedSSEToJsonErrorFrameIsLabelledGateway covers the third forced-
@@ -279,5 +278,5 @@ func TestForcedSSEToJsonErrorFrameIsLabelledGateway(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "quota exceeded mid-stream") {
 		t.Fatalf("body = %s, want the stream's error message relayed", rec.Body.String())
 	}
-	assertForced502Provenance(t, rec.Header())
+	assertForced502CarriesNoProvenance(t, rec.Header())
 }

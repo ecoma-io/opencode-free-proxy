@@ -137,28 +137,33 @@ The semantics agents most often get wrong:
     Stream/forced deaths are `response_started` PHASE rows — the delivered
     status is never rewritten into an HTTP verdict. See docs/architecture.md
     "Upstream error evidence".
-11. Responses are **attributed, not inferred** (issues #55, #63,
-    `internal/router/provenance_header.go`). Anything that came out of the
-    upstream attempt path carries `X-OFP-Failure-Origin` (`upstream` |
-    `ambiguous` | `gateway`), with `X-OFP-Failure-Phase` on gateway-origin
-    responses only and `X-OFP-Request-State` on everything but `upstream`
-    (`not_sent` | `unknown` | `response_started` — the last means the logical
-    call had been answered before the hop that failed, e.g. by a followed
-    redirect, issue #60; all three are read off the `Failure`, never off the
-    status). Authorship is a property of the PATH, never of the status code:
-    on an intermediated hop (a plain-http target carried by an http/https
-    forward proxy, `internal/upstream` `hopPathOf`) the proxy is an HTTP peer
-    that answers for itself, so the label is `ambiguous` with state `unknown`
-    — relayed verbatim like any response, never replay-safe, never marking an
-    egress, and never claiming the provider wrote it. The label is read off the returned
-    `Failure` — NEVER off the status that is about to be written, because a
-    provider 502 and a synthesized 502 are the same number. A local error
-    (bad body, unknown model, draining) and a client cancellation carry no
-    provenance header; absence means "not an upstream-interaction outcome",
-    never "upstream". Every inbound `X-OFP-*` header is stripped at the top
-    of the pipeline, so no client can forge one. Pinned by
-    `internal/router/provenance_header_test.go` and the black-box
-    `e2e/provenance_test.go`.
+11. Responses are **attributed internally, and never labelled on the wire**
+    (issues #55, #63, #77, `internal/upstream/provenance.go`,
+    `internal/router/response_headers.go`). OFP exposes a plain
+    OpenAI-compatible API: a caller reads the status and the body and decides
+    its own retry policy, and never has to know this process exists.
+    **Failure provenance is an implementation detail** — it decides the egress
+    move (`Failure.ReplaySafe()`), the health mark (`Failure.MarksEgressHealth()`,
+    a separate and narrower predicate, issue #62), and what the
+    evidence/forensics layer and the completion line record. The
+    `X-OFP-Failure-Origin` / `X-OFP-Failure-Phase` / `X-OFP-Request-State`
+    headers that once published it were **removed by issue #77**: they made
+    provenance a protocol, and it is free to change shape without notice.
+    Do not reintroduce them, and do not reintroduce a reserved inbound
+    `X-OFP-*` namespace or a blanket inbound strip to go with them.
+    Authorship is a property of the PATH, never of the status code: on an
+    intermediated hop (a plain-http target carried by an http/https forward
+    proxy, `internal/upstream` `hopPathOf`) the proxy is an HTTP peer that
+    answers for itself, so the origin is `OriginAmbiguous` with state
+    `unknown` — relayed verbatim like any response, never replay-safe, never
+    marking an egress, and never claiming the provider wrote it. The
+    attribution is read off the returned `Failure` — NEVER off the status that
+    is about to be written, because a provider 502 and a synthesized 502 are
+    the same number. `X-OFP-Egress` is a DIFFERENT thing and stays: an
+    operational diagnostic naming the configured egress that served a request,
+    on the served path only, carrying no classification. Pinned by
+    `internal/router/response_headers_test.go` and the black-box
+    `e2e/wire_surface_test.go`.
 12. Egress selection is a **logical intent, not an index walk** (issues #56,
     #64, `internal/routing/intent.go`). The attempt loop asks
     `routing.Selector` for the next egress under `normal` (no history) or
@@ -176,7 +181,7 @@ bool)`, with `Selection.Resolve()` telling the caller only what to dial.
     recorded cross-repo dependency, never invented here. The intent is
     recorded on every evidence row (`egress_intent`), never derived from a
     provider status (a 429 attempt stays `normal`), and never accepted from
-    the wire — inbound `X-OFP-*` is stripped before any stage.
+    the wire (no inbound header influences a selection).
     `fallback.max_attempts` bounds DISTINCT egresses; one route member is
     tried at most once per request. Pinned by
     `internal/routing/intent_test.go`, `internal/upstream/intent_test.go`,

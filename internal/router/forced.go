@@ -67,12 +67,12 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	if err != nil {
 		origin, reason := forcedAbortReason(r, err, delivered)
 		ev.ForcedAbort(egID, resp.StatusCode, origin, reason, time.Since(started).Milliseconds())
-		// The 502 is THIS process's, synthesized over a live 2xx stream — the
-		// record relabel must say so, or the success-path origin (upstream or
-		// ambiguous, handler.go:395) would assert the provider authored a status
-		// it never sent (issue #72). response_started forbids a replay of the
-		// already-answered call.
-		setGatewayResponseStarted(w.Header())
+		// The 502 is THIS process's, synthesized over a live 2xx stream. The
+		// evidence row above already carries the delivered origin (the
+		// provider's, or `ambiguous` on an intermediated hop) so the record
+		// never claims the provider authored a status it never sent (issue
+		// #72); the response itself is a plain gateway error with nothing to
+		// attribute on it.
 		writeError(w, http.StatusBadGateway, "Failed to convert streaming response to JSON")
 		return
 	}
@@ -98,7 +98,6 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 	parsed, errBody, ok := relay.ParseSSEToOpenAIResponse(string(raw), model)
 	if !ok {
 		ev.ForcedAbort(egID, resp.StatusCode, delivered, "convert", time.Since(started).Milliseconds())
-		setGatewayResponseStarted(w.Header())
 		writeError(w, http.StatusBadGateway, "Invalid SSE response for non-streaming request")
 		return
 	}
@@ -108,10 +107,9 @@ func (s *Server) forcedSSEToJson(w http.ResponseWriter, r *http.Request, resp *h
 		ev.ForcedAbort(egID, resp.StatusCode, delivered, "sse_error_frame", time.Since(started).Milliseconds())
 		// This 502 reports an error the STREAM carried — a provider-authored
 		// status would be a fabrication here, so the 502 is this process's,
-		// labelled gateway/response_started over the live 2xx stream. The
-		// evidence row keeps the delivered origin for the record; the wire
-		// label must not let a caller replay a call that was already answered.
-		setGatewayResponseStarted(w.Header())
+		// synthesized over the live 2xx stream. The evidence row keeps the
+		// delivered origin for the record; the response carries no attribution
+		// at all.
 		msg, _ := errBody["message"].(string)
 		if msg == "" {
 			msg = "Upstream SSE stream failed"

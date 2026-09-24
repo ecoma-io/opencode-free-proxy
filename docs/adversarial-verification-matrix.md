@@ -21,15 +21,17 @@ of the guard that enforces it, and the exact gate output that exercised it.
 
 ## Gates run this session
 
-| Gate                                | Command                        | Result (real output)        |
-| ----------------------------------- | ------------------------------ | --------------------------- |
-| Build                               | `go build ./...`               | PASS                        |
-| Vet                                 | `go vet ./...`                 | PASS                        |
-| Vet (e2e tag set)                   | `go vet -tags e2e ./e2e/`      | PASS                        |
-| Format                              | `gofmt -l .`                   | clean                       |
-| Race suite (whole module, no cache) | `go test -race -count=1 ./...` | PASS — 10 ok, `-race` clean |
-| Black-box e2e against fake upstream | `go test -tags e2e ./e2e/`     | PASS — okay in 14.486s      |
-| Static analysis                     | `golangci-lint run ./...`      | 0 issues                    |
+| Gate                                | Command                            | Result (real output)         |
+| ----------------------------------- | ---------------------------------- | ---------------------------- |
+| Build                               | `go build ./...`                   | PASS                         |
+| Vet                                 | `go vet ./...`                     | PASS                         |
+| Vet (e2e tag set)                   | `go vet -tags e2e ./e2e/`          | PASS                         |
+| Format                              | `gofmt -l .`                       | clean                        |
+| Race suite (whole module, no cache) | `go test -race -count=1 ./...`     | PASS — 13 ok, `-race` clean  |
+| Black-box e2e against fake upstream | `go test -tags e2e ./e2e/`         | PASS — okay in ~14.8s        |
+| Static analysis                     | `golangci-lint run ./...`          | 0 issues                     |
+| Semgrep (repo rules)                | `semgrep --config .github/semgrep` | 0 findings, 6 rules, 3 files |
+| Docs formatting                     | `pnpm format`                      | unchanged / formatted        |
 
 ## The contract, row by row
 
@@ -98,14 +100,14 @@ recorded**.
 
 - **Contract:** `normal` / `new-egress` is a logical intent; it is stamped on
   the evidence row as `egress_intent` by the attempt loop, and the executor is
-  its only author. Inbound `X-OFP-*` headers (including a forged
-  `X-OFP-Intent`) are stripped before any stage and cannot change the record.
+  its only author. No inbound header — a forged `X-OFP-Intent` or anything
+  else — can change the record, and none of it reaches the upstream request.
 - **Guard seam:** `internal/routing/intent.go` (intent vocabulary + the seam's
   contract comment), `internal/router/intent_router_test.go`
   (TestProviderVerdictStaysNormalUnderAnyStatus, TestForgedIntentCannotChangeTheRecordedOne).
 - **Pinned by:** `internal/router/intent_test.go` (PlanSelector exclusion),
-  `internal/router/provenance_header_test.go` (forged inbound `X-OFP-*` inert
-  - stripped), `internal/upstream/intent_test.go`.
+  `internal/router/response_headers_test.go` (TestForgedInboundHeadersAreInert),
+  `internal/upstream/intent_test.go`.
 - **Evidence the gates recorded:** the forged-intent test asserts the recorded
   row carries the executor's `egress_intent = "normal"` even when the inbound
   header claims `new-egress`.
@@ -148,27 +150,44 @@ recorded**.
 - **Evidence the gates recorded:** executor's `new-egress` move lands on egress
   b after a replay-safe a failure, never back on a.
 
-### R6 — Headers are provenance-labelled, minimised, and cannot be forged inbound
+### R6 — Provenance is internal; the response is a plain OpenAI-compatible answer
 
-- **Contract:** every upstream-interaction response carries
-  `X-OFP-Failure-Origin/Phase/Request-State` recorded from the row (never from
-  the about-to-write status); the origin is `upstream | ambiguous | gateway`,
-  where `ambiguous` refuses to name the provider as the author of a response
-  that arrived over an intermediated hop (issue #63); a local error /
-  client-cancel carries no provenance; every inbound `X-OFP-*` is stripped.
-- **Guard seam:** `internal/router/provenance_header.go` (read from row, never
-  from wire), `internal/router/provenance_header_test.go`
-  (TestInboundInternalHeadersAreStripped, TestStripInternalHeadersCaseInsensitive,
-  TestTransportFailureIsLabelledGateway,
-  TestForwardProxiedResponseIsLabelledAmbiguous,
-  TestServedResponseThroughAForwardProxyIsLabelledAmbiguous),
-  `internal/upstream/response_ownership_test.go` (path-vs-status authorship).
-- **Pinned by:** `internal/router/provenance_header_test.go`,
+- **Contract (issue #77):** NO response carries `X-OFP-Failure-Origin`,
+  `X-OFP-Failure-Phase` or `X-OFP-Request-State` — the vendor recovery
+  contract is removed, on every path. The attribution itself is unchanged and
+  stays internal: it is read off the returned `Failure` (never from the
+  about-to-write status), where `OriginAmbiguous` refuses to name the provider
+  as the author of a response that arrived over an intermediated hop (issue
+  #63), and where `OriginClient` records that no interaction concluded. The
+  only header a served response adds is `X-OFP-Egress`, the selected egress id
+  — a diagnostic, not provenance. There is no reserved inbound `X-OFP-*`
+  namespace and no inbound strip; what must hold instead is that a forged
+  inbound header is inert in BOTH directions (never in a response, never in an
+  upstream request).
+- **Guard seam:** `internal/router/response_headers.go` (the egress diagnostic
+  and the module's statement of what is and is not published),
+  `internal/router/response_headers_test.go`
+  (TestProviderVerdictIsPublishedBare, TestServedResponseIsPublishedBare,
+  TestAmbiguousOriginResponseIsPublishedBare, TestAmbiguousOriginServedResponseIsPublishedBare,
+  TestGatewayTransportFailureIsPublishedBare,
+  TestNoEligibleEgressIsPublishedBare, TestNoEligibleEgressRecordsTheNoDialFactInternally,
+  TestResponseStartedFailuresArePublishedBare,
+  TestSSEStreamDeathIsPublishedBareWithoutFallback, TestForgedInboundHeadersAreInert,
+  TestAmbiguousOriginReachesTheRelayPhaseRows — the router→row plumbing for the
+  delivered origin, which the deleted wire tests used to pin),
+  `internal/upstream/response_ownership_test.go` (path-vs-status authorship),
+  `internal/upstream/provenance_test.go` (the internal model itself),
+  `internal/upstream/fallback_test.go` (TestNoDialFailureIsTheCanonicalNoDialRecord —
+  the never-dialed record's invariants, which no consumer reads).
+- **Pinned by:** `internal/router/response_headers_test.go`,
+  `internal/router/forced_bounds_test.go` (the forced-502 sites),
   `internal/router/provenance_log_test.go`, plus black-box
-  `e2e/provenance_test.go`.
-- **Adversarial note (verified absent):** a header forged with a
-  provider-shaped status is inert — the label is read off the returned
-  `Failure`, never off the status that's about to be written.
+  `e2e/wire_surface_test.go`.
+- **Adversarial note (verified absent):** a response is never attributed from
+  a status — a provider 502, an intermediary's 502 and a gateway 502 are the
+  same number, and the record that tells them apart is read, never published.
+  A forged inbound header of the removed names reaches neither side of the
+  boundary.
 
 ### R7 — Secondary body reads are total-bounded (bytes AND time); the SSE product read is not
 
@@ -216,7 +235,7 @@ and never invented.
 | Intent recorded, never derived / never inbound                 | **in force**                                                      | R3 (intent tests + forged-header pins)                    |
 | Single emit boundary, bounded, dropped counted                 | **in force**                                                      | R4 (evidence_log.go + cap tests)                          |
 | Replay-safe failover moves to distinct egress only             | **in force**                                                      | R5 (intent exclusion + terminal tests)                    |
-| Provenance-labelled, unforgeable inbound                       | **in force**                                                      | R6 (provenance header tests)                              |
+| Provenance internal; no vendor failure header published        | **in force** (revised by #77)                                     | R6 (response_headers_test.go, e2e/wire_surface_test.go)   |
 | Secondary body reads total-bounded; SSE product read not       | **in force**                                                      | R7 (ReadBoundedBody + watchdog tests)                     |
 | OFP ↔ RPGW egress intent                                       | OFP side **in force**; RPGW side a recorded cross-repo dependency | cross-service seams section (routing intent seam + row)   |
 
@@ -231,3 +250,40 @@ and never invented.
 - **Every "verified absent" note above is a real grep** run in this session
   against `internal/` — zero status-keyed retries, zero intent-derived-from-
   status, zero inbound-forgery survivors. Not asserted; observed.
+
+### Review round for issue #77 (wire-contract removal)
+
+Four independent review passes were run against the change (architecture,
+reliability, regression/coverage, wire protocol). Every finding was either
+fixed in this commit or recorded as a pre-existing gap; none was left
+unaddressed. The ones that changed the code:
+
+- **Absence assertions were value-based.** `Header.Get(name) != ""` passes for
+  a header present with an EMPTY value — the exact shape a reintroduced
+  `X-OFP-Failure-Phase` would take, since its zero `String()` is `""` and the
+  deleted setter guarded that case explicitly. Both helpers now use
+  `Values(name)`, which distinguishes absent from empty.
+- **The router→row provenance seam was unpinned.** The deleted wire tests were
+  also the only router-level proof that the executor's delivered `Origin`
+  reaches the abort rows rather than a constant; a refactor passing
+  `OriginUpstream` unconditionally would have recorded an intermediary's answer
+  as the provider's with every test still green.
+  `TestAmbiguousOriginReachesTheRelayPhaseRows` restores that pin.
+- **The never-dialed record had no invariant test.** Both consumers read only
+  `.Class`, so a silent drift of origin/phase/state would fail nothing.
+  `TestNoDialFailureIsTheCanonicalNoDialRecord` pins the value, including that
+  its `ReplaySafe() == true` is a record and not an authorisation.
+- **Two over-claims and three stale comments** were corrected:
+  "one completion line per request" (true for every ROUTED request, not for
+  pre-routing rejections), a `client.go` comment still describing the removed
+  wire label, and the `X-OFP-Egress` doc claiming the served path only (it is
+  also written before a forced-conversion 502, as it always was).
+
+Recorded as pre-existing, not introduced here, and deliberately NOT changed in
+this PR: a forced-conversion 502 appears on no record of its own (the
+completion line and evidence row carry the delivered 200 — the wire label was
+the only place that fact was visible before, and issue #72's row is the
+remaining account of it); `X-OFP-Egress` is not exposed through
+`Access-Control-Expose-Headers`, so browser callers cannot read it; and an
+egress id's SHAPE is not validated, so an operator-authored id is published
+verbatim on served responses (control bytes are rejected — `config.hasControlByte`).

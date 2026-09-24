@@ -147,16 +147,10 @@ func (x *Executor) ExecuteObserved(ctx context.Context, url string, buildHeaders
 	attempts := 0
 	lastID := ""
 	// The verdict of the LAST dialed attempt. Its initial value is what the
-	// never-dialed envelope below returns: no provider answered and no
-	// request byte existed, so it is transport-origin and provably not_sent —
-	// nothing was even attempted. The class stays ClassConnectionError, the
-	// label this path has always carried.
-	lastFailure := Failure{
-		Class:        ClassConnectionError,
-		Origin:       OriginTransport,
-		Phase:        FailurePhaseNone,
-		RequestState: RequestStateNotSent,
-	}
+	// never-dialed envelope below returns — the canonical record of "nothing
+	// was ever dialed", shared with the router's pre-plan rejection so the two
+	// envelopes cannot drift apart (NoDialFailure).
+	lastFailure := NoDialFailure()
 	var lastErr *UpstreamError
 	// terminalRow is the recorder index of the row the most recent failed
 	// attempt's decisions were stamped on (-1 = none). The post-loop

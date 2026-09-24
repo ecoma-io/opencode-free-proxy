@@ -343,7 +343,7 @@ func TestAllSkippedReturnsSynthetic502(t *testing.T) {
 		MaxConcurrency:  map[string]int{"a": 1, "b": 1},
 		HealthPolicy:    testHealthPolicy,
 	}
-	resp, id, attempts, _, uerr := f.exec.Execute(
+	resp, id, attempts, failure, uerr := f.exec.Execute(
 		context.Background(), f.servers["a"].URL,
 		func() map[string]string { return map[string]string{} },
 		[]byte(`{}`), f.plan("r", "a", "b"), p)
@@ -358,6 +358,46 @@ func TestAllSkippedReturnsSynthetic502(t *testing.T) {
 	}
 	if f.rec.total() != 0 {
 		t.Fatalf("upstream calls = %d, want 0", f.rec.total())
+	}
+	// The record half of the envelope, not just its class: this is the one
+	// value no transport can report, so its provenance is fixed by construction
+	// and must not drift (NoDialFailure).
+	assertNoDialFailure(t, failure)
+}
+
+// TestNoDialFailureIsTheCanonicalNoDialRecord pins the value's OWN invariants,
+// which both producers must share (internal/upstream fallback.go's never-dialed
+// return and internal/router handler.go's pre-plan rejection). Those consumers
+// read only .Class, so nothing else would notice a silent drift of origin,
+// phase or request state — and the drift matters: ReplaySafe() is TRUE here by
+// construction ("no request byte exists"), which is a RECORD and never an
+// authorisation. MarksEgressHealth() must not be true of it either: a request
+// that never dialed is no evidence about any egress path.
+func TestNoDialFailureIsTheCanonicalNoDialRecord(t *testing.T) {
+	assertNoDialFailure(t, NoDialFailure())
+	if !NoDialFailure().ReplaySafe() {
+		t.Fatal("a never-dialed request is replay-safe by construction — the value is a record, not an authorisation")
+	}
+	if NoDialFailure().MarksEgressHealth() {
+		t.Fatal("nothing was dialed, so no egress path was exercised — this must not mark an egress")
+	}
+}
+
+// assertNoDialFailure is the shared shape check for the canonical no-dial
+// record.
+func assertNoDialFailure(t *testing.T, f Failure) {
+	t.Helper()
+	if f.Class != ClassConnectionError {
+		t.Fatalf("Class = %s, want %s", f.Class, ClassConnectionError)
+	}
+	if f.Origin != OriginTransport {
+		t.Fatalf("Origin = %s, want %s", f.Origin, OriginTransport)
+	}
+	if f.Phase != FailurePhaseNone {
+		t.Fatalf("Phase = %s, want %s (no step was performed)", f.Phase, FailurePhaseNone)
+	}
+	if f.RequestState != RequestStateNotSent {
+		t.Fatalf("RequestState = %s, want %s (nothing was dialed)", f.RequestState, RequestStateNotSent)
 	}
 }
 

@@ -310,11 +310,14 @@ func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHead
 	}
 	// A live response is served, not failed, so its CLASS is ClassSuccess and
 	// its client-facing envelope is untouched — but its AUTHORSHIP is still the
-	// path's, for the same reason a failed one's is: this response is about to
-	// be labelled on the wire and relayed as the provider's answer, and a hop an
-	// HTTP intermediary carried cannot promise that (a captive portal's 200 is
-	// the case that makes it visible — issue #63). The router reads this record
-	// to label the response; nothing else about the success path changes.
+	// path's, for the same reason a failed one's is: OFP relays this response as
+	// the provider's answer, and a hop an HTTP intermediary carried cannot
+	// promise that the provider wrote it (a captive portal's 200 is the case
+	// that makes it visible — issue #63). The record is INTERNAL: the router
+	// forwards it into the phase rows a live relay can still produce
+	// (forced/stream aborts) and never publishes it as a header (issue #77,
+	// internal/router/response_headers.go); nothing else about the success path
+	// changes.
 	return resp, nil, Failure{Origin: path.responseOrigin(), RequestState: path.responseState()}
 }
 

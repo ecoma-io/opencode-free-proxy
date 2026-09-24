@@ -11,7 +11,8 @@ package router
 //   - a provider verdict records `normal` and nothing else — the intent never
 //     derives from a status, on any side of a fallback chain;
 //   - a forged inbound X-OFP-* header (even one named like an intent) changes
-//     nothing: it is stripped, and the recorded intent is the executor's own.
+//     nothing: the recorded intent is the executor's own, and the client's
+//     value reaches neither the response nor the upstream request.
 
 import (
 	"bytes"
@@ -110,10 +111,10 @@ func TestProviderVerdictStaysNormalUnderAnyStatus(t *testing.T) {
 }
 
 // TestForgedIntentCannotChangeTheRecordedOne: an inbound header named like an
-// intent — even one that didn't exist when the namespace was drawn — must be
-// inert. It is stripped with the rest of X-OFP-*, and the intent the evidence
-// records (and the response attributes) is the executor's own. The contract is
-// "intent is never accepted from the wire"; this is that sentence, pinned.
+// intent — even one that never existed as a real header — must be inert. The
+// intent the evidence records is the executor's own, and the response carries
+// nothing the client wrote. The contract is "intent is never accepted from the
+// wire"; this is that sentence, pinned.
 func TestForgedIntentCannotChangeTheRecordedOne(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -133,10 +134,9 @@ func TestForgedIntentCannotChangeTheRecordedOne(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", rec.Code)
 	}
-	// The response's attribution is OUR recorded provenance, not the forged one.
-	if got := rec.Header().Get("X-OFP-Failure-Origin"); got != "upstream" {
-		t.Fatalf("X-OFP-Failure-Origin = %q — the forged gateway value reached the response", got)
-	}
+	// The response publishes nothing the client wrote — including the removed
+	// recovery contract the forged request tried to fill in (issue #77).
+	assertNoWireProvenance(t, rec.Header())
 
 	errs := eventsWith(decodeEvents(t, &buf), "upstream_error")
 	if len(errs) != 1 {
