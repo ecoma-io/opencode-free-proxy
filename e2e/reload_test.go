@@ -29,6 +29,19 @@ type proxySpawn struct {
 	cmd    *exec.Cmd
 	out    *syncBuf
 	client *http.Client
+	done   chan struct{} // closed once the single Process.Wait goroutine reaps it
+}
+
+// reap waits for the spawned process's single Wait goroutine to have reaped
+// it. Like the reaper itself it is idempotent — any number of callers may
+// block here, and after done closes, further reap calls return immediately.
+func (sp *proxySpawn) reap(timeout time.Duration) bool {
+	select {
+	case <-sp.done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // spawnProxy builds and runs the server binary with the given extra env
@@ -65,23 +78,25 @@ func spawnProxy(t *testing.T, cfgDir string, extra map[string]string) *proxySpaw
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start server: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		done := make(chan struct{})
-		go func() { _, _ = cmd.Process.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-		}
-	})
+	done := make(chan struct{})
 	sp := &proxySpawn{
 		base:   "http://127.0.0.1:" + port,
 		cmd:    cmd,
 		out:    out,
 		client: &http.Client{Timeout: 30 * time.Second},
+		done:   done,
 	}
+	// Exactly one Process.Wait per spawned process, started here; waitExit
+	// (during a shutdown test) and t.Cleanup (after) both block on the same
+	// done channel, so a process is never reaped twice.
+	go func() { _, _ = cmd.Process.Wait(); close(done) }()
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		if !sp.reap(3 * time.Second) {
+			_ = cmd.Process.Kill()
+			sp.reap(3 * time.Second)
+		}
+	})
 	if err := waitHealthy(sp.base+"/healthz", 15*time.Second); err != nil {
 		t.Fatalf("spawn: %v\nlog:\n%s", err, out.String())
 	}

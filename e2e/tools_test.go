@@ -221,7 +221,7 @@ func TestMuseResponsesToolChoiceDemoted(t *testing.T) {
 // tool_call and finish_reason tool_calls.
 func TestUpstreamToolCallAggregatedForChatClient(t *testing.T) {
 	fake.setReplies(toolCallSSE, "")
-	defer fake.setReplies("", "")
+	defer fake.resetReplies()
 	resp := postChat(t, chatBody(testedModel), nil)
 	defer resp.Body.Close()
 	body := decodeJSON(t, resp)
@@ -252,7 +252,7 @@ func TestUpstreamToolCallAggregatedForChatClient(t *testing.T) {
 // as they arrive — both deltas, the id, and the terminal [DONE].
 func TestUpstreamToolCallStreamedFragments(t *testing.T) {
 	fake.setReplies(toolCallSSE, "")
-	defer fake.setReplies("", "")
+	defer fake.resetReplies()
 	body := chatBody(testedModel)
 	body["stream"] = true
 	resp := postChat(t, body, nil)
@@ -328,7 +328,7 @@ func TestBrokenToolCallIDRepaired(t *testing.T) {
 // output item — the full cross-interface round trip.
 func TestResponsesClientToolCallFromChatUpstream(t *testing.T) {
 	fake.setReplies(toolCallSSE, "")
-	defer fake.setReplies("", "")
+	defer fake.resetReplies()
 	resp := doRequest(t, "POST", "/v1/responses", map[string]any{
 		"model":  testedModel,
 		"input":  "read main.go",

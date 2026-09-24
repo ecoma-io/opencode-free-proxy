@@ -126,6 +126,18 @@ func (f *fakeUpstream) setReplies(chat, resp string) {
 	}
 }
 
+// resetReplies restores the default canned SSE bodies. setReplies keeps the
+// current value on empty args, so a `defer setReplies("", "")` is a NO-OP —
+// the call sites that meant "restore after this test" were leaking their
+// canned bytes into later tests on the shared instance. This is the explicit
+// reverse of that intent.
+func (f *fakeUpstream) resetReplies() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.chatReply = ""
+	f.respReply = ""
+}
+
 func (f *fakeUpstream) replyFor(kind string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
