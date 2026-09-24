@@ -45,6 +45,26 @@ Covered, end to end through the wire:
 - `image_url` on a non-vision model → stripped, placeholder text upstream
 - `/v1/models` → free filter (`-free` + `big-pickle`, dead ids dropped, sorted)
 
+### Body limits & wire surface (`hardening_test.go`)
+
+The three body limits are separate layers that must each fire independently
+(AGENTS.md rule 4); each sub-test trips exactly one:
+
+- server cap (8 MiB) → 400 `unreadable body` before any routing, zero upstream
+  calls
+- route `match.max_body_bytes` → the route is SKIPPED (higher-priority route
+  with the cap yields to a catch-all; `X-OFP-Egress` proves which rode)
+- egress `max_body_bytes` → route matched but the head is ineligible →
+  502 `No eligible egress`, zero calls
+
+Also here:
+
+- the never-dial 502 path (route matched, head set empty) publishes no
+  `X-OFP-Egress` and no removed-contract header
+- `log-level: error` on a real spawn silences the info-level completion line
+- a same-host redirect is followed over a real subprocess (cross-host refusal
+  is unit-pinned in `internal/upstream/transport_hardening_test.go`)
+
 ### Config snapshot, fallback & shutdown (`reload_test.go`, `shutdown_test.go`)
 
 Each test spawns its OWN server subprocess with bespoke env
@@ -57,7 +77,7 @@ even though `upstream.base` is a single value:
   never dials the new route, and logs `generation=1 fallback=true`; the next
   request pins generation 2 and dials the new egress (`X-OFP-Egress` headers
   prove both)
-- 429 is TERMINAL and marks nothing: the client gets a's own `[429]:`
+- 429 is TERMINAL and marks nothing: the client gets its own `[429]:`
   envelope, the other egress sees zero requests, and a later round-robin
   request lands on a again (no cooldown) —
   `TestEgress429IsTerminalAndMarksNoHealth`, with

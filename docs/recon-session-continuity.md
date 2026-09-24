@@ -10,8 +10,8 @@ Extended the same day with the `x-opencode-project` id (§ Project id).
 
 Proxy on `:8091` (real upstream), `POST /v1/chat/completions`, non-streaming.
 Native session ids (matching `^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`) pass
-through the proxy verbatim (`executor.ResolveSession`, executor.go:53-56), so
-the upstream saw exactly the header values below.
+through the proxy verbatim (`upstream.ResolveSession`, `executor.go:54-60`),
+so the upstream saw exactly the header values below.
 
 **A — server-side memory probe**: A1 stores a secret with S1; A2 asks for it
 with S2; A3 asks again with S1. Upstream is stateless, so neither can recall

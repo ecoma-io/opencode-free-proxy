@@ -83,7 +83,7 @@ process-wide and keyed by egress id + transport signature.
 
 ## Process-wide state lifecycles
 
-Three pieces of process-wide state meet every reload, each with its own
+Four pieces of process-wide state meet every reload, each with its own
 migration rule — never reset-everything. The once-per-generation maintenance
 (`Server.onGeneration`) runs prune + reclaim + rotation-prune as ONE step
 under the client mutex, guarded by a monotonic generation CAS so a request
@@ -119,6 +119,14 @@ holding a stale snapshot can never prune against its older keep-set.
   GC — is what eventually releases a never-pruned transport's returned
   conn). An active connection is never closed by the prune; the stale
   snapshot self-heals by rebuilding the client on its next dial.
+- **Session/identity store** (`internal/identity`) — process-wide identity,
+  not policy: a TTL+size-capped map keyed by connection scope. It survives
+  config hot-reloads (nothing in the runtime snapshot drives it); it resets
+  only via the TTL janitor (an entry idle > `SessionTTL`, 2 h, is reclaimed
+  and the next request derives a fresh stable id) or a process restart; who
+  still needs it — every headerless request below the assistant-text minimum
+  shares the entry, but no request pins it: each request re-resolves, so
+  janitor eviction mid-flight is safe.
 
 ## The request pipeline
 
@@ -152,11 +160,12 @@ AGENTS.md for the porting discipline):
    per-egress retry matrix: a provider response (2xx, 429, any 4xx/5xx) is
    relayed verbatim and ends the call, and the route's next egress is tried
    only when the attempt failed before the request existed — a dial that
-   never put a byte on the wire. 60 s response-header timeout, 360 s stream
-   stall (reset per line). Every SECONDARY read of an already-received
-   body — the terminal error-envelope read, the redirect drain, the non-SSE
-   guard, and the `/v1/models` fetch (bounded under its own
-   `ModelsFetchTimeout`) — is bounded by the byte cap AND a total deadline
+   never put a byte on the wire. 60 s response-header timeout, 360 s
+   stream stall (reset on any byte/read progress, not per line). Every
+   SECONDARY read of an already-received body — the terminal error-envelope
+   read, the redirect drain, the non-SSE guard, and the `/v1/models` fetch
+   (bounded under its own `ModelsFetchTimeout`) — is bounded by the byte cap
+   AND a total deadline
    (`SecondaryReadTimeout`, 10 s); only the SSE product read (ScanLines)
    keeps a progress-reset stall, because a slow-but-live stream is the
    product there.
@@ -239,7 +248,7 @@ unchanged).
   folds like host:port; version numbers fold with any digits) — the
   `message` field disambiguates within a group. A fingerprint is an
   equality key for humans — never an input to behavior.
-- **Bounds**: 16 rows per request (past that, a `dropped` counter rides
+- **Bounds**: 16 rows per request (past that, an `evidence_dropped` counter rides
   the last event), 512 B messages, 256 B body peeks, 8 rate-limit
   entries, 64 B header values. A hostile upstream cannot grow memory or
   log volume through this layer. SSE is never buffered for evidence —
@@ -314,13 +323,18 @@ transport can _prove_ about transmission. The contract those fields serve is
   The SSE product read (`ScanLines`) deliberately keeps its progress-reset
   stall instead — a slow-but-live stream is the product there, and any
   progress re-arms the 360 s window.
-- **The write flag is set on write _entry_.** The final connection handed to
-  `net/http` is wrapped (`recordingConn`), and it marks the attempt as having
-  transmitted on entry to the write, not on success — a partial write may have
-  put a prefix on the wire, and an _attempted_ write must close the `not_sent`
-  door permanently. The wrapper is applied at the outermost layer of each
-  transport path exactly once, so TLS handshake records are never counted as
-  request bytes. It is transparent when no trace is in the context.
+- **The write flag is set per REQUEST by a `httptrace.WroteRequest` hook**
+  (`internal/upstream/provenance.go` `writeHook` → `markWrite`), not by
+  wrapping the connection. `WroteRequest` fires after the request bytes are
+  handed to a connection — including on a partially failed write — and it is
+  conservative: it fires whether or not the write returned an error, because
+  a write that failed partway may still have put a prefix on the wire and an
+  _attempted_ write must close the `not_sent` door permanently. Being
+  per-REQUEST is what makes a write over a POOLED connection observable at
+  all — a conn wrapping approach would only see the conns this call dialed,
+  so a hop served by an already-idle connection would transmit invisibly
+  (issue #60) — and it keeps TLS handshake bytes (a ClientHello is not a
+  request byte) out of the record.
 - **Authorship comes from the PATH, never from the status** (issue #63). A
   response that arrives over an intermediated hop — a plain-http target
   carried by an http/https forward proxy, Go's absolute-form path — could have
@@ -331,8 +345,8 @@ transport can _prove_ about transmission. The contract those fields serve is
   Every other path (direct, SOCKS5 tunnel, CONNECT tunnel) carries transport
   bytes through the intermediary, which therefore cannot author an HTTP
   message, and reports `OriginUpstream` / `ResponseStarted`. The rule is
-  `hopPathOf(scheme)`, read from the transport the attempt actually used, and it
-  applies to a served response exactly as it does to a failure. It decides
+  `Client.hopPathOf(scheme)`, read from the transport the attempt actually
+  used, and it applies to a served response exactly as it does to a failure. It decides
   nothing: an ambiguous response is relayed verbatim, is not replay-safe and
   marks no egress.
 - **Nothing is inferred from error text.** Phases come from the boundary that
@@ -368,9 +382,32 @@ not_sent` — decides whether the attempt may move to another egress, and
   an intermediated hop is still relayed verbatim and still refuses to name the
   provider as its author — the refusal just happens internally, where it feeds
   the evidence rows and the phase rows a live relay can still produce.
-  `OriginClient` likewise records nothing for the caller. The ONE header a
-  served response carries is `X-OFP-Egress`, an operational diagnostic naming
-  the configured egress that served it — no origin, no phase, no state.
+  `OriginClient` likewise records nothing for the caller. The ONE
+  classification header a served response carries is `X-OFP-Egress`, an
+  operational diagnostic naming the configured egress that served it — no
+  origin, no phase, no state. (CORS headers are also attached to every
+  response; see `## Endpoints`.)
+
+### Origin TLS identity (uTLS ClientHello forging)
+
+Every origin handshake this proxy performs speaks the OFFICIAL opencode
+client's ClientHello, so the free-tier upstream cannot tell this proxy from
+a genuine client at the TLS layer (`internal/upstream/hello.go`, issue #48).
+The spec is a field-by-field capture of the official CLI v1.18.31 — a Bun
+v1.3.14 binary whose TLS is BoringSSL in the default embedder configuration:
+no GREASE, no post-quantum key share, and ALPN offers `http/1.1` only. Two
+pinned consequences:
+
+- the ALPN parity (["http/1.1"]) means HTTP/2 is never negotiated, and stdlib
+  keeps speaking HTTP/1.1 over the returned `*utls.UConn` — exactly what the
+  official client does;
+- the spec is rebuilt PER HANDSHAKE (utls writes marshaling-time state into
+  the extension structs), and injected `NextProtos` is overwritten rather
+  than honored — ALPN is identity, not a knob.
+
+`originTLSDialer` wraps any raw dialer (direct TCP or SOCKS5 tunnel) with
+this handshake; the CONNECT-tunnel answer at the end of the origin-TLS bullet
+above uses the same `handshakeOrigin` so every path reports the same phase.
 
 ## Endpoints
 
@@ -379,6 +416,22 @@ not_sent` — decides whether the attempt may move to another egress, and
 - `GET /v1/models` — live free-tier model list from the upstream, with a
   static registry fallback (fail-open).
 - `GET /healthz` — liveness.
+- `OPTIONS /` — browser CORS preflight.
+
+Every API response carries `Access-Control-Allow-Origin: *`,
+`Access-Control-Allow-Methods: POST, GET, OPTIONS`, and
+`Access-Control-Allow-Headers: *`; SSE responses additionally carry their
+event-stream framing headers.
+
+### Inbound listener bounds
+
+The server limits only connection states that can be bounded without cutting a
+legitimate stream: request headers have a **10 s** `ReadHeaderTimeout`, and an
+idle keep-alive connection between completed requests has a **120 s**
+`IdleTimeout`. `ReadTimeout` and `WriteTimeout` deliberately stay zero: their
+whole-request deadlines would terminate a slow permitted request body or a
+long-lived SSE response. See `cmd/server/main.go` for the net/http lifecycle
+reasoning and `e2e/timeouts_test.go` for the black-box pins.
 
 Model naming: the `oc/` prefix is optional; thinking suffixes
 `(high)/​(8192)/​(none)/​(auto)` are parsed, applied to the upstream body, and
@@ -387,20 +440,20 @@ upstream and are translated transparently for chat clients.
 
 ## Package layout
 
-| Package              | Role                                                                                                                                                                                                            |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                         |
-| `internal/logging`   | zerolog construction + the compatibility adapter at constructor edges; centralized `time`/`level`/`msg` field names                                                                                             |
-| `internal/config`    | every runtime constant + bootstrap env vars; multi-egress YAML model, interpolation, redaction, hot-reload store, the immutable `Runtime` snapshot                                                              |
-| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                     |
-| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/failover orchestration (one logical upstream call) + the per-request snapshot capture + the evidence emit boundary |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                              |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                            |
-| `internal/upstream`  | HTTP client (single-call execute, failure taxonomy + provenance, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging, the error-evidence recorder   |
-| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                    |
-| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                          |
-| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                              |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                         |
-| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                        |
-| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                            |
+| Package              | Role                                                                                                                                                                                                                                                                                                     |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                                                                                                                  |
+| `internal/logging`   | zerolog construction + the compatibility adapter at constructor edges; centralized `time`/`level`/`msg` field names                                                                                                                                                                                      |
+| `internal/config`    | every runtime constant + bootstrap env vars; multi-egress YAML model, interpolation, redaction, hot-reload store, the immutable `Runtime` snapshot                                                                                                                                                       |
+| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                                                                                                         |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                                                                                                              |
+| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/failover orchestration (one logical upstream call) + the per-request snapshot capture + the evidence emit boundary                                                                                          |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                                                                                                                       |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                                                                                                                     |
+| `internal/upstream`  | HTTP client (single-call execute, failure taxonomy + provenance, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), origin TLS with the official opencode ClientHello forged via utls (`hello.go`, issue #48), executor transforms, header forging, the error-evidence recorder |
+| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                                                                                                             |
+| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                                                                                                                   |
+| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                                                                                                                       |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                                                                                                                  |
+| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                                                                                                                 |
+| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                                                                                                                     |

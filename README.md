@@ -28,7 +28,7 @@ streaming and non-streaming.
 - **Structured JSON logs**: one line per event on stdout, gated by the
   hot-reloadable `log-level` (default `info`); every routed request logs a
   completion line with generation / route / egress / attempts / class /
-  status / latency / model / fallback.
+  status / latency / model / endpoint / fallback.
 - **Secret hygiene**: credentials are `${VAR}` env references resolved at
   load — the file carries no literals, logs and errors never echo them.
 
@@ -87,6 +87,7 @@ Streaming responses are a commitment once started. Details:
 ```sh
 go build ./...                       # compile
 go test ./...                        # offline unit suite (httptest only, no egress)
+go test -race ./...                  # race detector — CI runs it on the unit suite
 go test -tags e2e ./e2e/             # black-box e2e: server subprocess + fake upstream
 go vet ./... && go vet -tags e2e ./e2e/ && gofmt -l .   # must all be clean
 golangci-lint run ./...              # CI's Lint step
@@ -95,12 +96,13 @@ pnpm format                          # prettier over docs/workflows/configs
 
 ## Documentation
 
-| Doc                                            | What it covers                                                                                    |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| [docs/configuration.md](docs/configuration.md) | The full config document: schema, defaults, `${VAR}` interpolation, hot reload, validation errors |
-| [docs/deployment.md](docs/deployment.md)       | Docker, Compose, config mounts, bootstrap env, graceful shutdown, production notes                |
-| [docs/architecture.md](docs/architecture.md)   | Request pipeline, immutable generations, process-wide state lifecycles                            |
-| [docs/recon-*.md](docs/README.md)              | Investigation records: UA chain, session continuity, mid-stream IP switches                       |
+| Doc                                                      | What it covers                                                                                    |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| [docs/configuration.md](docs/configuration.md)           | The full config document: schema, defaults, `${VAR}` interpolation, hot reload, validation errors |
+| [docs/recovery-semantics.md](docs/recovery-semantics.md) | Recovery authority, failure provenance, safe egress failover, and health semantics                |
+| [docs/deployment.md](docs/deployment.md)                 | Docker, Compose, config mounts, bootstrap env, graceful shutdown, production notes                |
+| [docs/architecture.md](docs/architecture.md)             | Request pipeline, immutable generations, process-wide state lifecycles                            |
+| [docs/recon-*.md](docs/README.md)                        | Investigation records: UA chain, session continuity, mid-stream IP switches                       |
 
 ## Contributing
 

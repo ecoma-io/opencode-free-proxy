@@ -203,14 +203,17 @@ func TestGraceForcesCloseStalledStream(t *testing.T) {
 	// First frame must arrive (the relay committed chunk0) — the stream is
 	// in flight before we signal. The upstream stalls after one frame, so
 	// read incrementally until chunk0 shows rather than demanding a full
-	// buffer.
-	buf := make([]byte, 32)
+	// buffer. Reads accumulate into a Builder: the per-read Contains check
+	// above looked at only the latest 32-byte slice and could lose chunk0
+	// across a fragmented read (e.g. "data: chu" + "nk0\n\n").
 	saw0 := false
+	var sb strings.Builder
+	buf := make([]byte, 32)
 	for i := 0; i < 100 && !saw0; i++ {
 		n, err := resp.Body.Read(buf)
-		if n > 0 && strings.Contains(string(buf[:n]), "chunk0") {
-			saw0 = true
-			break
+		if n > 0 {
+			sb.Write(buf[:n])
+			saw0 = strings.Contains(sb.String(), "chunk0")
 		}
 		if err != nil {
 			break
@@ -284,14 +287,13 @@ func TestGraceForcesCloseStalledStream(t *testing.T) {
 	waitExit(t, sp, 3*time.Second)
 }
 
-// waitExit waits for the spawned process to terminate.
+// waitExit waits for the spawned process to terminate. It shares the spawn's
+// single reaper (see proxySpawn.reap) so it never issues a second
+// Process.Wait on the same process — the one reaper the spawn owns is the
+// only one there is.
 func waitExit(t *testing.T, sp *proxySpawn, timeout time.Duration) {
 	t.Helper()
-	done := make(chan struct{})
-	go func() { _, _ = sp.cmd.Process.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(timeout):
+	if !sp.reap(timeout) {
 		t.Fatalf("server process did not exit within %v\nlog:\n%s", timeout, sp.out.String())
 	}
 }

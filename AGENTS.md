@@ -19,6 +19,7 @@ upstream support belongs here.
 ```sh
 go build ./...                       # compile
 go test ./...                        # offline unit suite (httptest only, no egress)
+go test -race ./...                  # race detector — CI runs it on the unit suite
 go test -tags e2e ./e2e/             # black-box e2e: builds cmd/server, runs it as a
                                      #   subprocess against a fake zen upstream
 E2E_LIVE=1 go test -tags e2e ./e2e/ -run TestLive   # optional: real proxy + real upstream
@@ -50,7 +51,8 @@ directory as a candidate rule config, regardless of naming:
 2. A `.yml`/`.yaml`-suffixed file needs the `.test.` infix to be recognised
    as a test target rather than only as a config candidate.
 
-Both were confirmed against semgrep 1.172.0 by running it, and both apply
+Both were confirmed against semgrep 1.176.1 (the pinned CI image,
+`.github/workflows/analysis.yml`) by running it, and both apply
 only to `languages: [yaml]` fixtures.
 
 ## The multi-egress config: canonical example + parity test
@@ -80,9 +82,10 @@ The semantics agents most often get wrong:
    pinned per request from its snapshot; state (streak + cooldown) is
    process-wide keyed by egress id + transport signature (`type:url`). A
    policy-only reload keeps history; a proxy URL swap starts a fresh
-   identity. Health is **egress-path health only**, marked by the same
-   predicate that permits the egress move — `Failure.ReplaySafe()` (issue
-   #53, docs/recovery-semantics.md). Provider statuses mark nothing, 4xx and
+   identity. Health is **egress-path health only**: `Failure.ReplaySafe()`
+   governs whether the request may move, while the separate
+   `Failure.MarksEgressHealth()` governs whether its egress is marked (issue
+   #62, docs/recovery-semantics.md). Provider statuses mark nothing, 4xx and
    5xx alike; success resets; a threshold decrease never arms retroactively.
 6. Proxy-auth (407) is typed at the transport boundary only
    (`internal/upstream/connect.go`, `socks5.go`). A 407 that arrives as a
@@ -160,8 +163,11 @@ The semantics agents most often get wrong:
     attribution is read off the returned `Failure` — NEVER off the status that
     is about to be written, because a provider 502 and a synthesized 502 are
     the same number. `X-OFP-Egress` is a DIFFERENT thing and stays: an
-    operational diagnostic naming the configured egress that served a request,
-    on the served path only, carrying no classification. Pinned by
+    operational diagnostic naming the configured egress an attempt went out
+    through, written on every outcome that DIALED something — including the
+    forced-conversion 502 — and absent from every path that never dialed (a
+    transport-failure 502, the pre-plan "no eligible egress" 502); it carries
+    no classification. Pinned by
     `internal/router/response_headers_test.go` and the black-box
     `e2e/wire_surface_test.go`.
 12. Egress selection is a **logical intent, not an index walk** (issues #56,
@@ -189,23 +195,23 @@ bool)`, with `Selection.Resolve()` telling the caller only what to dial.
 
 ## Layout
 
-| Package              | Role                                                                                                                                                                                                                                       |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                                                    |
-| `internal/logging`   | zerolog construction (`time`/`level`/`msg` field names), the constructor-edge compatibility adapter for legacy test callbacks                                                                                                              |
-| `internal/config`    | every runtime constant + the `OCFP_`-prefixed bootstrap env vars; multi-egress YAML model (routes, egresses, `upstream.base`, `user_agent.sync_interval`, `log-level`), interpolation, redaction, hot-reload store                         |
-| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                                           |
-| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                                                |
-| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/failover orchestration (one logical upstream call per attempt) + evidence emit boundary (`evidence_log.go`)                                   |
-| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                                                         |
-| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                                                       |
-| `internal/upstream`  | HTTP client (single-call execute, failure taxonomy + provenance, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), executor transforms, header forging, strictly-observational evidence recorder (`evidence.go`) |
-| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                                               |
-| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                                                     |
-| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                                                         |
-| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                                                    |
-| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                                                   |
-| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                                                       |
+| Package              | Role                                                                                                                                                                                                                                                                                                                                  |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                                                                                                                                               |
+| `internal/logging`   | zerolog construction (`time`/`level`/`msg` field names), the constructor-edge compatibility adapter for legacy test callbacks                                                                                                                                                                                                         |
+| `internal/config`    | every runtime constant + the `OCFP_`-prefixed bootstrap env vars; multi-egress YAML model (routes, egresses, `upstream.base`, `user_agent.sync_interval`, `log-level`), interpolation, redaction, hot-reload store                                                                                                                    |
+| `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                                                                                                                                      |
+| `internal/health`    | per-egress health registry: consecutive-failure threshold, cooldown; state survives config swaps, policy pinned per request                                                                                                                                                                                                           |
+| `internal/router`    | endpoints + chatCore pipeline + bypass/test-connection/modality/tool-dedupe stages + routing/failover orchestration (one logical upstream call per attempt) + evidence emit boundary (`evidence_log.go`)                                                                                                                              |
+| `internal/relay`     | passthrough/translate SSE relays, SSE→JSON aggregation, usage seam                                                                                                                                                                                                                                                                    |
+| `internal/translate` | request translators (chat ↔ responses), SSE state machines, prenorms, modality strip                                                                                                                                                                                                                                                  |
+| `internal/upstream`  | HTTP client (single-call execute, failure taxonomy + provenance, SSE line scan), per-egress transports (direct, http/https CONNECT, socks5), origin TLS with the official opencode ClientHello forged via utls (`hello.go`, issue #48), executor transforms, header forging, strictly-observational evidence recorder (`evidence.go`) |
+| `internal/cloak`     | thinking suffix parse/apply, model id/URL, fingerprint tools                                                                                                                                                                                                                                                                          |
+| `internal/identity`  | session/request ids, opencode UA triple cache + GitHub sync loop (fail-open), session resolution chain                                                                                                                                                                                                                                |
+| `internal/caps`      | per-model input-modality resolution (exact table → glob patterns → name heuristic)                                                                                                                                                                                                                                                    |
+| `internal/usage`     | usage normalization/merge/estimation/thinking synthesis                                                                                                                                                                                                                                                                               |
+| `internal/jsonx`     | JS-semantics JSON accessors (`AsStr`/`AsArr`/`Truthy`/…)                                                                                                                                                                                                                                                                              |
+| `e2e/`               | black-box e2e suite behind the `e2e` build tag (see `e2e/README.md`)                                                                                                                                                                                                                                                                  |
 
 ## Porting discipline (the rules that keep parity)
 
