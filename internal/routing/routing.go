@@ -304,6 +304,11 @@ func schedulerFingerprint(route config.Route, rt *config.Runtime) string {
 		strategy = config.StrategyRoundRobin
 	}
 	var b strings.Builder
+	// The fingerprint is rebuilt for every Plan. Its representation is wholly
+	// predictable from the route: reserve fields, separators, and a conservative
+	// maximum decimal width so normal routes avoid Builder growth. Grow changes
+	// capacity only; the NUL-delimited identity remains byte-for-byte identical.
+	b.Grow(len(strategy) + len(route.ID) + len(route.Egress)*(len(strconv.Itoa(0))+1))
 	b.WriteString(string(strategy))
 	b.WriteByte(0)
 	b.WriteString(route.ID)
