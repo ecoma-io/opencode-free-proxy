@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"opencode-free-proxy/internal/config"
@@ -26,6 +27,24 @@ import (
 // the evidence stream must come from the boundary that raised it, not from
 // strings.HasPrefix on an error (issue #6 discipline).
 var ErrStreamStalled = errors.New("stream stalled")
+
+// scanBufPool is the fixed-size 32 KiB buffer pool for ScanLines' reader
+// goroutine. The read buffer is the hot path's single largest per-request
+// allocation (BenchmarkScanLines measures ~35 KiB B/op, dominated by the one
+// 32 KiB `buf := make`), and everything ScanLines emits is already a copy:
+// each delivered line is `string(...)` out of `pending`, and the tail is
+// `string(pending)` too — no emitted string aliases the read buffer. A pooled
+// buffer is therefore reusable once the reader goroutine's ownership ends,
+// and the reader goroutine's `defer scanBufPool.Put(pooled)` returns it on
+// every return path without clearing: the next reader observes only the bytes
+// its own Read wrote (`buf[:n]`, never past `n`) plus its own fresh `pending`
+// slice, never a transported tail. That `buf[:n]` slicing is the boundary
+// that keeps one request's bytes from leaking into another — pinned by
+// TestScanLinesPoolPoison. The pool is intentionally fixed at the
+// stream-buffer size: ScanLines' read size is not configurable, so a
+// variable-capacity pool would only hand out buffers that are promptly
+// reallocated back to 32 KiB anyway.
+var scanBufPool = sync.Pool{New: func() any { return make([]byte, 32*1024) }}
 
 // maxErrorBodyBytes caps how much of a terminal error response is read for
 // the client-facing message (parseUpstreamError) and how much of a rejected
@@ -753,7 +772,16 @@ func ScanLines(ctx context.Context, body io.Reader, stall time.Duration, fn func
 	go func() {
 		defer close(lines)
 		defer close(tails)
-		buf := make([]byte, 32*1024)
+		pooled := scanBufPool.Get()
+		buf := pooled.([]byte)
+		// local return: the reader goroutine's ownership of buf ends at EVERY
+		// return — clean EOF, read error, ctx cancel, and the fn-error
+		// coordination path (when fn fails, the EXHAUSTIVE select 2 below
+		// delivers the return and the goroutine runs this defer immediately).
+		// Put the original interface value back untouched: re-boxing the
+		// slice header (Put(buf)) would allocate a fresh cell per stream,
+		// and reusing `pooled` keeps that interface copy allocation-free.
+		defer scanBufPool.Put(pooled)
 		// pending is the unterminated segment so far. It grows without
 		// bound for a line that never ends — deliberate parity:
 		// stream.js:243-247 `buffer += text` is unbounded the same way
