@@ -57,7 +57,7 @@ even though `upstream.base` is a single value:
   never dials the new route, and logs `generation=1 fallback=true`; the next
   request pins generation 2 and dials the new egress (`X-OFP-Egress` headers
   prove both)
-- 429 is TERMINAL and marks nothing: the client gets a's own `[429]:`
+- 429 is TERMINAL and marks nothing: the client gets its own `[429]:`
   envelope, the other egress sees zero requests, and a later round-robin
   request lands on a again (no cooldown) —
   `TestEgress429IsTerminalAndMarksNoHealth`, with
