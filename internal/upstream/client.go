@@ -480,7 +480,7 @@ func (c *Client) attempt(ctx context.Context, call *callTrace, url string, heade
 		// happens AFTER noteResponse above, so the failure the caller records
 		// inherits response_started/unknown — never not_sent.
 		if !sameRedirectHost(next.Hostname(), initialHostname) {
-			drainAndClose(resp)
+			drainAndClose(ctx, resp)
 			return nil, hop, path, fmt.Errorf("redirect: Location %q leaves the request host (%s)", boundedLocation(loc), initialHostname)
 		}
 		hops++
