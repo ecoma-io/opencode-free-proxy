@@ -255,7 +255,13 @@ func TestOutageAttributionDecidesWhetherThePoolIsQuarantined(t *testing.T) {
 // proxy_connect on a call that was already answered — marked, and not
 // replayable.
 func TestMarkingFailureDoesNotMoveTheRequest(t *testing.T) {
-	deadHop := closedAddr(t)
+	// The redirect target must STAY on the initial request host: the
+	// cross-host form is refused earlier by the redirect allow-list
+	// (GHSA-5472-vw5j-wjvg) with FailurePhaseNone, before hop 2 ever dials —
+	// which would silently change this test's subject. A same-host Location
+	// (origin.invalid → origin.invalid, nothing resolves it) keeps the walk
+	// alive so hop 2 really dials the (now-closed) proxy.
+	const originHost = "http://origin.invalid"
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// Connection: close is LOAD-BEARING: without it the redirect would ride
@@ -263,7 +269,7 @@ func TestMarkingFailureDoesNotMoveTheRequest(t *testing.T) {
 		// failure would degrade to unattributable (FailurePhaseNone) rather
 		// than naming the proxy hop.
 		w.Header().Set("Connection", "close")
-		w.Header().Set("Location", "http://"+deadHop+"/zen/v1/chat/completions")
+		w.Header().Set("Location", originHost+"/zen/v1/chat/completions")
 		w.WriteHeader(http.StatusTemporaryRedirect)
 		// The egress layer disappears with the redirect: hop 2 has to dial the
 		// proxy again, and the listener is closed.
@@ -282,7 +288,7 @@ func TestMarkingFailureDoesNotMoveTheRequest(t *testing.T) {
 	rec := NewRecorder()
 
 	resp, id, attempts, failure, uerr := exec.ExecuteObserved(
-		context.Background(), "http://origin.example/zen/v1/chat/completions",
+		context.Background(), originHost+"/zen/v1/chat/completions",
 		staticHeaders(), []byte(`{}`), plan, policy(true, 3), rec)
 	if resp != nil {
 		_ = resp.Body.Close()

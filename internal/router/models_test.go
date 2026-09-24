@@ -187,6 +187,51 @@ func TestHandleModelsReachableEmptyUpstream(t *testing.T) {
 	}
 }
 
+// TestHandleModelsRefusesCrossHostRedirect (GHSA-5472-vw5j-wjvg): the
+// /v1/models fetch rides the direct client (s.Upstream), the ONE flow whose
+// target is the operator's upstream base — so a hostile 3xx from that origin
+// must not steer the fetch at a private network through the host's own
+// network. The per-request CheckRedirect bound to the snapshot's base host
+// refuses the cross-host hop; the refusal fails the fetch and the handler
+// answers the static registry (fail-open), never paging the internal target.
+func TestHandleModelsRefusesCrossHostRedirect(t *testing.T) {
+	// The upstream.base answers the models request with a redirect to a
+	// foreign (unreachable) host — the shape that would probe an internal
+	// service if followed.
+	redirected := false
+	base := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, ctx *http.Request) {
+		if ctx.URL.Path != config.ZenModelsPath {
+			t.Errorf("upstream saw %s, want %s", ctx.URL.Path, config.ZenModelsPath)
+		}
+		redirected = true
+		w.Header().Set("Location", "http://169.254.169.254/latest/meta-data/")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer base.Close()
+
+	s := modelsServerBase(t, base.URL)
+	rec := httptest.NewRecorder()
+	s.HandleModels(rec, httptest.NewRequest("GET", "/v1/models", nil))
+
+	if !redirected {
+		t.Fatal("the upstream base never saw the models request")
+	}
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (the fail-open static registry answers)", rec.Code)
+	}
+	var body struct {
+		Data []modelsEntry `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not JSON: %v\n%s", err, rec.Body.String())
+	}
+	// The static registry is present, NOT an empty list: the cross-host
+	// redirect made the fetch fail, so fail-open answered.
+	if len(body.Data) == 0 {
+		t.Fatalf("data = %#v, want the static registry (the fetch failed on the refused redirect)", body.Data)
+	}
+}
+
 // TestHandleModelsDrainGateAnswers503: a draining server refuses NEW
 // /v1/models requests with 503, the same contract relay() applies to
 func TestHandleModelsDrainGateAnswers503(t *testing.T) {
