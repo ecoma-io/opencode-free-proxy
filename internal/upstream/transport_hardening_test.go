@@ -728,6 +728,92 @@ func TestTerminalErrorBodyReadIsBounded(t *testing.T) {
 	}
 }
 
+// TestSecondaryBodyReadIsTimeBounded pins the TOTAL deadline behind the three
+// secondary body reads (terminal error-envelope read, redirect drain, non-SSE
+// guard): a peer that streams bytes forever below the byte cap must not pin
+// the goroutine. The handler sends headers, one byte (proof the body was
+// open), then blocks on a channel the test never closes — without the
+// watchdog the read hangs. The short injectable total is asserted on; the
+// production path shares it via config.SecondaryReadTimeout.
+func TestSecondaryBodyReadIsTimeBounded(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+		// Flush so the headers + the proof byte reach the client while the
+		// handler still holds the connection: without it the write sits in
+		// net/http's buffer and the test would hang in Do, not in the read
+		// under test.
+		if f, ok := w.(http.Flusher); ok {
+			_, _ = w.Write([]byte("x"))
+			f.Flush()
+		}
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	start := time.Now()
+	raw := readBoundedBody(context.Background(), resp.Body, maxErrorBodyBytes, 100*time.Millisecond)
+	elapsed := time.Since(start)
+	if raw != nil {
+		t.Fatalf("read = %d bytes, want nil on total-deadline expiry", len(raw))
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("read took %v against a 100 ms total — the secondary read is time-unbounded", elapsed)
+	}
+}
+
+// TestSecondaryBodyReadPassesThroughNormalBodies guards the other side of the
+// watchdog: a FINITE body under the cap must arrive intact, not be discarded
+// by the racing read.
+func TestSecondaryBodyReadPassesThroughNormalBodies(t *testing.T) {
+	want := `{"error":{"message":"upstream says no"}}`
+	raw := readBoundedBody(context.Background(), io.NopCloser(strings.NewReader(want)), maxErrorBodyBytes, time.Second)
+	if string(raw) != want {
+		t.Fatalf("read = %q, want the body intact", raw)
+	}
+}
+
+// TestSecondaryBodyReadRespectsCancellation pins the ctx half of the watchdog:
+// an already-cancelled caller releases a hung read immediately, without
+// waiting out the total (this is the r.Context() wiring the non-SSE guard
+// relies on for client disconnects).
+func TestSecondaryBodyReadRespectsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	never := &hangBody{release: make(chan struct{})}
+	defer close(never.release)
+	start := time.Now()
+	if raw := readBoundedBody(ctx, never, maxErrorBodyBytes, 10*time.Second); raw != nil {
+		t.Fatalf("read = %d bytes, want nil on cancelled ctx", len(raw))
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("read took %v on a cancelled ctx — cancellation does not release the read", elapsed)
+	}
+}
+
+// hangBody is a body that never yields a byte (Read blocks) until released.
+type hangBody struct {
+	release chan struct{}
+}
+
+func (h *hangBody) Read([]byte) (int, error) {
+	<-h.release
+	return 0, io.EOF
+}
+
+func (h *hangBody) Close() error { return nil }
+
 // TestAllTransportsCarryIdleConnTimeout is the structural pin for
 // config.IdleConnTimeout: EVERY transport this package builds must carry it.
 // net/http registers no finalizer for pooled conns, so a conn that was busy

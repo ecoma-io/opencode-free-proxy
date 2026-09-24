@@ -357,4 +357,22 @@ const (
 	// direct client, whose transports carry only a response-HEADER
 	// deadline (ConnectTimeout) — this restores a total bound.
 	ModelsFetchTimeout = 10 * time.Second
+
+	// SecondaryReadTimeout bounds the total time one SECONDARY body read may
+	// spend reading an already-received response: the terminal error-envelope
+	// read, the redirect drain, and the non-SSE guard. Each is a fixed-size
+	// read off a response whose headers have already arrived — the transport's
+	// response-HEADER timeout (ConnectTimeout) is spent and bounds nothing
+	// further, so a peer that streams bytes forever below the byte cap would
+	// pin the goroutine outright. This is a TOTAL bound, not a progress-reset
+	// stall: these reads are bounded at maxErrorBodyBytes/maxNonSSEBodyBytes
+	// anyway and the bytes are secondary (an error envelope, a discarded
+	// redirect body, a short HTML page), so a peer impossible to finish within
+	// the window buys nothing more. Distinct from the SSE product read
+	// (ScanLines), which deliberately resets its stall on ANY progress — a
+	// slow-but-live stream is the product there. Go-side hardening with no JS
+	// counterpart (utils/error.js:61 reads error bodies unbounded). 10 s is a
+	// dial-peer cadence: a real secondary body is a handful of KiB read in
+	// milliseconds, so this fires only against a stalled or hostile peer.
+	SecondaryReadTimeout = 10 * time.Second
 )

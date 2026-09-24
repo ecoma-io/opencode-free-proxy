@@ -84,6 +84,15 @@ recorded**.
 - **Adversarial note (verified absent):** grep for status-keyed retry across
   `internal/` returns **zero** non-test callers of a status-derived replay
   decision.
+- **Adversarial note (request-state monotonicity, fixed this session):** a
+  pooled-connection failure performs no dial — no phase is attributable — so
+  it must never fabricate a fresh state. Pinned by
+  `internal/upstream/provenance_test.go` `TestRequestStateNeverClaimsNotSentWithoutADial`:
+  a clean pooled-conn failure is `unknown`/`FailurePhaseNone`, and a pooled-conn
+  failure on a call an earlier hop already transmitted — answered or unanswered —
+  inherits the CALL's state (`response_started` / `unknown`), so no later hop
+  can revive a `not_sent` the call forfeited (issue #60, extended to pooled
+  reuse by the inheritCall fix).
 
 ### R3 — Intent is recorded, never derived from a status and never taken from the wire
 
@@ -161,6 +170,31 @@ recorded**.
   provider-shaped status is inert — the label is read off the returned
   `Failure`, never off the status that's about to be written.
 
+### R7 — Secondary body reads are total-bounded (bytes AND time); the SSE product read is not
+
+- **Contract:** every read of an already-received upstream body that is NOT the
+  SSE product — the terminal error-envelope read, the redirect drain, the
+  non-SSE guard, and the `/v1/models` fetch — is bounded by a byte cap
+  (`maxErrorBodyBytes` / `maxNonSSEBodyBytes` / 4 MiB for models) and a total
+  deadline (`config.SecondaryReadTimeout`, 10 s; the models fetch under its
+  own `config.ModelsFetchTimeout`, enforced by the request context). A peer
+  streaming a secondary body forever below the byte cap pins the goroutine
+  only until the deadline fires. The SSE product read (`ScanLines`)
+  deliberately keeps its 360 s progress-reset stall instead: a slow-but-live
+  stream is the product, and any chunk re-arms the window.
+- **Guard seam:** `internal/upstream/client.go` `ReadBoundedBody` /
+  `readBoundedBody` (watchdog goroutine + cumulative deadline); call sites:
+  the terminal error-envelope read, `drainAndClose` (redirect drain), and
+  `internal/router/stream.go` non-SSE guard.
+- **Pinned by:** `internal/upstream/transport_hardening_test.go`
+  `TestSecondaryBodyReadIsTimeBounded` (upstream flushes headers then drips a
+  byte forever → returns nil within 100 ms), `TestSecondaryBodyReadPassesThroughNormalBodies`
+  (finite body intact), `TestSecondaryBodyReadRespectsCancellation`
+  (request cancel aborts), `TestTerminalErrorBodyReadIsBounded`.
+- **Adversarial note:** these are Go-side hardening bounds with no JS
+  counterpart (the JS handlers read upstream error bodies unbounded
+  — utils/error.js:61). Not an invariance claim, an exhaust-proofing one.
+
 ## Cross-service seams — recorded as dependencies, never invented
 
 The one cross-repo contract this repo does not silently implement: **egress
@@ -183,7 +217,8 @@ and never invented.
 | Single emit boundary, bounded, dropped counted                 | **in force**                                                      | R4 (evidence_log.go + cap tests)                          |
 | Replay-safe failover moves to distinct egress only             | **in force**                                                      | R5 (intent exclusion + terminal tests)                    |
 | Provenance-labelled, unforgeable inbound                       | **in force**                                                      | R6 (provenance header tests)                              |
-| OFP ↔ RPGW egress intent                                       | OFP side **in force**; RPGW side a recorded cross-repo dependency | R7 (routing intent seam + cross-repo row)                 |
+| Secondary body reads total-bounded; SSE product read not       | **in force**                                                      | R7 (ReadBoundedBody + watchdog tests)                     |
+| OFP ↔ RPGW egress intent                                       | OFP side **in force**; RPGW side a recorded cross-repo dependency | cross-service seams section (routing intent seam + row)   |
 
 ## Adversarial review notes (honest gaps, not dodged claims)
 

@@ -614,12 +614,22 @@ func (t *dialTrace) provenance(err error) (FailurePhase, RequestState) {
 	dialed, dialOK, wrote, phase := t.dialed, t.dialOK, t.wrote, t.phase
 	t.mu.Unlock()
 
+	// The call forbids not_sent for EVERY hop whose own record would prove it
+	// unsent: a logical call that already transmitted — or was already
+	// answered — cannot claim the request never went out (issue #60). A hop
+	// that performed no dial at all (pooled conn) earns FailurePhaseNone and
+	// the CALL's state, never a premature not_sent; the other branches fall
+	// through to the same call check below.
+	inheritCall := t.call != nil && (t.call.transmitted.Load() || t.call.responded.Load())
 	var fp FailurePhase
 	switch {
 	case !dialed:
 		// A pooled connection: the transport reused a live conn, so this hop
 		// performed no dial at all. Nothing is attributable and nothing is
-		// proven — unknown, never not_sent.
+		// proven — unknown, unless the call's own history forbids that too.
+		if inheritCall {
+			return FailurePhaseNone, t.call.state()
+		}
 		return FailurePhaseNone, RequestStateUnknown
 	case !dialOK:
 		// The dial itself failed: a phase this package performed, entirely
@@ -632,15 +642,23 @@ func (t *dialTrace) provenance(err error) (FailurePhase, RequestState) {
 		fp = FailurePhaseNone
 	default:
 		// Request bytes were handed to a conn during this hop. Whatever went
-		// wrong after that is not provably pre-transmission.
-		return postDialPhase(err), RequestStateUnknown
+		// wrong after that is not provably pre-transmission. State inherits the
+		// call's history like every other branch: a hop writing on a call an
+		// earlier hop already ANSWERED reports response_started, not unknown.
+		fp = postDialPhase(err)
+		if inheritCall {
+			return fp, t.call.state()
+		}
+		// This hop itself wrote, so the call has transmitted even if the flag
+		// raced the store — net/http's write hook already fired.
+		return fp, RequestStateUnknown
 	}
 	// fp is a phase this hop provably reached without writing. That is enough
 	// to prove the hop unsent — but not enough to prove the CALL unsent: a
-	// logical call that already transmitted on an earlier hop cannot claim
-	// not_sent for a later hop's dial failure (issue #60). The hop's phase is
-	// still the honest attribution of where THIS hop failed.
-	if t.call != nil && t.call.transmitted.Load() {
+	// logical call that already transmitted — or was already answered — on an
+	// earlier hop cannot claim not_sent for a later hop's failure (issue #60).
+	// The hop's phase is still the honest attribution of where THIS hop failed.
+	if inheritCall {
 		return fp, t.call.state()
 	}
 	return fp, RequestStateNotSent

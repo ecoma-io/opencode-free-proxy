@@ -109,9 +109,16 @@ holding a stale snapshot can never prune against its older keep-set.
 - **Transports** (`internal/router`) — cached by transport signature.
   Cache membership is NOT request ownership: a request owns the `*Client` it
   resolved by reference, so eviction cannot fail or destabilize it. Eviction
-  closes the old transport's idle connections immediately; the stale
-  snapshot self-heals by rebuilding the client on its next dial. An active
-  connection is never closed by the prune.
+  latches the old transport's `closeIdle` and closes its IDLE connections
+  immediately; a connection still busy under an in-flight request completes,
+  and the moment it returns to the pool `tryPutIdleConn` sees the latched
+  flag and closes it ON RETURN — not by the timer. `IdleConnTimeout` is the
+  backstop for the unlatched lifetime only: it reaps a conn that re-entered
+  the pool AFTER a later prune re-armed the latch, or one whose transport
+  was never pruned (`net/http` registers no finalizer, so that timeout — not
+  GC — is what eventually releases a never-pruned transport's returned
+  conn). An active connection is never closed by the prune; the stale
+  snapshot self-heals by rebuilding the client on its next dial.
 
 ## The request pipeline
 
@@ -146,7 +153,13 @@ AGENTS.md for the porting discipline):
    relayed verbatim and ends the call, and the route's next egress is tried
    only when the attempt failed before the request existed — a dial that
    never put a byte on the wire. 60 s response-header timeout, 360 s stream
-   stall (reset per line).
+   stall (reset per line). Every SECONDARY read of an already-received
+   body — the terminal error-envelope read, the redirect drain, the non-SSE
+   guard, and the `/v1/models` fetch (bounded under its own
+   `ModelsFetchTimeout`) — is bounded by the byte cap AND a total deadline
+   (`SecondaryReadTimeout`, 10 s); only the SSE product read (ScanLines)
+   keeps a progress-reset stall, because a slow-but-live stream is the
+   product there.
 9. Relay: format-matched passthrough (with usage estimation seam) or
    translation; non-streaming clients get the forced SSE→JSON aggregate
    with the same usage/thinking synthesis as the JS router (only when the
@@ -281,7 +294,26 @@ transport can _prove_ about transmission. The contract those fields serve is
   (viable because `net/http` builds its dial context with
   `context.WithoutCancel`, which retains values), and `net/http` skips the
   dial entirely on a pooled connection — so a failure on a reused connection
-  has no phase and degrades to `unknown`, never `not_sent`.
+  has no phase and degrades to `unknown` on a clean call, never `not_sent`.
+  The call's monotonic history still speaks: a pooled-conn failure on a call
+  that already transmitted — or was already answered by an earlier hop —
+  inherits the call's state (`unknown`/`response_started`) instead of a
+  fresh one, so no later hop can ever revive a `not_sent` a busier call
+  already forfeited.
+- **Secondary body reads are total-bounded, by bytes and by time.**
+  `internal/upstream/client.go` reads any already-received body that is not
+  the SSE product — the terminal error-envelope read, the redirect drain,
+  and the non-SSE guard — through `ReadBoundedBody`, which caps the bytes
+  (`maxErrorBodyBytes` / `maxNonSSEBodyBytes`) AND the total time
+  (`config.SecondaryReadTimeout`, 10 s, via a watchdog). A fourth secondary
+  read, the `/v1/models` fetch, is total-bounded by its own request context
+  (`config.ModelsFetchTimeout`) rather than the helper. The
+  response-HEADER timeout (`ConnectTimeout`) is spent once headers arrive
+  and bounds nothing further, so a peer streaming a secondary body forever
+  below the byte cap would pin the goroutine outright without the deadline.
+  The SSE product read (`ScanLines`) deliberately keeps its progress-reset
+  stall instead — a slow-but-live stream is the product there, and any
+  progress re-arms the 360 s window.
 - **The write flag is set on write _entry_.** The final connection handed to
   `net/http` is wrapped (`recordingConn`), and it marks the attempt as having
   transmitted on entry to the write, not on success — a partial write may have
