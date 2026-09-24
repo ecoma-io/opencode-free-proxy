@@ -160,11 +160,12 @@ AGENTS.md for the porting discipline):
    per-egress retry matrix: a provider response (2xx, 429, any 4xx/5xx) is
    relayed verbatim and ends the call, and the route's next egress is tried
    only when the attempt failed before the request existed — a dial that
-   never put a byte on the wire. 60 s response-header timeout, 360 s stream
-   stall (reset per line). Every SECONDARY read of an already-received
-   body — the terminal error-envelope read, the redirect drain, the non-SSE
-   guard, and the `/v1/models` fetch (bounded under its own
-   `ModelsFetchTimeout`) — is bounded by the byte cap AND a total deadline
+   never put a byte on the wire. 60 s response-header timeout, 360 s
+   stream stall (reset on any byte/read progress, not per line). Every
+   SECONDARY read of an already-received body — the terminal error-envelope
+   read, the redirect drain, the non-SSE guard, and the `/v1/models` fetch
+   (bounded under its own `ModelsFetchTimeout`) — is bounded by the byte cap
+   AND a total deadline
    (`SecondaryReadTimeout`, 10 s); only the SSE product read (ScanLines)
    keeps a progress-reset stall, because a slow-but-live stream is the
    product there.
