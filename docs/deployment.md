@@ -177,9 +177,17 @@ On `SIGINT`/`SIGTERM` the server drains in two phases:
   config's `log-level` (default `info`; `debug | info | warn | error`,
   hot-reloadable with the rest of the snapshot — see
   [configuration.md → Log level](configuration.md#log-level)). Every request
-  logs one completion line at info with `generation`, `route`, `egress`,
-  `attempts`, `class`, `status`, `latency_ms`, `model`, `endpoint`,
+  logs one completion line at info with `request_id`, `generation`, `route`,
+  `egress`, `attempts`, `class`, `status`, `latency_ms`, `model`, `endpoint`,
   `fallback`; set `log-level: debug` to also see opencode UA warm-up.
+  `request_id` is this process's own handle for the request, and it is
+  the one to grep when a caller has nothing else. A caller that sends
+  `X-Request-Id` gets it recorded as `caller_request_id` alongside — the
+  join key for reading this process's lines against the service in front
+  of it, which mints the canonical id. It is a fixed always-on header
+  with no configuration, the value is used whole or dropped (never
+  rewritten), and it is never sent upstream or echoed on the response
+  ([architecture.md → Upstream error evidence](architecture.md#upstream-error-evidence-forensics)).
   The API is plain OpenAI-compatible: any outcome that DIALED something
   adds only `X-OFP-Egress: <id>` — including the forced-conversion 502, and
   absent from every path that never dialed — naming the configured egress the

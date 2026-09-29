@@ -43,6 +43,12 @@ type evidenceLog struct {
 	upstreamHost string
 	maxAttempts  int
 
+	// callerRequestID is the caller's own correlation id, validated and
+	// accepted whole or dropped (caller_id.go). It rides ALONGSIDE requestID,
+	// never in place of it: attempt_id stays request_id/N, and an absent caller
+	// id leaves the field off rather than rendering an empty one.
+	callerRequestID string
+
 	requestBytes int
 	// bodyJSON is the already-serialized request slice relay holds anyway;
 	// its sha256 is computed lazily — only when at least one row is emitted —
@@ -63,26 +69,32 @@ type evidenceLog struct {
 // logs. The pseudonym is stable per session for correlation while remaining
 // opaque — it is a correlator, not anonymization (the operator could brute
 // force known ids), and the docs say so.
-func newEvidenceLog(log zerolog.Logger, rec *upstream.Recorder, requestID string, generation uint64, route, model, endpoint string, streaming bool, session string, upstreamBase string, maxAttempts int, bodyBytes int, bodyJSON []byte) *evidenceLog {
+//
+// callerID is the validated caller-supplied correlation id ("" when absent or
+// rejected — caller_id.go). It sits next to requestID rather than in place of
+// it: a failure row names BOTH this process's own attempt identity and the
+// caller's name for the request, and the two are never interchangeable.
+func newEvidenceLog(log zerolog.Logger, rec *upstream.Recorder, requestID, callerID string, generation uint64, route, model, endpoint string, streaming bool, session string, upstreamBase string, maxAttempts int, bodyBytes int, bodyJSON []byte) *evidenceLog {
 	sum := sha256.Sum256([]byte(session))
 	host := ""
 	if u, err := url.Parse(upstreamBase); err == nil {
 		host = u.Host
 	}
 	return &evidenceLog{
-		log:          log,
-		rec:          rec,
-		requestID:    requestID,
-		generation:   generation,
-		route:        route,
-		model:        model,
-		endpoint:     endpoint,
-		streaming:    streaming,
-		sessionFP:    hex.EncodeToString(sum[:])[:16],
-		upstreamHost: host,
-		maxAttempts:  maxAttempts,
-		requestBytes: bodyBytes,
-		bodyJSON:     bodyJSON,
+		log:             log,
+		rec:             rec,
+		requestID:       requestID,
+		callerRequestID: callerID,
+		generation:      generation,
+		route:           route,
+		model:           model,
+		endpoint:        endpoint,
+		streaming:       streaming,
+		sessionFP:       hex.EncodeToString(sum[:])[:16],
+		upstreamHost:    host,
+		maxAttempts:     maxAttempts,
+		requestBytes:    bodyBytes,
+		bodyJSON:        bodyJSON,
 	}
 }
 
@@ -140,6 +152,9 @@ func (e *evidenceLog) Emit() {
 func (e *evidenceLog) emitError(row upstream.Row, dropped int) {
 	evt := e.log.Warn()
 	evt.Str("request_id", e.requestID)
+	if e.callerRequestID != "" {
+		evt.Str("caller_request_id", e.callerRequestID)
+	}
 	if id := e.attemptID(row); id != "" {
 		evt.Str("attempt_id", id)
 	}
@@ -241,8 +256,11 @@ func (e *evidenceLog) emitError(row upstream.Row, dropped int) {
 // while remaining available when an investigation raises the level.
 func (e *evidenceLog) emitSkip(row upstream.Row, dropped int) {
 	evt := e.log.Debug().
-		Str("request_id", e.requestID).
-		Uint64("generation", e.generation).
+		Str("request_id", e.requestID)
+	if e.callerRequestID != "" {
+		evt.Str("caller_request_id", e.callerRequestID)
+	}
+	evt = evt.Uint64("generation", e.generation).
 		Str("route", e.route).
 		Str("egress", row.Egress)
 	if row.EgressType != "" {

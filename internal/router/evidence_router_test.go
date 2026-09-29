@@ -424,7 +424,7 @@ func TestEvidenceDroppedCounterOnSkipLastRow(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	ev := newEvidenceLog(logging.New(&buf).Level(zerolog.DebugLevel), rec, "req", 1, "default", "m", "chat", true, "ses_e2e", "http://up.invalid", 3, 2, nil)
+	ev := newEvidenceLog(logging.New(&buf).Level(zerolog.DebugLevel), rec, "req", "", 1, "default", "m", "chat", true, "ses_e2e", "http://up.invalid", 3, 2, nil)
 	ev.Emit()
 
 	skips := eventsWith(decodeEvents(t, &buf), "egress_skipped")
@@ -514,7 +514,7 @@ func TestEvidenceEmitLevelPolicy(t *testing.T) {
 
 	t.Run("debug level renders both", func(t *testing.T) {
 		var buf bytes.Buffer
-		ev := newEvidenceLog(newLog(zerolog.DebugLevel, &buf), rows(), "req", 1, "r", "m", "chat", false,
+		ev := newEvidenceLog(newLog(zerolog.DebugLevel, &buf), rows(), "req", "", 1, "r", "m", "chat", false,
 			"session", "http://h:1/b", 1, 2, []byte("{}"))
 		ev.Emit()
 		events := decodeEvents(t, &buf)
@@ -524,7 +524,7 @@ func TestEvidenceEmitLevelPolicy(t *testing.T) {
 	})
 	t.Run("info level suppresses skips only", func(t *testing.T) {
 		var buf bytes.Buffer
-		ev := newEvidenceLog(newLog(zerolog.InfoLevel, &buf), rows(), "req", 1, "r", "m", "chat", false,
+		ev := newEvidenceLog(newLog(zerolog.InfoLevel, &buf), rows(), "req", "", 1, "r", "m", "chat", false,
 			"session", "http://h:1/b", 1, 2, []byte("{}"))
 		ev.Emit()
 		events := decodeEvents(t, &buf)
@@ -548,7 +548,7 @@ func TestEvidenceDroppedCounterSurfaces(t *testing.T) {
 	rec.Append(upstream.Row{Phase: upstream.PhaseResponse, Attempt: 99, Status: 429, Class: "upstream_429"})
 
 	var buf bytes.Buffer
-	ev := newEvidenceLog(logging.New(&buf), rec, "req", 1, "r", "m", "chat", false,
+	ev := newEvidenceLog(logging.New(&buf), rec, "req", "", 1, "r", "m", "chat", false,
 		"session", "http://h:1/b", 1, 16, []byte("{}"))
 	ev.Emit()
 

@@ -100,7 +100,69 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// generation N is served, dialed, retried and logged entirely under N,
 	// and the swap to N+1 affects only requests that have not arrived yet.
 	rt := s.runtime()
+	// The request id and the clock start at the TOP of the pipeline, so a
+	// request rejected before routing and a served request measure their
+	// latency over the same span (the whole request) rather than over two
+	// different ones — the pre-routing rejections below log through the same
+	// completion line, and a latency that skipped the parse and routing work
+	// would not be comparable with a served request's.
+	reqID := newRequestID()
+	start := time.Now()
+	// The caller's own correlation id, read once and logged alongside the local
+	// one (issue #83, caller_id.go). Log-only: it never reaches routing,
+	// health, fallback, session resolution, the executor or the response. "" is
+	// "absent", and the log field is left off rather than rendered empty.
+	callerID := callerRequestID(r.Header)
+	// cleanModel is the model id this request will be routed and dialed under.
+	// Declared here because the completion closure below reads it and every
+	// pre-routing rejection renders through that closure — the value is empty
+	// until alias strip and the thinking suffix are resolved, which is exactly
+	// what a rejected-before-routing line should say.
+	var cleanModel string
+	// profile is the routing fact-set (the endpoint's format is the only field
+	// known before the body is read), hoisted above the completion closure for
+	// the same reason: the line renders `endpoint` on every outcome, including
+	// the rejections that happen before routing exists. Its model/streaming/
+	// body fields are filled in beside the route match below, and nothing
+	// before that point reads them.
+	var profile routing.Profile
+	profile.Endpoint = string(sourceFormat)
+	// Completion is one event per REQUEST that reached this handler at Info:
+	// the black-box e2e suite and the snapshot tests assert the outcome facts
+	// (generation, egress, attempts, fallback) on the default info level, so
+	// Debug would hide the very line the contract is observed through.
+	//
+	// Scope is the whole handler, not just the routed part: a request rejected
+	// before routing (405, draining 503, unreadable/!JSON/missing-model 400,
+	// test-connection, bypass, translate failure, no-route-matched 400) also
+	// records its outcome here, with the plan-shaped fields left empty. What
+	// this line IS guaranteed for is every request that reached the pipeline —
+	// including the one rejected with no eligible egress, which dialed nothing
+	// at all and would otherwise leave a client-visible 502 with no line
+	// explaining it. Before this shape existed, a client-visible 4xx/5xx could
+	// be produced with no line in this process naming it at all.
+	//
+	// routeID/egress/attempts/failure are the caller's, so the pre-routing
+	// rejections emit the same line shape as a served request. The failure
+	// record is INTERNAL (response_headers.go): it classifies the outcome here
+	// and on the evidence rows, and is never serialized.
+	//
+	// The Msgf text is FROZEN (AGENTS.md rule 10) — correlation rides the JSON
+	// fields only, never the rendered sentence.
+	logCompletion := func(routeID, egID string, attempts int, failure upstream.Failure, status int, latencyMs int64) {
+		evt := s.log.Info().Str("request_id", reqID)
+		if callerID != "" {
+			evt = evt.Str("caller_request_id", callerID)
+		}
+		evt.Uint64("generation", rt.Generation).
+			Str("route", routeID).Str("egress", egID).Int("attempts", attempts).
+			Str("class", failure.Class.String()).Int("status", status).Int64("latency_ms", latencyMs).
+			Str("model", cleanModel).Str("endpoint", profile.Endpoint).Bool("fallback", attempts > 1).
+			Msgf("request completed generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
+				rt.Generation, routeID, egID, attempts, failure.Class, status, latencyMs, cleanModel, profile.Endpoint, attempts > 1)
+	}
 	if r.Method != http.MethodPost {
+		logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusMethodNotAllowed, time.Since(start).Milliseconds())
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
@@ -108,16 +170,19 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// reading the body (in-flight requests/streams finish under the shutdown
 	// grace; nothing upstream is dialed after this point).
 	if s.Draining.Load() {
+		logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusServiceUnavailable, time.Since(start).Milliseconds())
 		writeError(w, http.StatusServiceUnavailable, "Server is shutting down")
 		return
 	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil || len(raw) > maxBodyBytes {
+		logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusBadRequest, time.Since(start).Milliseconds())
 		writeError(w, http.StatusBadRequest, "Bad request — unreadable body")
 		return
 	}
 	var body map[string]any
 	if err := json.Unmarshal(raw, &body); err != nil || body == nil {
+		logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusBadRequest, time.Since(start).Milliseconds())
 		writeError(w, http.StatusBadRequest, "Bad request — body must be a JSON object")
 		return
 	}
@@ -135,15 +200,29 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		body["model"] = stripped
 	}
 
+	// The model this request would route and dial under, resolved as soon as
+	// the model id is known — not after the early returns below. The completion
+	// closure renders it on EVERY line, including the rejections that happen
+	// before routing, so an operator can name the model a rejected request
+	// asked for instead of reading an empty field.
+	if requested != "" {
+		cleanModel = cloak.BaseModelID(aliasRe.ReplaceAllString(requested, ""))
+	}
+
 	if requested == "" {
+		logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusBadRequest, time.Since(start).Milliseconds())
 		writeError(w, http.StatusBadRequest, "Model not found — body.model is required")
 		return
 	}
 
 	// Test-connection probe (src/sse/handlers/chat.js:91-97): header presence
 	// with any value answers a fixed synthetic completion with no upstream
-	// call. Shared-handler scope — see isTestConnectionRequest.
+	// call. Shared-handler scope — see isTestConnectionRequest. A local
+	// synthetic answer still gets a line: it is a request the client made and
+	// an operator correlating the Injector's logs will otherwise see one
+	// service account for it and nothing here.
 	if isTestConnectionRequest(r) {
+		logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusOK, time.Since(start).Milliseconds())
 		createTestConnectionResponse(w, requested)
 		return
 	}
@@ -154,11 +233,15 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// detection or the thinking snapshot. The model argument is the
 	// marker-stripped requested model (chat.js passes modelStr).
 	if s.handleBypassRequest(w, body, requested, r.Header.Get("User-Agent"), sourceFormat) {
+		logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusOK, time.Since(start).Milliseconds())
 		return
 	}
 	model := aliasRe.ReplaceAllString(requested, "")
 	upstreamModel := model
-	cleanModel := cloak.BaseModelID(upstreamModel)
+	// cleanModel was resolved above, right after the model id became known, so
+	// the completion line could name it on a pre-routing rejection too. The
+	// value is identical — same alias strip, same thinking-suffix strip.
+	cleanModel = cloak.BaseModelID(upstreamModel)
 
 	targetFormat := relay.FormatChat
 	if cloak.IsResponsesModel(upstreamModel) {
@@ -193,6 +276,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		if sourceFormat == relay.FormatChat {
 			translated := translate.ChatRequestToResponsesRequest(upstreamModel, body)
 			if translated == nil {
+				logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusBadRequest, time.Since(start).Milliseconds())
 				writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to translate request for %s → %s", sourceFormat, targetFormat))
 				return
 			}
@@ -200,6 +284,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		} else {
 			body = translate.ResponsesToChatRequest(body)
 			if body == nil {
+				logCompletion("", "", 0, upstream.NoDialFailure(), http.StatusBadRequest, time.Since(start).Milliseconds())
 				writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to translate request for %s → %s", sourceFormat, targetFormat))
 				return
 			}
@@ -271,12 +356,9 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// maintenance before it consults eligibility.
 	s.clientMu.Lock()
 	hp := health.PolicyFromSnapshot(rt)
-	profile := routing.Profile{
-		Model:     cleanModel,
-		Streaming: clientRequestedStreaming,
-		BodyBytes: int64(len(raw)),
-		Endpoint:  string(sourceFormat),
-	}
+	profile.Model = cleanModel
+	profile.Streaming = clientRequestedStreaming
+	profile.BodyBytes = int64(len(raw))
 	route, ok := rt.MatchRoute(profile.Streaming, profile.BodyBytes, profile.Model)
 	// Pin the route's health identities for the request's whole lifetime —
 	// released when relay returns, after the executor's last observation. A
@@ -290,6 +372,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	}
 	s.clientMu.Unlock()
 	if !ok {
+		logCompletion(route.ID, "", 0, upstream.NoDialFailure(), http.StatusBadRequest, time.Since(start).Milliseconds())
 		writeError(w, http.StatusBadRequest, "No route matched this request")
 		return
 	}
@@ -297,37 +380,6 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 		defer releaseHealth()
 	}
 	s.onGeneration(rt)
-	// The request id and the clock start here, before the head selection, so a
-	// request rejected before a plan existed and a served request measure their
-	// latency over the same span (planning onward) rather than over two
-	// different ones.
-	reqID := newRequestID()
-	start := time.Now()
-	// Completion is one event per ROUTED request at Info: the black-box e2e
-	// suite and the snapshot tests assert the outcome facts (generation,
-	// egress, attempts, fallback) on the default info level, so Debug would
-	// hide the very line the contract is observed through.
-	//
-	// "Routed" is the honest scope: a request rejected before routing (405,
-	// draining 503, unreadable/!JSON/missing-model 400, test-connection,
-	// bypass, translate failure, no-route-matched 400) returns above this
-	// point and logs no completion line. What this line IS guaranteed for is
-	// every request that matched a route — including the one rejected just
-	// below with no eligible egress, which dialed nothing at all and would
-	// otherwise leave a client-visible 502 with no line explaining it.
-	//
-	// routeID/egress/attempts/failure are the caller's, so the pre-plan
-	// rejection below emits the same line shape as a served request. The
-	// failure record is INTERNAL (response_headers.go): it classifies the
-	// outcome here and on the evidence rows, and is never serialized.
-	logCompletion := func(routeID, egID string, attempts int, failure upstream.Failure, status int, latencyMs int64) {
-		s.log.Info().Str("request_id", reqID).Uint64("generation", rt.Generation).
-			Str("route", routeID).Str("egress", egID).Int("attempts", attempts).
-			Str("class", failure.Class.String()).Int("status", status).Int64("latency_ms", latencyMs).
-			Str("model", cleanModel).Str("endpoint", profile.Endpoint).Bool("fallback", attempts > 1).
-			Msgf("request completed generation=%d route=%s egress=%s attempts=%d class=%s status=%d latency_ms=%d model=%q endpoint=%s fallback=%t",
-				rt.Generation, routeID, egID, attempts, failure.Class, status, latencyMs, cleanModel, profile.Endpoint, attempts > 1)
-	}
 	heads := s.routeHeads(rt, route, profile, hp)
 	if len(heads) == 0 {
 		// No egress was eligible, so no plan existed and nothing was dialed.
@@ -349,6 +401,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	session := upstream.PrepareRequest(upstreamModel, body, downstream)
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
+		logCompletion(route.ID, "", 0, upstream.NoDialFailure(), http.StatusInternalServerError, time.Since(start).Milliseconds())
 		writeError(w, http.StatusInternalServerError, "Failed to serialize request")
 		return
 	}
@@ -383,7 +436,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	// the single emit point. Emission happens right after Execute, when every
 	// row's decisions are complete and before the completion line.
 	rec := upstream.NewRecorder()
-	ev := newEvidenceLog(s.log, rec, reqID, rt.Generation, plan.RouteID, cleanModel,
+	ev := newEvidenceLog(s.log, rec, reqID, callerID, rt.Generation, plan.RouteID, cleanModel,
 		profile.Endpoint, clientRequestedStreaming, session, url, policy.Budget(), len(bodyJSON), bodyJSON)
 	resp, egID, attempts, failure, uerr := s.Exec.ExecuteObserved(reqCtx, url, buildHeaders, bodyJSON, plan, policy, rec)
 	latency := time.Since(start)

@@ -203,6 +203,32 @@ unchanged).
   logical upstream call, so there is no dial suffix. Stream-phase rows and
   skips have no attempt id (the attempt already committed and returned, or
   never dialed at all).
+- **`caller_request_id` — the caller's own name for the request**
+  (`X-Request-Id`, issue #83). One fixed, always-on inbound header, no config
+  knob: it is a diagnostic, not policy, and a configurable header name would be
+  a hot-reloadable knob with exactly one correct value. The value is validated
+  against `[A-Za-z0-9._:-]`, 1–128 bytes, and used **whole or not at all** —
+  never folded, collapsed or truncated, because a rewritten correlation key is
+  the worst available outcome: the join fails silently with no field pointing
+  at the reason, and an operator ends up grepping for a value that was never
+  sent. A rejected value is absent, and this process's own `request_id` is
+  still there, so a bad join key degrades to "same service, same time" rather
+  than to a wrong id.
+
+  It is **log-only**: it never reaches routing, health, fallback, session
+  resolution, the executor, or the response. It is not in the
+  `captureDownstream` forwarding allow-list, so it is not sent upstream either
+  — which is what keeps it away from session stickiness, prompt caching and the
+  `session_fp` pseudonym. It is not `X-Opencode-Request` either (the forged
+  `msg_`+hex upstream id, whose shape the free-tier gate depends on). The local
+  `request_id` stays authoritative and `attempt_id` is still derived from it: a
+  caller may name a request, never the attempt sequence. Because the two are
+  both 16 hex characters by construction, the field is deliberately distinct
+  from `request_id` rather than merged into it — grepping `request_id` across
+  two services' merged logs must not splice unrelated rows together. Nothing
+  this process writes echoes it back; the service in front owns the canonical
+  id.
+
 - **Phases, not re-classification**: `response` (an HTTP verdict ≥ 400),
   `transport` (no HTTP response exists), `stream`/`forced` (a live
   response died or failed conversion after headers). Stream/forced rows
@@ -237,7 +263,12 @@ unchanged).
   `session_fp` = sha256(session id)[:16] — a stable **pseudonym for
   correlation, not anonymization** (an operator with known ids could
   brute-force it); the request body as `request_body_sha256`[:16],
-  computed lazily only when evidence is emitted.
+  computed lazily only when evidence is emitted. `caller_request_id` is
+  the one peer-supplied string a row carries, and it is bounded twice over:
+  the charset rejects CR/LF/NUL/quote/backslash by construction, and the
+  128-byte cap bounds the field. It is the caller's own identifier, not
+  this process's data about the caller, so it is logged as received —
+  and only when it passes the allow-list.
 - **Fingerprints** (`error_fingerprint`, FNV-1a over
   status|type|code|normalized message) group the same logical error
   across attempts/egresses/requests: digit runs fold ("retry in 17s" ≡

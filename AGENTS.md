@@ -124,13 +124,20 @@ The semantics agents most often get wrong:
    of `zerolog.SetGlobalLevel`; the swap message must keep the literal
    `config reload: swapped to new config (generation %d` — the e2e suite
    greps it. Completion lines log at info and are the e2e suite's only
-   request-outcome evidence (Debug would hide them).
+   request-outcome evidence (Debug would hide them). There is exactly ONE
+   completion line per request that reached a handler, including the
+   pre-routing rejections (405, draining 503, unreadable/non-JSON body,
+   missing `body.model`, `x-test-connection`, bypass, translate failure) and
+   `GET /v1/models` — a request that logs nothing is a bug, and a request that
+   logs two lines is a bug. A line written before any plan exists carries
+   `attempts=0` and an empty `egress`.
 10. Upstream-error forensics (issue #45) are strictly observational. The
     recorder (`internal/upstream/evidence.go`) only COLLECTS rows;
     `internal/router/evidence_log.go` is the only emit boundary. The
     completion line's `Msgf` text is frozen — evidence events are additive
     only (warn `upstream_error` per failed interaction, debug
-    `egress_skipped` per pass-over; success emits nothing). Rows are
+    `egress_skipped` per pass-over; success emits nothing). Correlation
+    travels in JSON fields only, never in the rendered sentence. Rows are
     captured BEFORE classification reduces the verdict, but never before a
     decision exists (`fallback_decision` only after the executor decided).
     Upstream- or attacker-derived text reaches a log only sanitized and
@@ -192,6 +199,25 @@ bool)`, with `Selection.Resolve()` telling the caller only what to dial.
     tried at most once per request. Pinned by
     `internal/routing/intent_test.go`, `internal/upstream/intent_test.go`,
     and `internal/router/intent_router_test.go`.
+13. A caller-supplied correlation id (issue #83) is read from ONE fixed inbound
+    header, `X-Request-Id`, and logged as `caller_request_id` — **log-only,
+    accept-or-ignore, always on, zero configuration** (no YAML key, no env
+    var; a knob would defeat the point, which is joining this process's lines
+    to the service in front of it). `internal/router/caller_id.go` returns
+    `""` for absent OR rejected — a value outside `[A-Za-z0-9._:-]` or longer
+    than 128 bytes is treated as ABSENT, never trimmed, folded or truncated:
+    a rewritten join key fails silently, while an absent one is diagnosable.
+    Every emit site guards on `!= ""` (zerolog's `Event.Str` appends
+    unconditionally, so an unguarded field prints `"caller_request_id":""` on
+    every line of every request). It is a separate field and NEVER
+    substituted for, promoted into, or derived from the local `request_id`,
+    and it never reaches a decision: not into `routing.Selector`, health,
+    fallback, session resolution, or anything that reaches the wire — it is
+    absent from `captureDownstream` (so it is never forwarded upstream and
+    cannot touch session stickiness), is not `X-Opencode-Request`, and is
+    never echoed on the response. Pinned by
+    `internal/router/caller_id_test.go` and
+    `e2e/wire_surface_test.go`.
 
 ## Layout
 
