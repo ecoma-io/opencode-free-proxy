@@ -103,6 +103,36 @@ const (
 	MinMaxOutputTokens = 16 // upstream 400s below this ("The number must be `>= 16`")
 )
 
+// Caller correlation id (issue #83). ONE fixed, always-on inbound header, read
+// and LOGGED as a separate `caller_request_id` field beside this process's own
+// `request_id` — never derived from it, never substituted for it, never a
+// decision input and never written to the response. It is a diagnostic, not
+// policy, so it carries no config knob: a configurable header name would be a
+// hot-reloadable knob with exactly one correct value.
+//
+// The header is deliberately NOT an X-OFP-* name (issue #77 retired that
+// namespace) and NOT one of the names the session resolver consumes
+// (identity/sessionresolver.go) or the executor forges
+// (upstream/executor.go x-opencode-request). It is not in captureDownstream's
+// forwarding allow-list either, so it is never sent upstream and cannot reach
+// session stickiness, prompt caching or the session_fp pseudonym.
+const (
+	// CallerRequestIDHeader is the single inbound header read for a
+	// caller-supplied correlation id.
+	CallerRequestIDHeader = "X-Request-Id"
+	// CallerRequestIDPattern is the accept-or-ignore charset: 1..128 bytes of
+	// [A-Za-z0-9._:-], anchored. It excludes CR, LF, NUL, quote and backslash
+	// by construction, so an ACCEPTED value can never forge a log line, and it
+	// bounds both cardinality and length. A value outside it is DROPPED, never
+	// folded or truncated: a rewritten join key fails silently, whereas a
+	// missing field leaves this process's own request_id to degrade the join to
+	// "same service, same time" rather than to a wrong id.
+	CallerRequestIDPattern = `^[A-Za-z0-9._:-]{1,128}$`
+	// MaxCallerRequestIDLen documents the bound the pattern already encodes; it
+	// is the number a caller is told about, and the length a test asserts.
+	MaxCallerRequestIDLen = 128
+)
+
 // Timeouts / retries (config/runtimeConfig.js defaults).
 const (
 	ConnectTimeout = 60 * time.Second  // response-headers timeout

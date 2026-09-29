@@ -164,6 +164,31 @@ the upstream correctly:
   Code session id is translated to the opencode shape, client-declared
   `x-opencode-client` honored over the `desktop` default
 
+### Public wire surface (`wire_surface_test.go`)
+
+What a caller can observe, asserted the way an OpenAI-compatible client sees
+it (issue #77): statuses relayed verbatim, the gateway envelope intact, and
+none of the removed `X-OFP-Failure-*` contract anywhere on the wire.
+
+- a caller-supplied `X-Request-Id` joins both the completion line and the
+  `upstream_error` event under `caller_request_id`, verbatim, while
+  `request_id` and `attempt_id` (`reqID/1`) stay local and unchanged — and
+  the response is untouched: no echo, no `Access-Control-Expose-Headers`
+  (`TestCallerRequestIDJoinsTwoServicesLogs`)
+- a value outside the allow-list (over-long, space, tab, quote, non-ASCII,
+  slash) leaves the field ABSENT — never trimmed or shortened — while the
+  request still succeeds and the local `request_id` survives; CR/LF/NUL
+  cannot be tested here because Go's client refuses to transmit them, so
+  they are covered by the unit table instead
+  (`TestCallerRequestIDRejectedValueIsDroppedNotFolded`)
+- the value logged is what ARRIVED, not what the client wrote: HTTP trims
+  optional whitespace around a field value, so `"trim-me "` is logged as
+  `trim-me` and never re-padded
+  (`TestCallerRequestIDHTTPTrailingSpaceArrivesTrimmed`)
+- a pre-routing rejection (400, no route matched) that used to log nothing
+  now records a line naming the model, `attempts=0`, no egress and the
+  caller's id (`TestPreRoutingRejectionIsVisibleInTheLog`)
+
 ## Live suite (real proxy + real upstream)
 
 Against an already-running proxy (default `http://127.0.0.1:8090`). Skipped

@@ -81,7 +81,10 @@ Events are leveled:
 - **debug** — opencode UA warm-up; `egress_skipped` diagnostics (slot-full
   / transport build / unknown-egress pass-overs). Completion lines are
   info-only with a fixed field set — no level adds correlation fields to
-  them;
+  them. `caller_request_id` is the one input-dependent field: it rides the
+  line when the caller sent an acceptable `X-Request-Id` (see
+  [architecture.md → Upstream error evidence](architecture.md#upstream-error-evidence-forensics))
+  and is simply absent otherwise, at every level;
 - **warn** — fault signals a request survived (reload read/rejection,
   transport-setup failure, forced SSE→JSON abort, shutdown grace forced
   close);
@@ -202,10 +205,15 @@ Upstream-failure forensics (`upstream_error` events — see
 [architecture.md](architecture.md#upstream-error-evidence-forensics)) are
 shaped so the default level is already investigative:
 
-- **info (default)** — one completion line per routed request, plus one warn
-  `upstream_error` event per failed upstream interaction (dial, stream
-  death, forced-conversion failure) with rate limits, classification,
-  health and failover decisions. Successful requests emit nothing extra.
+- **info (default)** — one completion line per request that reached the
+  handler, plus one warn `upstream_error` event per failed upstream
+  interaction (dial, stream death, forced-conversion failure) with rate
+  limits, classification, health and failover decisions. A request rejected
+  before routing (405, draining 503, an unreadable or non-JSON body, a
+  missing `body.model`, a `x-test-connection` reply, a bypass) records its
+  rejection on a completion line with `attempts=0` and an empty `egress`,
+  so a rejected request is never silent. Successful requests emit nothing
+  extra.
 - **debug** — adds `egress_skipped` diagnostics (slot-full / transport
   build / unknown-egress pass-overs), which can be frequent under load.
 - **warn / error** — silences the completion lines; failure evidence
@@ -331,11 +339,14 @@ temporarily ineligible). Its sibling, the pre-plan
 `502 No eligible egress for route "r"`, is written when the route's head set
 filtered to empty before a plan existed at all. Both dialed nothing, so both
 report the same way: `attempts=0`, an empty `egress`, and the no-dial
-classification `class=connection_error` on that request's completion line. The
-completion line is emitted for every request that matched a route, so these two
-nothing-dialed 502s are explained; a request rejected before routing (405,
-draining 503, an unreadable or non-JSON body, a missing `body.model`, a
-`x-test-connection` reply, a bypass) returns earlier and logs no line. An
+classification `class=connection_error` on that request's completion line.
+The completion line is emitted for every request that matched a route, so these two
+nothing-dialed 502s are explained. A request rejected before routing logs the
+same way, carrying the rejection's own status (405, the draining 503, an
+unreadable or non-JSON body, a missing `body.model`, a `x-test-connection`
+reply, a bypass, a failed translation) on the one line that request gets —
+those paths reach no plan either, so they too carry `attempts=0` and an
+empty `egress`. An
 unknown-but-present model is NOT rejected: it is routed like any other (it
 generally matches the catch-all route, or fails with `No route matched` if
 none does).

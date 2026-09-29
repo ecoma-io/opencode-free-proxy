@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"opencode-free-proxy/internal/config"
+
+	"github.com/rs/zerolog"
 )
 
 // modelsEntry is one /v1/models item.
@@ -38,15 +40,25 @@ type modelsEntry struct {
 // per-request http.Client: one connection pool, one transport configuration
 // (its ResponseHeaderTimeout is the only upstream deadline). The total fetch
 // bound is restored with a context deadline (config.ModelsFetchTimeout).
+//
+// The endpoint mints no request id and logs no line of its own — it never
+// reaches relay(). It records its outcome here instead, through the same
+// correlation fields every other surface emits: the local request_id plus the
+// caller's own id when one was sent (issue #83), and whether the answer came
+// from the upstream list or the fail-open static registry.
 func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
+	reqID := newRequestID()
+	callerID := callerRequestID(r.Header)
 	// Drain gate, same contract as relay(): a shutting-down server refuses
 	// NEW work with 503 instead of starting an upstream fetch. The fail-open
 	// fallback below applies only to fetch problems while serving.
 	if s.Draining.Load() {
+		logModelsOutcome(s.log, reqID, callerID, "", http.StatusServiceUnavailable, 0, false)
 		writeError(w, http.StatusServiceUnavailable, "Server is shutting down")
 		return
 	}
 	var entries []modelsEntry
+	fromUpstream := false
 	if s.Upstream != nil && s.Upstream.HTTP != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), config.ModelsFetchTimeout)
 		defer cancel()
@@ -85,17 +97,48 @@ func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
 			if resp, err := client.Do(req); err == nil {
 				raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 				_ = resp.Body.Close()
+				// A body carrying no usable shape parses to nil, and the
+				// fail-open fallback below answers instead — so the registry
+				// flag must be set from the PARSE result, never from the fetch
+				// succeeding. A 500 from the list endpoint that still filtered
+				// to ids is a served list, and the line says so.
 				entries = parseUpstreamModels(raw)
+				fromUpstream = entries != nil
 			}
 		}
 	}
 	if entries == nil {
 		entries = staticFreeModels()
 	}
+	logModelsOutcome(s.log, reqID, callerID, "v1/models", http.StatusOK, len(entries), fromUpstream)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   entries,
 	})
+}
+
+// logModelsOutcome records the one event GET /v1/models emits. The Msgf text
+// follows the completion line's frozen shape so a grep for `request completed`
+// finds this surface too, while the JSON fields carry what only this endpoint
+// knows: the source of the list and how many free ids it yielded. A caller id
+// is logged exactly as it is everywhere else — validated whole or dropped, and
+// the field is left off when there is none (caller_id.go).
+func logModelsOutcome(log zerolog.Logger, requestID, callerID, endpoint string, status, count int, fromUpstream bool) {
+	source := "static_registry"
+	if fromUpstream {
+		source = "upstream"
+	}
+	evt := log.Info().Str("request_id", requestID)
+	if callerID != "" {
+		evt = evt.Str("caller_request_id", callerID)
+	}
+	evt.Uint64("generation", 0).
+		Str("route", "").Str("egress", "").Int("attempts", 0).
+		Str("class", "models_list").Int("status", status).
+		Str("model", "").Str("endpoint", endpoint).Bool("fallback", false).
+		Str("source", source).Int("models", count).
+		Msgf("request completed generation=0 route= egress= attempts=0 class=models_list status=%d latency_ms=0 model=%q endpoint=%s fallback=false",
+			status, "", endpoint)
 }
 
 // parseUpstreamModels applies the free filter to the upstream JSON. It ports
