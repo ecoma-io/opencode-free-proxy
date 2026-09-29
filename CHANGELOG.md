@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.9.0...v0.10.0) (2026-09-29)
+
+
+### Features
+
+* **router:** log a bounded caller-supplied request id alongside the local one ([#83](https://github.com/ecoma-io/opencode-free-proxy/issues/83)) ([#84](https://github.com/ecoma-io/opencode-free-proxy/issues/84)) ([b800109](https://github.com/ecoma-io/opencode-free-proxy/commit/b800109682cfbdd8422ba801637d1ebe276760e3))
+
 ## [0.9.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.8.0...v0.9.0) (2026-09-24)
 
 
