@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.11.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.10.0...v0.11.0) (2026-09-30)
+
+
+### Features
+
+* **router:** a readiness endpoint and a drain head start, so SIGTERM is observable ([7fc52d7](https://github.com/ecoma-io/opencode-free-proxy/commit/7fc52d737b1ae6d950d6bb7a8098906060e0bafd)), closes [#87](https://github.com/ecoma-io/opencode-free-proxy/issues/87)
+* **router:** add GET /readyz and a drain head start so SIGTERM is observable ([#90](https://github.com/ecoma-io/opencode-free-proxy/issues/90)) ([7fc52d7](https://github.com/ecoma-io/opencode-free-proxy/commit/7fc52d737b1ae6d950d6bb7a8098906060e0bafd))
+
+
+### Bug Fixes
+
+* **config:** accept duration literals in OCFP_SHUTDOWN_GRACE and fail the boot if malformed ([#88](https://github.com/ecoma-io/opencode-free-proxy/issues/88)) ([3a82210](https://github.com/ecoma-io/opencode-free-proxy/commit/3a82210b7cda26a893d2c0e773012b196fe0baa1))
+* **config:** accept duration literals in OCFP_SHUTDOWN_GRACE, never silently fall back ([3a82210](https://github.com/ecoma-io/opencode-free-proxy/commit/3a82210b7cda26a893d2c0e773012b196fe0baa1)), closes [#86](https://github.com/ecoma-io/opencode-free-proxy/issues/86)
+
 ## [0.10.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.9.0...v0.10.0) (2026-09-29)
 
 
