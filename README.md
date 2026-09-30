@@ -70,6 +70,11 @@ Bootstrap env (the process itself — everything else lives in the file):
 | `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                |
 | `OCFP_SHUTDOWN_GRACE` | `55000` (55s)        | Drain window: active streams finish before forced close (ms) |
 
+`OCFP_CONFIG_POLL_MS` and `OCFP_SHUTDOWN_GRACE` also accept a Go duration
+literal (`350s`, `1m30s`); the millisecond integer above is tried first. A
+value matching neither form fails the boot instead of silently using the
+default — see [docs/configuration.md](blob/main/docs/configuration.md).
+
 ## Architecture in one paragraph
 
 Every request captures ONE immutable runtime generation at arrival and is

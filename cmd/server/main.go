@@ -46,7 +46,18 @@ func main() {
 	}
 
 	log := logging.New(os.Stdout)
-	cfg := config.FromEnv()
+	// A malformed OCFP_SHUTDOWN_GRACE or OCFP_CONFIG_POLL_MS is fatal here,
+	// never a silent fallback to the default (issue #86): the operator
+	// believes they configured a value, and the failure mode of not getting
+	// it is one-directional — a drain window they asked to be long would run
+	// short, force-closing live streams. config.FromEnv reports the key and
+	// the value's length, never the value. This is the same fatalLog +
+	// os.Exit(1) shape every other bootstrap failure below uses.
+	cfg, err := config.FromEnv()
+	if err != nil {
+		fatalLog.Error().Err(err).Msg("bootstrap env load failed")
+		os.Exit(1)
+	}
 	uaCache := identity.NewUserAgentCache()
 
 	// The DIRECT client is used only by UA warm/sync (GitHub is reached
