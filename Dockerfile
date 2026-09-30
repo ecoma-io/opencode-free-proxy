@@ -2,7 +2,8 @@
 # plus the CA bundle needed to verify TLS to the opencode.ai upstream.
 # No shell — the Docker HEALTHCHECK works because `healthcheck` is a
 # subcommand of the entrypoint binary itself (it GETs the server's own
-# /healthz on $OCFP_PORT).
+# /readyz on $OCFP_PORT, so a draining container reports unhealthy while it
+# is still finishing in-flight work).
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 ARG VERSION=dev
