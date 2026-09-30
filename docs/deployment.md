@@ -132,27 +132,56 @@ stays `8090` behind the `HOST_PORT` mapping — change `HOST_PORT`, not
 
 ## Health / readiness
 
-- `GET /healthz` answers `200 ok` while the process serves — it is the
-  Docker `HEALTHCHECK` target and a perfectly good k8s liveness probe.
+Two separate questions, two separate endpoints, and they must not have the
+same answer.
+
+- `GET /healthz` answers `200 ok` for the entire remaining life of the
+  process, **drain window included**. That is deliberate: it is liveness, and
+  a liveness probe that failed while a process was stopping correctly would
+  tell an orchestrator to kill it mid-drain. It is a good k8s liveness probe.
+- `GET /readyz` answers `200 ok` while the process will take new work, and
+  `503` from the instant `SIGINT`/`SIGTERM` sets the drain flag. This is what
+  a load balancer or an ingress should poll: it goes false **while the
+  listener is still accepting**, so the instance leaves the pool before its
+  socket goes away. It sends `Cache-Control: no-store` (a cached `200`
+  replayed after draining began would route traffic into a closing socket),
+  and answers a non-`GET` with `405` and `Allow: GET`. It is not part of the
+  OpenAI-compatible surface, so it carries a plain-text body rather than an
+  OpenAI-shaped error envelope.
+- Both read the **same** flag (`router.Server.Draining`) the request gate
+  reads, so the probe and the gate can never disagree.
+- The Docker `HEALTHCHECK` runs the entrypoint's `healthcheck` subcommand,
+  which probes `/readyz` and requires `200` **and** body `ok`. A draining
+  container therefore reports unhealthy while the process is still serving
+  its in-flight work, which is the intent. Point an external liveness probe
+  at `/healthz` if you want the unconditional `200` instead.
 - The model-facing `GET /v1/models` degrades independently: it falls back to
   a static free-tier registry when the upstream list is unreachable
   (fail-open), so a flaky upstream does not fail the probe surface.
-- There is no separate readiness endpoint; a freshly started process begins
-  admitting requests as soon as the listener is up (the UA cache warms in
-  the background — first requests use the compiled-in default UA triple,
-  fail-open).
+- A freshly started process begins admitting requests as soon as the listener
+  is up (the UA cache warms in the background — first requests use the
+  compiled-in default UA triple, fail-open).
 
 ## Graceful shutdown
 
-On `SIGINT`/`SIGTERM` the server drains in two phases:
+On `SIGINT`/`SIGTERM` the server drains in three phases:
 
-1. **Drain** — new requests get `503 Server is shutting down`; the config
+1. **Readiness head start** — the drain flag is set first, so `/readyz`
+   flips to `503` while `/healthz` still answers `200` and the API still
+   serves. The process then pauses, by default 5 s, so whatever routes to it
+   has time to notice before the socket goes away. The pause is **drawn from**
+   the shutdown grace rather than added to it (capped at `grace/2`), so total
+   signal→exit stays within `OCFP_SHUTDOWN_GRACE` and `stop_grace_period`
+   needs no adjustment. The 5 s is sized to a 2 s probe interval plus a 2 s
+   timeout plus scheduling slack; a short grace takes a proportionally short
+   head start, and a server that has already stopped takes none.
+2. **Drain** — new requests get `503 Server is shutting down`; the config
    poller and UA sync stop; in-flight requests and streams run to completion
    (or to the upstream's own stall deadline) under `srv.Shutdown`.
-2. **Force** — after `OCFP_SHUTDOWN_GRACE` (default 55 s) every still-tracked
-   connection is force-closed, so a stuck stream cannot pin the process
-   forever. Container stop commands should budget for the grace
-   (`docker stop -t 60 …` to outlive the default 55 s). The shipped
+3. **Force** — when the drain budget (grace minus the head start) lapses,
+   every still-tracked connection is force-closed, so a stuck stream cannot
+   pin the process forever. Container stop commands should budget for the
+   grace (`docker stop -t 60 …` to outlive the default 55 s). The shipped
    `compose.yaml` sets `stop_grace_period: 60s` for the same reason — a
    compose file without it SIGKILLs at compose's 10 s default, 45 s before
    the drain window ends.

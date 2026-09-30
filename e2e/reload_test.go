@@ -26,6 +26,7 @@ import (
 // proxySpawn is one self-contained server subprocess.
 type proxySpawn struct {
 	base   string
+	port   string
 	cmd    *exec.Cmd
 	out    *syncBuf
 	client *http.Client
@@ -81,6 +82,7 @@ func spawnProxy(t *testing.T, cfgDir string, extra map[string]string) *proxySpaw
 	done := make(chan struct{})
 	sp := &proxySpawn{
 		base:   "http://127.0.0.1:" + port,
+		port:   port,
 		cmd:    cmd,
 		out:    out,
 		client: &http.Client{Timeout: 30 * time.Second},

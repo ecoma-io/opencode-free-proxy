@@ -8,10 +8,11 @@ streaming and non-streaming.
 ## What it does
 
 - **Two endpoints, one upstream**: `POST /v1/chat/completions`,
-  `POST /v1/responses` (plus `GET /v1/models` and `GET /healthz`), proxied
-  to the OpenCode Zen free tier with the full client-identity hardening —
-  fingerprint tools, compound opencode User-Agent (synced from GitHub),
-  session resolution, thinking-suffix handling.
+  `POST /v1/responses` (plus `GET /v1/models`, `GET /healthz` and
+  `GET /readyz`), proxied to the OpenCode Zen free tier with the full
+  client-identity hardening — fingerprint tools, compound opencode
+  User-Agent (synced from GitHub), session resolution, thinking-suffix
+  handling.
 - **Multi-egress routing**: per-egress http/https/socks5 proxies (or direct),
   routes with priorities and match conditions, round-robin and smooth
   weighted rotation.

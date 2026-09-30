@@ -446,13 +446,50 @@ above uses the same `handshakeOrigin` so every path reports the same phase.
 - `POST /v1/responses` — OpenAI Responses API (SSE or JSON).
 - `GET /v1/models` — live free-tier model list from the upstream, with a
   static registry fallback (fail-open).
-- `GET /healthz` — liveness.
+- `GET /healthz` — liveness. Unconditional `200 ok` for the whole remaining
+  life of the process, drain window included.
+- `GET /readyz` — readiness. `200 ok` while the process will take new work,
+  `503` from the instant the drain flag is set. It reports the SAME flag the
+  request gate reads (`router.Server.Draining`), so probe and gate cannot
+  disagree, and it goes unready while the listener is still accepting — see
+  "Graceful shutdown" below for the head start that makes the ordering
+  observable. Not part of the OpenAI-compatible surface: plain-text body,
+  `Cache-Control: no-store`, `405` + `Allow: GET` for a non-GET.
 - `OPTIONS /` — browser CORS preflight.
 
 Every API response carries `Access-Control-Allow-Origin: *`,
 `Access-Control-Allow-Methods: POST, GET, OPTIONS`, and
 `Access-Control-Allow-Headers: *`; SSE responses additionally carry their
 event-stream framing headers.
+
+### Graceful shutdown and the readiness head start
+
+The two lifecycle questions a going-away process must answer are distinct,
+and the endpoints reflect that: `/healthz` stays `200` for the whole
+remaining life of the process (liveness — a failing liveness probe would
+tell an orchestrator to kill a process that is draining correctly), and
+`/readyz` goes `503` from the instant `Drain()` sets the flag (readiness —
+stop sending me traffic). Both read the same `router.Server.Draining`
+atomic, so the probe and the request gate can never disagree.
+
+The ordering is the point: readiness must go false **while the listener is
+still accepting**, because a probe that has not noticed yet cannot be told
+anything by a closed port — it can only learn about the drain as a refused
+connection. `cmd/server/main.go` therefore does not call `Drain()` and
+`Shutdown()` adjacently: it sets the flag, logs `readiness_unready`, and
+pauses for a head start (5 s, sized to the deployment's 2 s probe interval
+plus 2 s timeout plus slack) before `srv.Shutdown` closes the listener. The
+head start is **drawn from** `OCFP_SHUTDOWN_GRACE` (capped at `grace/2`) so
+total signal→exit stays within the grace and a container's
+`stop_grace_period` needs no adjustment for it; a short grace takes a
+proportionally short head start, a zero or negative one takes none, and the
+wait returns immediately if the server already stopped on its own.
+
+Inside that window the API still serves and `/healthz` still answers — a
+request arriving there gets a complete HTTP response (the drain gate's
+`503`), never a refused connection. `e2e/readiness_test.go` pins the
+ordering (`firstUnready` must precede `firstClosed`) black-box; see also
+`docs/deployment.md` "Graceful shutdown".
 
 ### Inbound listener bounds
 
@@ -473,7 +510,7 @@ upstream and are translated transparently for chat clients.
 
 | Package              | Role                                                                                                                                                                                                                                                                                                     |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cmd/server`         | entrypoint; also serves `healthcheck` (Docker HEALTHCHECK on `scratch`)                                                                                                                                                                                                                                  |
+| `cmd/server`         | entrypoint; `/readyz` + the readiness head start (`readiness.go`); also serves `healthcheck` (Docker HEALTHCHECK on `scratch`, probing `/readyz`)                                                                                                                                                        |
 | `internal/logging`   | zerolog construction + the compatibility adapter at constructor edges; centralized `time`/`level`/`msg` field names                                                                                                                                                                                      |
 | `internal/config`    | every runtime constant + bootstrap env vars; multi-egress YAML model, interpolation, redaction, hot-reload store, the immutable `Runtime` snapshot                                                                                                                                                       |
 | `internal/routing`   | route planner: model/streaming/body gates, round-robin + smooth weighted rotation, snapshot-pinned attempt order                                                                                                                                                                                         |

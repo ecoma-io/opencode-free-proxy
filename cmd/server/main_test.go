@@ -7,12 +7,15 @@ import (
 )
 
 // TestRunHealthcheck drives the Docker HEALTHCHECK subcommand against a real
-// listener via the OCFP_PORT env var (the subcommand's only configuration input).
+// listener via the OCFP_PORT env var (the subcommand's only configuration
+// input). Since issue #87 the probe reads READINESS (/readyz) and checks the
+// body as well as the status — see runHealthcheck.
 func TestRunHealthcheck(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(readyBody))
 	}))
 	defer srv.Close()
 	t.Setenv("OCFP_PORT", srvPort(t, srv))
@@ -20,16 +23,30 @@ func TestRunHealthcheck(t *testing.T) {
 	if err := runHealthcheck(); err != nil {
 		t.Fatalf("healthy server: %v", err)
 	}
-	if gotPath != "/healthz" {
-		t.Fatalf("probe path = %q, want /healthz", gotPath)
+	// Liveness must NOT be the probe target any more: a drain is invisible to
+	// /healthz by design, and Docker marks the container unhealthy from it.
+	if gotPath != readyPath {
+		t.Fatalf("probe path = %q, want %q", gotPath, readyPath)
 	}
 
-	// Non-200 must fail the probe.
+	// 503 — the drain — must fail the probe. This is the whole point of
+	// pointing it at /readyz.
 	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	if err := runHealthcheck(); err == nil {
 		t.Fatal("503 server: want error, got nil")
+	}
+
+	// A 200 whose body is NOT "ok" must fail too. A status-only probe passes
+	// a 200 from anything else that happens to be listening on this port,
+	// which is precisely the hole the body check closes.
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("some other service"))
+	})
+	if err := runHealthcheck(); err == nil {
+		t.Fatal("200 with a foreign body: want error, got nil")
 	}
 
 	// Closed port (server down) must fail the probe.

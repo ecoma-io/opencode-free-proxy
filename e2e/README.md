@@ -90,6 +90,11 @@ even though `upstream.base` is a single value:
 - SIGTERM: new requests answer 503 (drain gate) while the in-flight stream
   finishes under grace; a stream that stalls past `OCFP_SHUTDOWN_GRACE` is
   force-closed
+- readiness (`readiness_test.go`): `/readyz` flips to 503 BEFORE the listener
+  closes, with a measurable window between the two; a request inside that
+  window gets a complete HTTP response rather than a refused connection;
+  `/healthz` keeps answering 200 throughout; and the real `healthcheck`
+  subcommand exits 0 while serving and 1 while draining
 
 ### Health policy pinning & proxy-auth boundaries (`egress_test.go`)
 

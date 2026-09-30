@@ -1,13 +1,14 @@
 //go:build e2e
 
-// Graceful-shutdown E2E: SIGTERM must stop new work — 503 drain gate or,
-// once Shutdown closed the listener, connection-refused — while in-flight
-// streams finish under OCFP_SHUTDOWN_GRACE; past the grace the remaining
-// connections are force-closed. The 503 gate branch itself is asserted
-// deterministically in internal/router (TestDrainGateRejectsNewRequests);
-// the subprocess polls here accept either rejection shape because the
-// listener close races the poll. Both cases run real subprocesses against a
-// real upstream that streams slow enough to be mid-flight.
+// Graceful-shutdown E2E: SIGTERM must stop new work with the 503 drain gate
+// while in-flight streams finish under OCFP_SHUTDOWN_GRACE; past the grace the
+// remaining connections are force-closed. The 503 is asserted DETERMINISTICALLY
+// here because the readiness head start (issue #87) guarantees the listener is
+// still open for a bounded window after the drain flag is set — this file's
+// header used to accept "503 OR connection refused" because the listener close
+// raced the poll; that race is gone, so a connection-refused here means the
+// head start did not happen. Both cases run real subprocesses against a real
+// upstream that streams slow enough to be mid-flight.
 package e2e
 
 import (
@@ -117,27 +118,35 @@ func TestGracefulDrainFinishesInFlightStream(t *testing.T) {
 		t.Fatalf("SIGTERM: %v", err)
 	}
 
-	// New requests must now be rejected: drain gate 503, or — once Shutdown
-	// has closed the listener — connection refused. Both mean new work is
-	// blocked while the in-flight stream finishes under grace.
+	// New requests must now be rejected by the 503 drain gate. The readiness
+	// head start guarantees the listener is still open for a bounded window
+	// after the drain flag, so the 503 is what a poll must see — a transport
+	// error here means the listener closed without the head start (issue
+	// #87), which is the regression this file now exists to catch.
 	deadline := time.Now().Add(5 * time.Second)
 	drained := false
+	var lastErr error
 	for time.Now().Before(deadline) {
 		r, err := sp.client.Post(sp.base+"/v1/chat/completions", "application/json",
 			strings.NewReader(`{"model":"qwen3-coder-free","stream":true}`))
 		if err != nil {
-			drained = true // listener closed (Shutdown) — new work rejected
-			break
+			// Only acceptable if the drain already outran the poll entirely;
+			// with a head start in the picture this must not be the first
+			// answer, so it is recorded and retried rather than accepted.
+			lastErr = err
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
+		status := r.StatusCode
 		_ = r.Body.Close()
-		if r.StatusCode == http.StatusServiceUnavailable {
+		if status == http.StatusServiceUnavailable {
 			drained = true
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !drained {
-		t.Fatalf("shutdown never rejected new requests (log:\n%s)", sp.out.String())
+		t.Fatalf("shutdown never answered new requests with the 503 drain gate (last transport error: %v)\nlog:\n%s", lastErr, sp.out.String())
 	}
 
 	// The in-flight stream keeps flowing to [DONE].
@@ -228,25 +237,38 @@ func TestGraceForcesCloseStalledStream(t *testing.T) {
 	}
 	sigAt := time.Now()
 
-	// New requests are rejected: drain gate 503 or — Shutdown closed the
-	// listener — connection refused. Both mean new work is blocked.
+	// New requests are rejected by the 503 drain gate. With a 300ms grace the
+	// head start is grace/2 = 150ms, so the listener is briefly still open —
+	// but a 150ms window against a 30ms poll and a cold client is tight, so a
+	// transport error after a 503 is tolerated here (this test's subject is
+	// the force-close, not the head start; readiness_test.go pins the head
+	// start deterministically). A connection refused BEFORE any 503 is the
+	// signal that the head start was skipped entirely.
 	deadline := time.Now().Add(3 * time.Second)
 	drained := false
+	var firstErr error
 	for time.Now().Before(deadline) {
 		r, err := sp.client.Post(sp.base+"/v1/chat/completions", "application/json",
 			strings.NewReader(`{"model":"qwen3-coder-free","stream":true}`))
 		if err != nil {
-			drained = true
+			if firstErr == nil {
+				firstErr = err
+			}
 			break
 		}
+		status := r.StatusCode
 		_ = r.Body.Close()
-		if r.StatusCode == http.StatusServiceUnavailable {
+		if status == http.StatusServiceUnavailable {
 			drained = true
 			break
 		}
 		time.Sleep(30 * time.Millisecond)
 	}
-	if !drained {
+	if !drained && firstErr != nil && !strings.Contains(firstErr.Error(), "connection refused") &&
+		!strings.Contains(firstErr.Error(), "EOF") {
+		t.Fatalf("new request failed with an unexpected error (want 503 or connection refused): %v", firstErr)
+	}
+	if !drained && firstErr == nil {
 		t.Fatalf("shutdown never rejected new requests (log:\n%s)", sp.out.String())
 	}
 
@@ -272,10 +294,11 @@ func TestGraceForcesCloseStalledStream(t *testing.T) {
 	// The forced close must NOT happen before the grace elapsed: the server
 	// waits the full grace before killing in-flight connections. A server
 	// that dies instantly on SIGTERM (signal-handler regression, grace
-	// ignored) would fail the read within milliseconds of the signal; the
-	// grace is 300ms and the grace path closes at ~grace, so require at
-	// least 200ms (leave margin for scheduling without accepting instant
-	// death).
+	// ignored) would fail the read within milliseconds of the signal.
+	// The grace is 300ms and the total signal→exit is still ~300ms — the
+	// 150ms readiness head start comes OUT of the grace, not on top of it
+	// (issue #87) — so require at least 200ms, which leaves margin for
+	// scheduling without accepting instant death.
 	if elapsed < 200*time.Millisecond {
 		t.Fatalf("connection closed after %v since SIGTERM, want >= ~grace (300ms) — grace was likely ignored", elapsed)
 	}
