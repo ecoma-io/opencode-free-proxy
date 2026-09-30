@@ -111,6 +111,17 @@ reload is completely silent.
 | `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                       |
 | `OCFP_SHUTDOWN_GRACE` | `55000`              | Drain window before force-close (ms)                                |
 
+The two duration variables each accept **either** form: a bare positive
+integer in milliseconds (the contract above, and what the shipped compose
+file uses) or a Go duration literal — `350s`, `1m30s`, `500ms`. The integer
+is tried first, so every value that parsed before still parses to exactly the
+same duration. A value matching neither form **fails the boot** rather than
+silently falling back to the default: the old behaviour made a production
+`OCFP_SHUTDOWN_GRACE=350s` run on the 55 s default for every start, force-
+closing live streams while the operator believed they had a long drain
+(issue #86). The fatal line names the variable and the value's **length**,
+never the value.
+
 No other process env vars exist; every service setting (upstream base, UA
 sync cadence, routing) lives in the config document. `.env.example` (repo
 root) is the template for the whole environment — copy it to `.env`

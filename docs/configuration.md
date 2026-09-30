@@ -24,6 +24,12 @@ example and the parser cannot drift.
 | `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval (ms)                                                       |
 | `OCFP_SHUTDOWN_GRACE` | `55000`              | Drain window: in-flight streams finish before forced close (ms) — see deployment.md |
 
+Both duration variables also accept a Go duration literal (`350s`, `1m30s`,
+`500ms`); the millisecond integer is tried first, so every value that parsed
+before parses identically now. A value matching neither form **fails the
+boot** with the variable's name and the value's length — never a silent
+fallback to the default (issue #86).
+
 These are read once at startup and are **not** hot-reloaded. Everything below
 is.
 

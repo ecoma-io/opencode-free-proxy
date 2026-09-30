@@ -284,8 +284,8 @@ bool)`, with `Selection.Resolve()` telling the caller only what to dial.
 | --------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `OCFP_PORT`           | `8090`               | Listen port (`0` valid in tests)                                                                                                         |
 | `OCFP_CONFIG`         | _(empty = built-in)_ | Multi-egress routing config file (YAML); hot-reloaded, invalid keeps last good; also carries `upstream.base`, `user_agent.sync_interval` |
-| `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval for `OCFP_CONFIG` (ms)                                                                                          |
-| `OCFP_SHUTDOWN_GRACE` | `55000`              | Drain window: in-flight streams finish before forced close (ms)                                                                          |
+| `OCFP_CONFIG_POLL_MS` | `1000`               | Hot-reload poll interval for `OCFP_CONFIG` (ms, or a Go duration literal)                                                                |
+| `OCFP_SHUTDOWN_GRACE` | `55000`              | Drain window: in-flight streams finish before forced close (ms, or a Go duration literal)                                                |
 
 ## Security
 

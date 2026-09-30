@@ -3,6 +3,8 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"time"
@@ -306,36 +308,48 @@ var DefaultErrorMessages = map[int]string{
 // variables are deliberately not part of it. Every env var the process reads
 // carries the OCFP_ prefix (OCFP_PORT included — never a bare PORT), so a
 // deployment can identify the service's whole environment by one prefix.
+// A duration variable that is present but malformed is an error, never a
+// silent default (issue #86): the caller must not start a process on a value
+// the operator never chose. Errors are joined so one boot reports every
+// malformed variable, and they name the key and the value's LENGTH only — an
+// env var can carry a secret and neither ParseDuration's error text nor this
+// function's ever quote it.
 type Config struct {
 	Port string
 	// ConfigPath is OCFP_CONFIG: the routing + service config file. Empty =
 	// the built-in default runtime.
 	ConfigPath string
 	// ShutdownGrace is OCFP_SHUTDOWN_GRACE: how long draining waits for
-	// active requests/streams before forced close.
+	// active requests/streams before forced close. Accepts milliseconds
+	// ("55000") or a duration literal ("55s", "350s").
 	ShutdownGrace time.Duration
 	// ConfigPoll is OCFP_CONFIG_POLL_MS: the hot-reload poll interval.
+	// Accepts milliseconds ("1000") or a duration literal ("1s").
 	ConfigPoll time.Duration
 }
 
-// DefaultShutdownGrace is used when OCFP_SHUTDOWN_GRACE is unset (ms).
+// DefaultShutdownGrace is used when OCFP_SHUTDOWN_GRACE is unset.
 const DefaultShutdownGrace = 55 * time.Second
 
 // DefaultConfigPoll is the hot-reload poll interval (the rotation-proxy
 // gateway design polled at 1 s; repeated writes coalesce).
 const DefaultConfigPoll = time.Second
 
-func FromEnv() *Config {
+func FromEnv() (*Config, error) {
+	grace, graceErr := envDuration("OCFP_SHUTDOWN_GRACE", DefaultShutdownGrace)
+	poll, pollErr := envDuration("OCFP_CONFIG_POLL_MS", DefaultConfigPoll)
 	return &Config{
 		Port:       envOr("OCFP_PORT", DefaultPort),
 		ConfigPath: os.Getenv("OCFP_CONFIG"),
-		// OCFP_SHUTDOWN_GRACE is milliseconds like every other ms sibling
-		// (OCFP_CONFIG_POLL_MS). A "30s" duration string would be silently
-		// dropped by envMs' ParseDuration; envMs matches the documented
-		// contract.
-		ShutdownGrace: envMs("OCFP_SHUTDOWN_GRACE", DefaultShutdownGrace),
-		ConfigPoll:    envMs("OCFP_CONFIG_POLL_MS", DefaultConfigPoll),
-	}
+		// OCFP_SHUTDOWN_GRACE and OCFP_CONFIG_POLL_MS each accept EITHER
+		// form envDuration understands: a bare integer in milliseconds (the
+		// documented contract, and what the shipped compose file and every doc
+		// table use), or a Go duration literal itself. A value matching
+		// neither is a startup error, not a silent fallback — see
+		// envDuration and issue #86.
+		ShutdownGrace: grace,
+		ConfigPoll:    poll,
+	}, errors.Join(graceErr, pollErr)
 }
 
 func envOr(key, def string) string {
@@ -345,15 +359,54 @@ func envOr(key, def string) string {
 	return def
 }
 
-func envMs(key string, def time.Duration) time.Duration {
+// envDuration reads one duration-valued environment variable in EITHER of
+// the two forms operators actually write:
+//
+//   - a bare positive integer, in MILLISECONDS — the long-documented contract
+//     for every OCFP_ ms sibling (OCFP_CONFIG_POLL_MS, and OCFP_SHUTDOWN_GRACE
+//     as shipped in compose.yaml and every doc table);
+//   - a Go duration literal ("350s", "1m30s", "500ms") — the natural spelling
+//     for a variable named *_GRACE, and the only form the sister service
+//     openai-compatible-injector accepts for its identically named
+//     OAICR_SHUTDOWN_GRACE. Two org services reading the same-shaped variable
+//     under two different syntaxes is itself a defect (issue #86).
+//
+// The integer form is tried FIRST, so every value that parsed under the old
+// envMs parses to exactly the same duration now; nothing that worked before
+// changes.
+//
+// Neither form matching, or matching with a non-positive result, is a
+// STARTUP ERROR, never a silent fallback to def. The old envMs returned def
+// on anything unparseable with no signal at all, which is what let a
+// production OCFP_SHUTDOWN_GRACE=350s run on the 55s default for every start
+// (issue #86). The failure is one-directional and always toward the shorter,
+// more dangerous value: an operator who asked for a long drain got a short
+// one and force-closed live streams, believing the opposite. Silent fallback
+// on a malformed value is the defect; refusing to boot is the fix.
+//
+// The value is NEVER echoed, only its length: an env var can carry a secret
+// and time.ParseDuration's own error text quotes its input verbatim, so the
+// message carries the length and an example spelling instead. Errors are
+// returned, not logged, so FromEnv stays a pure reader and cmd/server decides
+// how to fail (log.Fatal, matching every other bootstrap failure).
+func envDuration(key string, def time.Duration) (time.Duration, error) {
 	raw := os.Getenv(key)
 	if raw == "" {
-		return def
+		return def, nil
 	}
-	if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-		return time.Duration(n) * time.Millisecond
+	if n, err := strconv.Atoi(raw); err == nil {
+		if n > 0 {
+			return time.Duration(n) * time.Millisecond, nil
+		}
+		return def, fmt.Errorf("%s is not a positive number of milliseconds (%d characters)", key, len(raw))
 	}
-	return def
+	if d, err := time.ParseDuration(raw); err == nil {
+		if d > 0 {
+			return d, nil
+		}
+		return def, fmt.Errorf("%s is not a positive duration (%d characters)", key, len(raw))
+	}
+	return def, fmt.Errorf("%s is not a positive millisecond integer and not a positive duration (%d characters; e.g. 55000, 350s, 1m30s)", key, len(raw))
 }
 
 // Hardening bounds for the forced SSE→JSON conversion and the /v1/models
