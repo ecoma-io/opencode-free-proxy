@@ -40,6 +40,16 @@ const (
 	// Used when the GitHub release lookup fails or the cache is cold.
 	ClientFallbackVersion = "1.18.31"
 	// Upstream rejects User-Agent versions below opencode/1.17.x (426/403).
+	//
+	// KNOWN DRIFT (measured live 2026-10-13): the floor is now 1.18, not 1.17 —
+	// a 1.17.x UA is answered 426 UpgradeRequired ("OpenCode 1.18.0 or newer is
+	// required to use the free tier"), and the version gate is evaluated BEFORE
+	// the free-tier gate (a 1.17 UA with a bad session id returns 403, not
+	// 426). Left at 17 deliberately: raising it widens the forge-vs-forward
+	// boundary in BuildHeaders, which is a separate decision with its own test
+	// update. Consequence today: a downstream client sending an
+	// `opencode/1.17.x` UA is forwarded verbatim and gets a relayed 426.
+	// See docs/recon-free-tier-gate.md.
 	ClientMinMajor    = 1
 	ClientMinMinor    = 17
 	GitHubReleasesURL = "https://api.github.com/repos/anomalyco/opencode/releases/latest"
