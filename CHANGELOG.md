@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.11.2](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.11.1...v0.11.2) (2026-10-13)
+
+
+### Documentation
+
+* **config:** mark the UA version floor as known drift at the constant ([823ec84](https://github.com/ecoma-io/opencode-free-proxy/commit/823ec840e7e73ce061138beae868d63b685441b1))
+* **identity:** cite the divergence record and pin the untested field ([c2b0e72](https://github.com/ecoma-io/opencode-free-proxy/commit/c2b0e72f5e48957be07eda7ff546b32823a1ac48))
+* make upstream drift an explicit porting divergence ([c08a642](https://github.com/ecoma-io/opencode-free-proxy/commit/c08a6426028a74bea792118246e987239a0e0ab9))
+* record the free-tier gate's session-id counter requirement ([550a1c1](https://github.com/ecoma-io/opencode-free-proxy/commit/550a1c1c5b2aeaab1f2ef3aee3a4d2ee730f67c8))
+
 ## [0.11.1](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.11.0...v0.11.1) (2026-10-13)
 
 
