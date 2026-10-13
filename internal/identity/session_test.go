@@ -6,8 +6,9 @@ package identity
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/binary"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -119,19 +120,20 @@ func TestSessionAndRequestPrefixesDiffer(t *testing.T) {
 	}
 }
 
-// translateSessionId hashes opencode\0<tool|generic>\0<sessionId> with sha256
-// and maps digest[0:6] → hex + digest[6:20] → BASE62_CHARS[b % 62].
-// Vectors computed from the JS algorithm (opencode.js translateSessionId).
+// translateSessionId hashes opencode\0<tool|generic>\0<sessionId> with sha256,
+// maps digest[6:20] → BASE62_CHARS[b % 62], and takes the 12-hex prefix from
+// the digest's TOP 36 bits with the low 12 bits forced to the `~1` counter
+// encoding (see TranslateSessionID — the upstream gate rejects a counter >= 64).
 func TestTranslateSessionIDGolden(t *testing.T) {
 	cases := []struct {
 		key  string
 		tool string
 		want string
 	}{
-		{"conversation-a", "claude", "ses_9b6cb3f235cf6eKUOqkP4rAtBT"},
-		{"claude:550e8400-e29b-41d4-a716-446655440000", "claude", "ses_ca4d828f276auulSOfo9t9Qrlf"},
-		{"session-from-codex", "generic", "ses_af05d62548412IHGwdH2GUk6Jk"},
-		{"", "", "ses_a7f9702bdb4d5CgHPQUAk1uIqH"}, // empty tool falls back to "generic"
+		{"conversation-a", "claude", "ses_9b6cb3f23ffe6eKUOqkP4rAtBT"},
+		{"claude:550e8400-e29b-41d4-a716-446655440000", "claude", "ses_ca4d828f2ffeuulSOfo9t9Qrlf"},
+		{"session-from-codex", "generic", "ses_af05d6254ffe2IHGwdH2GUk6Jk"},
+		{"", "", "ses_a7f9702bdffe5CgHPQUAk1uIqH"}, // empty tool falls back to "generic"
 	}
 	for _, tc := range cases {
 		got := TranslateSessionID(tc.key, tc.tool)
@@ -144,16 +146,46 @@ func TestTranslateSessionIDGolden(t *testing.T) {
 	}
 }
 
-// Cross-check the implementation shape against an in-test recomputation of
-// the JS digest mapping (crypto/sha256 mirroring Node createHash).
+// Cross-check the implementation shape against an in-test recomputation of the
+// digest mapping: the top 36 bits are the sha256 prefix, the low 12 are forced
+// to `~1`, and digest[6:20] → BASE62_CHARS[b % 62]. The JS original keeps the
+// whole 48 bits from the digest, which the upstream gate now rejects.
 func TestTranslateSessionIDShapeMatchesJSAlgorithm(t *testing.T) {
 	sum := sha256.Sum256([]byte("opencode\x00claude\x00conversation-a"))
-	want := "ses_" + hex.EncodeToString(sum[:6])
+	var w [8]byte
+	copy(w[2:], sum[:6])
+	x := binary.BigEndian.Uint64(w[:])
+	x = (x &^ 0xfff) | (^uint64(1) & 0xfff)
+	want := "ses_" + fmt.Sprintf("%012x", x)
 	for i := 6; i < 20; i++ {
 		want += string(base62Chars[int(sum[i])%62])
 	}
 	if got := TranslateSessionID("conversation-a", "claude"); got != want {
 		t.Errorf("TranslateSessionID = %q, want %q (sha256 mapping)", got, want)
+	}
+}
+
+// The upstream free-tier gate decodes the 12 hex chars into ~(millis*0x1000 +
+// counter) and rejects any id whose counter is >= 64 (measured live 2026-10-13,
+// deterministic). This pins the invariant the fix exists to keep: the decoded
+// counter of a translated id must stay in [0, 63].
+func TestTranslateSessionIDCounterUnderUpstreamGateLimit(t *testing.T) {
+	decodeCounter := func(s string) uint64 {
+		raw, err := strconv.ParseUint(strings.TrimPrefix(s, "ses_")[:12], 16, 64)
+		if err != nil {
+			t.Fatalf("prefix of %q is not hex: %v", s, err)
+		}
+		return (^raw) & 0xfff
+	}
+	keys := []string{"", "conversation-a", "session-from-codex", "claude:550e8400", strings.Repeat("k", 200)}
+	for _, key := range keys {
+		for _, tool := range []string{"", "generic", "claude", "codex"} {
+			got := TranslateSessionID(key, tool)
+			if c := decodeCounter(got); c > 63 {
+				t.Errorf("TranslateSessionID(%q, %q) = %q decodes to counter %d, want <= 63 "+
+					"(upstream rejects >= 64 with 403 FreeTierError)", key, tool, got, c)
+			}
+		}
 	}
 }
 

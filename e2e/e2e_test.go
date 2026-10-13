@@ -46,9 +46,15 @@ var officialUARe = regexp.MustCompile(
 const (
 	fakeChatID   = "chatcmpl-fake0001"
 	fakeRespID   = "resp_fake0001"
-	testedModel  = "qwen3-coder-free"
-	museModel    = "muse-spark-1.2-contributor-free"
 	bypassAnswer = "CLI Command Execution: Clear Terminal"
+
+	// testedModel drives both the hermetic suite (the fake upstream echoes it)
+	// and the live suite, so it must be a model the LIVE free tier still
+	// serves. `qwen3-coder-free` was dropped from the upstream free list and
+	// now answers 400 "Model is unavailable" (observed 2026-10-13); the live
+	// model list is what `TestLiveModels` fetches.
+	testedModel = "space-bunny-free"
+	museModel   = "muse-spark-1.3-contributor-free"
 )
 
 // chatSSE is the canned Chat Completions stream the fake upstream answers
