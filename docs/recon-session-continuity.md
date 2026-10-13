@@ -6,6 +6,14 @@ Question: request 1 sends session S1, request 2 continues the conversation
 with session S2 — does upstream error, and what happens to caching?
 Extended the same day with the `x-opencode-project` id (§ Project id).
 
+> **Scope note (added 2026-10-13).** This record asks whether _switching_
+> sessions changes admission, and the answer is still no. It predates the gate
+> finding that the upstream validates the session id's **structure** (counter
+> must be < 64) — a separate axis, measured in
+> [recon-free-tier-gate.md](recon-free-tier-gate.md). Conclusion 3's "a client
+> that changes its session id on every turn loses nothing" holds for any id the
+> gate accepts; it does not extend to _fabricating_ one.
+
 ## Method
 
 Proxy on `:8091` (real upstream), `POST /v1/chat/completions`, non-streaming.

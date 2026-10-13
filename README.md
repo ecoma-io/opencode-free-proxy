@@ -108,7 +108,7 @@ pnpm format                          # prettier over docs/workflows/configs
 | [docs/recovery-semantics.md](docs/recovery-semantics.md) | Recovery authority, failure provenance, safe egress failover, and health semantics                |
 | [docs/deployment.md](docs/deployment.md)                 | Docker, Compose, config mounts, bootstrap env, graceful shutdown, production notes                |
 | [docs/architecture.md](docs/architecture.md)             | Request pipeline, immutable generations, process-wide state lifecycles                            |
-| [docs/recon-*.md](docs/README.md)                        | Investigation records: UA chain, session continuity, mid-stream IP switches                       |
+| [docs/recon-*.md](docs/README.md)                        | Investigation records: UA chain, session continuity, mid-stream IP switches, free-tier gate       |
 
 ## Contributing
 

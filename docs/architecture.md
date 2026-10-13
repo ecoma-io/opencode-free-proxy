@@ -155,7 +155,10 @@ AGENTS.md for the porting discipline):
    normalization), header forging (`Bearer public`, compound opencode
    User-Agent synced from GitHub — passed through verbatim when the
    downstream UA is a valid ≥ 1.17 opencode client and forged otherwise) —
-   headers are rebuilt per egress attempt.
+   headers are rebuilt per egress attempt. The UA and the session id are both
+   upstream admission criteria, not decoration — the gate reads the UA version
+   (floor `1.18`) and the session id's embedded counter
+   ([recon-free-tier-gate.md](recon-free-tier-gate.md)).
 8. One logical upstream call, then a failover decision. There is no
    per-egress retry matrix: a provider response (2xx, 429, any 4xx/5xx) is
    relayed verbatim and ends the call, and the route's next egress is tried

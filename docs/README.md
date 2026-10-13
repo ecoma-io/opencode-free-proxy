@@ -17,8 +17,9 @@ source citations.
 
 Recon notes that would otherwise get lost between sessions.
 
-| File                                                       | What it covers                                                                                                                                                        |
-| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [recon-opencode-ua.md](recon-opencode-ua.md)               | How the official opencode CLI builds its compound User-Agent, the live binary capture, the per-segment version chains, and the sync design they feed                  |
-| [recon-session-continuity.md](recon-session-continuity.md) | Live upstream check: continuation requests with different session / project ids — error behavior, server-side memory, validation, and prompt-cache keying             |
-| [recon-ip-switch.md](recon-ip-switch.md)                   | Live upstream check: one conversation continued across a mid-stream egress IP change with fully rotated identity — blocking behavior, continuity, prompt-cache keying |
+| File                                                       | What it covers                                                                                                                                                             |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [recon-opencode-ua.md](recon-opencode-ua.md)               | How the official opencode CLI builds its compound User-Agent, the live binary capture, the per-segment version chains, and the sync design they feed                       |
+| [recon-session-continuity.md](recon-session-continuity.md) | Live upstream check: continuation requests with different session / project ids — error behavior, server-side memory, validation, and prompt-cache keying                  |
+| [recon-ip-switch.md](recon-ip-switch.md)                   | Live upstream check: one conversation continued across a mid-stream egress IP change with fully rotated identity — blocking behavior, continuity, prompt-cache keying      |
+| [recon-free-tier-gate.md](recon-free-tier-gate.md)         | Live upstream check: what the free-tier gate actually validates — the session-id counter limit, the moved `1.18` version floor, and which forged signals stopped mattering |

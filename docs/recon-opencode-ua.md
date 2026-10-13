@@ -5,6 +5,15 @@ how each version segment is sourced, and how this proxy replicates and syncs
 it. Sources pinned to tag **v1.18.31** (commit `014614d`, `release: v1.18.31`)
 of `anomalyco/opencode`; live capture 2026-09-20.
 
+> **Superseded in part (2026-10-13).** The free-tier **version floor moved
+> from `1.17` to `1.18`** (`426 UpgradeRequired`), and the 2.x-era client no
+> longer sends a compound UA at all — it sends `opencode/latest/2.0.27/cli`.
+> The compound form is still accepted, and only the leading version is read
+> for admission, so everything below remains valid as a description of what we
+> forge and why parity was pursued; it is no longer a description of the
+> current client's wire form. See
+> [recon-free-tier-gate.md](recon-free-tier-gate.md) for the measurements.
+
 ## 1. The wire form
 
 ```
@@ -118,6 +127,13 @@ runtime/bun/1.3.14` — byte-identical to the capture. This is the "chosen
   checks `opencode/≥1.17` + `stream:true` + the fingerprint quartet — the
   ai-sdk/bun segments are parity fidelity, not admission criteria (requests
   with either 4.0.23 or 4.0.40 pass upstream).
+
+  Two corrections from 2026-10-13, both measured
+  ([recon-free-tier-gate.md](recon-free-tier-gate.md)): the floor is **`1.18`**,
+  not 1.17 (`426 UpgradeRequired` below it — so a downstream 1.17.x client is
+  currently forwarded verbatim and relayed as a 426), and the gate also reads
+  the **session id's counter field**, which this note never covered because it
+  was not a UA question.
 
 ## 6. Re-verification commands
 

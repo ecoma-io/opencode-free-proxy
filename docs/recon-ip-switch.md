@@ -10,6 +10,14 @@ the opencode free tier block, error, or degrade the conversation?
 aggregate), UA triple `opencode/1.18.31 ai-sdk/provider-utils/4.0.23
 runtime/bun/1.3.14` (live sync).
 
+> **Later findings (2026-10-13).** This record answers whether an IP switch
+> breaks a conversation, and the answer is no. Two upstream changes since then
+> qualify the context without contradicting it: the free-tier UA floor moved
+> to `1.18`, and the gate began validating the session id's 12-bit counter
+> (< 64). Both apply equally to every turn here, so the identity-rotation
+> design exercised here remains valid. See
+> [recon-free-tier-gate.md](recon-free-tier-gate.md).
+
 ## Method
 
 Real proxy binary in the loop, egress chosen per request:
