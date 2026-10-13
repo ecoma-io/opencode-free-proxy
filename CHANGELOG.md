@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.11.0...v0.11.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* new opencode fingerprinting mechanism ([4fa6952](https://github.com/ecoma-io/opencode-free-proxy/commit/4fa69522738d71d4b6659f40ba60f7a932adebcb))
+
 ## [0.11.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.10.0...v0.11.0) (2026-09-30)
 
 
