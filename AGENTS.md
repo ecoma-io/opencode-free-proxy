@@ -258,6 +258,17 @@ bool)`, with `Selection.Resolve()` telling the caller only what to dial.
    flag, `formatDataLine`'s key re-serialization order differs (Go sorts map
    keys — semantics unchanged). If you can't articulate why Go differs, Go
    is wrong.
+   **An upstream behaviour change is also a divergence**, and the JS source
+   may be broken against current upstream too — say so explicitly rather than
+   "fixing" the port into agreement or leaving the port broken in silence.
+   `identity.TranslateSessionID` is the worked example: the free-tier gate
+   now validates the session id's 12-bit counter (must be < 64, measured
+   live 2026-10-13, docs/recon-free-tier-gate.md), so the JS's
+   hash-into-prefix mapping (`opencode.js:97`) is rejected on ~63/64 of
+   sessions. We keep the hash's high bits for stickiness and force the low
+   12 to the legal encoding. **A divergence caused by upstream drift must cite
+   the measurement, and must be re-checked when the upstream changes** — the
+   next drift will present as a blanket 403 with no local signal.
 5. **Behavioral changes need JS evidence.** Before "fixing" relay/pipeline
    behavior, read the matching 9router code and cite it — the weirdness is
    usually load-bearing (double `[DONE]` on chat→chat, `data: null` drops,
