@@ -114,22 +114,23 @@ func TranslateSessionID(sessionID, clientTool string) string {
 		tool = "generic"
 	}
 	sum := sha256.Sum256([]byte("opencode\x00" + tool + "\x00" + sessionID))
-	// DIVERGENCE (upstream change, 2026-10-13): opencode.ai's free-tier gate no
-	// longer checks the session id's SHAPE — it decodes the 12 hex chars back
-	// into `~(millis*0x1000 + counter)` and rejects any id whose 12-bit
-	// counter is >= 64 (bits 6..11 must be zero; measured live against
-	// /zen/v1/chat/completions, deterministic). A raw sha256 prefix carries
-	// random bits there, so ~63/64 of hash-derived sessions were rejected
-	// with 403 FreeTierError on every model.
+	// DIVERGENCE (upstream change, 2026-10-13): opencode.ai's free-tier gate
+	// no longer checks only the session id's SHAPE — it decodes the 12 hex
+	// chars back into `~(millis*0x1000 + counter)` and rejects any id whose
+	// 12-bit counter is >= 64 (measured live against both /zen/v1 endpoints,
+	// deterministic; docs/recon-free-tier-gate.md). A raw sha256 prefix
+	// carries random bits there, so ~63/64 of hash-derived sessions were
+	// rejected with 403 FreeTierError on every model. The millisecond field
+	// next to it is NOT validated (+/-365 days all pass).
 	//
-	// The JS source (opencode.js:97, `digest.subarray(0,6).toString("hex")`)
-	// has the same shape and is now broken upstream too — this is an upstream
-	// behaviour change, not a porting error.
+	// The JS source (open-sse/executors/opencode.js:97,
+	// `digest.subarray(0, 6).toString("hex")`) has the same shape and is now
+	// broken upstream too — an upstream behaviour change, not a porting error.
 	//
 	// Fix: keep the 36 high bits hash-derived (they carry the stickiness) and
 	// force the 12 low bits to the legal `~1` counter encoding, so the id is
 	// byte-identical to what generateSessionId emits for its first call in a
-	// millisecond.
+	// millisecond. Pinned by TestTranslateSessionIDCounterUnderUpstreamGateLimit.
 	var w [8]byte
 	copy(w[2:], sum[:6])
 	x := binary.BigEndian.Uint64(w[:])
