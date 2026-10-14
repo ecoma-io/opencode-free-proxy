@@ -99,8 +99,8 @@
 #                      (internal/config/config.go). Must be an absolute
 #                      http/https URL with a host; trailing slashes are
 #                      normalized at Resolve. Every request endpoint
-#                      (/zen/v1/chat/completions, /zen/v1/responses,
-#                      /zen/v1/models) derives from it — no other URL
+#                      (/inference/v1/chat/completions, /inference/v1/responses,
+#                      /inference/v1/models) derives from it — no other URL
 #                      appears in config or code.
 #
 # user_agent           the opencode free-tier gate reads a compound
@@ -226,7 +226,7 @@ health:
   cooldown: 45s # then the egress is unschedulable for 45s
 
 upstream:
-  # The OpenCode Zen free-tier root; every /zen/v1/... endpoint derives from
+  # The OpenCode free-tier root; every /inference/v1/... endpoint derives from
   # it. Trailing slashes would be normalized — keep it canonical anyway.
   base: https://opencode.ai
 

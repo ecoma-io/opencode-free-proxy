@@ -284,7 +284,7 @@ func TestChatStreamingPassthrough(t *testing.T) {
 		t.Fatalf("expected exactly 1 upstream call, got %d", rec.count())
 	}
 	call := rec.snapshot()[0]
-	if call.Path != "/zen/v1/chat/completions" {
+	if call.Path != config.ZenChatPath {
 		t.Fatalf("upstream path = %q", call.Path)
 	}
 	h := call.Header
@@ -306,8 +306,16 @@ func TestChatStreamingPassthrough(t *testing.T) {
 	if sess := h.Get("X-Opencode-Session"); !sessionRe.MatchString(sess) {
 		t.Fatalf("x-opencode-session = %q, want a valid opencode session id", sess)
 	}
-	if reqID := h.Get("X-Opencode-Request"); !requestRe.MatchString(reqID) {
-		t.Fatalf("x-opencode-request = %q, want a valid opencode request id", reqID)
+	if sess := h.Get("X-Opencode-Session-Id"); sess != h.Get("X-Opencode-Session") {
+		t.Fatalf("x-opencode-session-id = %q, want the session mirrored (the gate reads both)", sess)
+	}
+	// The v1-era header is never sent: any value under it is a free-tier
+	// rejection upstream (measured 2026-10-15, docs/recon-free-tier-gate.md).
+	if v := h.Get("X-Opencode-Request"); v != "" {
+		t.Fatalf("x-opencode-request = %q, want the legacy header omitted", v)
+	}
+	if reqID := h.Get("X-Opencode-Request-Id"); !requestRe.MatchString(reqID) {
+		t.Fatalf("x-opencode-request-id = %q, want a valid opencode request id", reqID)
 	}
 
 	body := jobj(t, mustJSON(t, call.Body), "upstream body")
@@ -318,7 +326,7 @@ func TestChatStreamingPassthrough(t *testing.T) {
 		t.Fatalf("upstream model = %v, want the oc/ alias stripped", body["model"])
 	}
 	names := toolNames(t, body)
-	if !reflect.DeepEqual(names, []string{"bash", "glob", "grep", "read"}) {
+	if !reflect.DeepEqual(names, []string{"shell", "glob", "grep", "read"}) {
 		t.Fatalf("upstream tools = %v, want the fingerprint quartet", names)
 	}
 	if body["tool_choice"] != "none" {
@@ -441,7 +449,7 @@ func TestUpstreamErrorPassthrough(t *testing.T) {
 
 // TestMuseSparkTranslateToChatClient: chat client + muse-spark model →
 // STREAM_MODE translate (responses upstream → chat client). The upstream call
-// goes to /zen/v1/responses with the Responses body shape; the client sees
+// goes to /inference/v1/responses with the Responses body shape; the client sees
 // chat chunks and — JS translate-mode parity — NO [DONE] sentinel.
 func TestMuseSparkTranslateToChatClient(t *testing.T) {
 	rec := &upstreamRecorder{}
@@ -479,13 +487,13 @@ func TestMuseSparkTranslateToChatClient(t *testing.T) {
 		t.Fatalf("chat chunk id = %q, want the chatcmpl- prefix", id)
 	}
 
-	// ---- upstream request: the muse model routes to /zen/v1/responses.
+	// ---- upstream request: the muse model routes to the Responses path.
 	if rec.count() != 1 {
 		t.Fatalf("expected 1 upstream call, got %d", rec.count())
 	}
 	call := rec.snapshot()[0]
-	if call.Path != "/zen/v1/responses" {
-		t.Fatalf("upstream path = %q, want /zen/v1/responses", call.Path)
+	if call.Path != config.ZenResponsesPath {
+		t.Fatalf("upstream path = %q, want the Responses path", call.Path)
 	}
 	body := mustJSON(t, call.Body)
 	if jstr(t, body["model"], "model") != "muse-spark-1.2-contributor-free" {
@@ -541,14 +549,14 @@ func TestMuseSparkResponsesPassthrough(t *testing.T) {
 	}
 
 	call := rec.snapshot()[0]
-	if call.Path != "/zen/v1/responses" {
+	if call.Path != config.ZenResponsesPath {
 		t.Fatalf("upstream path = %q", call.Path)
 	}
 	body := mustJSON(t, call.Body)
 	if jstr(t, body["model"], "model") != "muse-spark-1.2-contributor-free" {
 		t.Fatalf("upstream model = %v", body["model"])
 	}
-	if names := toolNames(t, body); !reflect.DeepEqual(names, []string{"bash", "glob", "grep", "read"}) {
+	if names := toolNames(t, body); !reflect.DeepEqual(names, []string{"shell", "glob", "grep", "read"}) {
 		t.Fatalf("upstream tools = %v, want the flat fingerprint quartet", names)
 	}
 	if body["tool_choice"] != "auto" {
@@ -638,8 +646,8 @@ func TestResponsesClientChatModelTranslate(t *testing.T) {
 
 	// ---- upstream request: chat model stays on /chat/completions.
 	call := rec.snapshot()[0]
-	if call.Path != "/zen/v1/chat/completions" {
-		t.Fatalf("upstream path = %q, want /zen/v1/chat/completions", call.Path)
+	if call.Path != config.ZenChatPath {
+		t.Fatalf("upstream path = %q, want the chat path", call.Path)
 	}
 	body := mustJSON(t, call.Body)
 	messages := jarr(t, body["messages"], "messages")
@@ -664,7 +672,7 @@ func TestResponsesClientChatModelTranslate(t *testing.T) {
 	if jstr(t, body["model"], "model") != "qwen3-coder-free" {
 		t.Fatalf("upstream model = %v", body["model"])
 	}
-	if names := toolNames(t, body); !reflect.DeepEqual(names, []string{"bash", "glob", "grep", "read"}) {
+	if names := toolNames(t, body); !reflect.DeepEqual(names, []string{"shell", "glob", "grep", "read"}) {
 		t.Fatalf("upstream tools = %v, want the chat-shaped quartet", names)
 	}
 }
@@ -770,7 +778,7 @@ func TestModelAliasAndThinkingSuffix(t *testing.T) {
 				t.Fatalf("%s: status = %d, body %s", tc.suffix, res.Code, res.Body.String())
 			}
 			call := rec.snapshot()[rec.count()-1]
-			if call.Path != "/zen/v1/responses" {
+			if call.Path != config.ZenResponsesPath {
 				t.Fatalf("%s: upstream path = %q", tc.suffix, call.Path)
 			}
 			body := mustJSON(t, call.Body)
@@ -797,10 +805,11 @@ func TestDownstreamCapture(t *testing.T) {
 		res := postJSON(t, mux, "/v1/chat/completions",
 			`{"model":"qwen3-coder-free","messages":[{"role":"user","content":"hi"}],"stream":false}`,
 			map[string]string{
-				"User-Agent":         "opencode/1.19.0",
-				"X-Opencode-Client":  "cli",
-				"X-Opencode-Request": "msg_downstream00000000",
-				"X-Opencode-Project": "team-x",
+				"User-Agent":            "opencode/1.19.0",
+				"X-Opencode-Client":     "cli",
+				"X-Opencode-Request-Id": "msg_downstream00000000",
+				"X-Opencode-Request":    "msg_legacy0000000000",
+				"X-Opencode-Project":    "team-x",
 			})
 		if res.Code != 200 {
 			t.Fatalf("status = %d, body %s", res.Code, res.Body.String())
@@ -812,8 +821,13 @@ func TestDownstreamCapture(t *testing.T) {
 		if got := h.Get("X-Opencode-Client"); got != "cli" {
 			t.Fatalf("x-opencode-client = %q, want the downstream passthrough", got)
 		}
-		if got := h.Get("X-Opencode-Request"); got != "msg_downstream00000000" {
-			t.Fatalf("x-opencode-request = %q, want the downstream passthrough", got)
+		if got := h.Get("X-Opencode-Request-Id"); got != "msg_downstream00000000" {
+			t.Fatalf("x-opencode-request-id = %q, want the downstream passthrough", got)
+		}
+		// A downstream legacy header is dropped, never echoed: upstream
+		// refuses any value under it.
+		if got := h.Get("X-Opencode-Request"); got != "" {
+			t.Fatalf("x-opencode-request = %q, want the legacy header dropped", got)
 		}
 		if got := h.Get("X-Opencode-Project"); got != "team-x" {
 			t.Fatalf("x-opencode-project = %q, want the downstream passthrough", got)

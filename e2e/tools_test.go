@@ -66,8 +66,8 @@ func claudeCodeTools() []any {
 // TestClaudeCodeToolsDedupedAndFingerprinted: the claude persona's WebSearch/
 // WebFetch are dropped because the Exa MCP tool is present, every other tool
 // survives verbatim, and the lowercase fingerprint quartet is injected — the
-// client's capitalized "Bash" does NOT satisfy the gate, so "bash" must be
-// added alongside it.
+// client's capitalized "Bash" does NOT satisfy the gate, so "shell" (the v2
+// command tool) must be added alongside it.
 func TestClaudeCodeToolsDedupedAndFingerprinted(t *testing.T) {
 	resp := postChat(t, map[string]any{
 		"model":    testedModel,
@@ -91,7 +91,7 @@ func TestClaudeCodeToolsDedupedAndFingerprinted(t *testing.T) {
 			t.Fatalf("client tool %q was dropped; upstream tools = %v", kept, names)
 		}
 	}
-	for _, fp := range []string{"bash", "glob", "grep", "read"} {
+	for _, fp := range []string{"shell", "glob", "grep", "read"} {
 		if !names[fp] {
 			t.Fatalf("fingerprint %q missing; upstream tools = %v", fp, names)
 		}
@@ -134,7 +134,7 @@ func TestNonClaudeClientToolsKept(t *testing.T) {
 	}, setUpstreamUA(t, "opencode/1.18.31"))
 	defer resp.Body.Close()
 	names := upstreamToolNames(t, "chat")
-	for _, want := range []string{"WebSearch", "WebFetch", "mcp__exa__web_search_exa", "Bash", "bash", "glob", "grep", "read"} {
+	for _, want := range []string{"WebSearch", "WebFetch", "mcp__exa__web_search_exa", "Bash", "shell", "glob", "grep", "read"} {
 		if !names[want] {
 			t.Fatalf("tool %q missing from non-claude client's upstream tools = %v", want, names)
 		}
@@ -156,6 +156,75 @@ func TestPlainChatGetsQuartetAndNoneChoice(t *testing.T) {
 	}
 }
 
+// TestFingerprintToolsCarryRealSchemas: the gate READS the injected tools'
+// parameter schemas — four declarations with an empty `properties` map are
+// refused upstream with 403 FreeTierError (measured 2026-10-15, see
+// docs/recon-free-tier-gate.md). Pinned black-box so the injection cannot
+// silently regress back to name-only declarations.
+func TestFingerprintToolsCarryRealSchemas(t *testing.T) {
+	resp := postChat(t, chatBody(testedModel), nil)
+	defer resp.Body.Close()
+
+	tools, _ := fake.lastChatBody()["tools"].([]any)
+	if len(tools) != 4 {
+		t.Fatalf("upstream tools = %d, want the quartet", len(tools))
+	}
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		params, _ := fn["parameters"].(map[string]any)
+		if params["type"] != "object" {
+			t.Errorf("tool %q parameters type = %v, want object", name, params["type"])
+		}
+		props, _ := params["properties"].(map[string]any)
+		if len(props) == 0 {
+			t.Errorf("tool %q declares no parameters — the gate refuses empty schemas", name)
+		}
+	}
+}
+
+// TestGateHeaderContract: both session headers travel with the same value,
+// the v2 request-id header carries a forged id, and the v1-era
+// x-opencode-request is never emitted (any value under it is a free-tier
+// rejection upstream). Measured 2026-10-15, docs/recon-free-tier-gate.md.
+func TestGateHeaderContract(t *testing.T) {
+	resp := postChat(t, chatBody(testedModel), nil)
+	defer resp.Body.Close()
+
+	session := fake.upstreamHeader(t, "x-opencode-session")
+	if session == "" {
+		t.Fatal("x-opencode-session missing upstream")
+	}
+	if got := fake.upstreamHeader(t, "x-opencode-session-id"); got != session {
+		t.Errorf("x-opencode-session-id = %q, want the session mirrored (%q)", got, session)
+	}
+	if got := fake.upstreamHeader(t, "x-opencode-request"); got != "" {
+		t.Errorf("x-opencode-request = %q, want the legacy header omitted", got)
+	}
+	if got := fake.upstreamHeader(t, "x-opencode-request-id"); got == "" {
+		t.Error("x-opencode-request-id missing upstream")
+	}
+}
+
+// A legacy client that sends the v1 request header must not have it echoed:
+// upstream refuses it, so forwarding it would 403 a request this proxy could
+// have served.
+func TestLegacyRequestHeaderIsNotEchoed(t *testing.T) {
+	req := chatBody(testedModel)
+	resp := postChat(t, req, func(r *http.Request) {
+		r.Header.Set("X-Opencode-Request", "msg_legacy0000000000")
+	})
+	defer resp.Body.Close()
+
+	if got := fake.upstreamHeader(t, "x-opencode-request"); got != "" {
+		t.Fatalf("x-opencode-request = %q, want the downstream legacy header dropped", got)
+	}
+	if got := fake.upstreamHeader(t, "x-opencode-request-id"); got == "" {
+		t.Error("x-opencode-request-id missing, want a forged id")
+	}
+}
+
 // TestMuseChatClientUpstreamResponsesShape: a CHAT-format client asking a
 // muse-spark model is translated to the Responses API upstream — messages
 // become input items, tools flatten to the responses shape, tool_choice is
@@ -174,7 +243,7 @@ func TestMuseChatClientUpstreamResponsesShape(t *testing.T) {
 	}
 	up := fake.lastRespBody()
 	if up == nil {
-		t.Fatal("muse request did not reach /zen/v1/responses")
+		t.Fatal("muse request did not reach the Responses path")
 	}
 	if up["tool_choice"] != "auto" {
 		t.Fatalf("upstream tool_choice = %v, want auto (muse is auto-only)", up["tool_choice"])

@@ -10,22 +10,30 @@ import (
 	"time"
 )
 
-// Upstream (OpenCode Zen free tier).
+// Upstream (the OpenCode inference gateway, free tier).
 const (
 	UpstreamBase = "https://opencode.ai"
 
-	// Upstream gate (verified live 2026-09-18, see 9router executors/opencode.js):
-	// /zen/v1/chat/completions and /zen/v1/responses with `Authorization: Bearer
-	// public` reject requests that do not look like the official OpenCode
-	// agentic client. stream must be true; tools must include the fingerprint
-	// quartet; User-Agent must look like opencode >= 1.17.
-	// Zen* paths are the request suffixes on the CONFIGURED upstream base
-	// (the OCFP_CONFIG upstream.base, default https://opencode.ai); request
-	// URLs are never absolute outside this const set (upstream.BuildURL,
-	// models.go, cloak).
-	ZenChatPath      = "/zen/v1/chat/completions"
-	ZenResponsesPath = "/zen/v1/responses"
-	ZenModelsPath    = "/zen/v1/models"
+	// Upstream gate (measured live 2026-09-18, re-measured 2026-10-15 against
+	// the inference backend, see docs/recon-free-tier-gate.md):
+	// /inference/v1/chat/completions and /inference/v1/responses with
+	// `Authorization: Bearer public` reject requests that do not look like the
+	// official OpenCode agentic client. `stream` must be true; `tools` must
+	// carry the fingerprint quartet WITH real parameter schemas; the session id
+	// must travel under BOTH x-opencode-session and x-opencode-session-id; the
+	// v1-era `x-opencode-request` header is refused outright (any value);
+	// User-Agent must carry `opencode/` with a version >= 1.18.0.
+	//
+	// These const names keep the `Zen*` prefix they had when the paths were
+	// `/zen/v1/*`; the VALUE moved on 2026-10-15 when upstream retired /zen/*
+	// (it now answers 403 FreeTierError for every identity, the official
+	// client's included) and pointed the client at `/inference/v1`. They are
+	// request suffixes on the CONFIGURED upstream base (the OCFP_CONFIG
+	// upstream.base, default https://opencode.ai); request URLs are never
+	// absolute outside this const set (upstream.BuildURL, models.go, cloak).
+	ZenChatPath      = "/inference/v1/chat/completions"
+	ZenResponsesPath = "/inference/v1/responses"
+	ZenModelsPath    = "/inference/v1/models"
 	PublicBearer     = "public"
 
 	// Free-model selection (mirrors src/app/api/providers/suggested-models/filters.js).
@@ -39,19 +47,21 @@ const (
 const (
 	// Used when the GitHub release lookup fails or the cache is cold.
 	ClientFallbackVersion = "1.18.31"
-	// Upstream rejects User-Agent versions below opencode/1.17.x (426/403).
+	// Upstream rejects User-Agent versions below opencode/1.18.0.
 	//
-	// KNOWN DRIFT (measured live 2026-10-13): the floor is now 1.18, not 1.17 —
-	// a 1.17.x UA is answered 426 UpgradeRequired ("OpenCode 1.18.0 or newer is
-	// required to use the free tier"), and the version gate is evaluated BEFORE
-	// the free-tier gate (a 1.17 UA with a bad session id returns 403, not
-	// 426). Left at 17 deliberately: raising it widens the forge-vs-forward
-	// boundary in BuildHeaders, which is a separate decision with its own test
-	// update. Consequence today: a downstream client sending an
-	// `opencode/1.17.x` UA is forwarded verbatim and gets a relayed 426.
-	// See docs/recon-free-tier-gate.md.
+	// MEASURED live 2026-10-15 on the /inference/v1 gate (and again on
+	// /zen/v1 on 2026-10-13): `opencode/1.17.x` is answered 426
+	// UpgradeRequired ("OpenCode 1.18.0 or newer is required to use the free
+	// tier"), 1.18.0 and up are admitted, and the version gate is evaluated
+	// BEFORE the free-tier gate (a 1.17 UA with a bad session id returns 403
+	// under the old endpoint, but a legal one returns 426). A UA with no
+	// numeric version at all (`opencode/latest`, `python-requests/2.0`) is a
+	// 403, not a 426 — a different rejection path, worth knowing when reading
+	// logs. Raised from 17 to 18 so a 1.17-era opencode client FORGES the
+	// current identity instead of having its too-old UA forwarded verbatim and
+	// the upstream 426 relayed as-is. See docs/recon-free-tier-gate.md.
 	ClientMinMajor    = 1
-	ClientMinMinor    = 17
+	ClientMinMinor    = 18
 	GitHubReleasesURL = "https://api.github.com/repos/anomalyco/opencode/releases/latest"
 	VersionCacheTTL   = 12 * time.Hour
 
@@ -91,7 +101,7 @@ const (
 	UASyncInterval = time.Hour
 )
 
-// Muse Spark free models are served by /zen/v1/responses (OpenAI Responses
+// Muse Spark free models are served by the Responses endpoint (OpenAI Responses
 // API); every other model stays on /chat/completions. Declared per-model, not
 // per-provider (mirrors providers/registry/opencode.js).
 const ResponsesURLModelsPattern = `(?i)^muse[-_]?spark(?:$|[-_:.\s])`
@@ -105,7 +115,97 @@ var ForceAutoToolChoiceModels = map[string]bool{
 }
 
 // Fingerprint quartet the free-tier gate demands in body.tools.
-var FingerprintTools = []string{"bash", "glob", "grep", "read"}
+//
+// MEASURED 2026-10-15 against the /inference/v1 gate (docs/recon-free-tier-gate.md):
+// the quartet is still four tools, but two facts changed with opencode v2.
+//
+//   - The command tool is named `shell`, not `bash`. Either name is accepted
+//     today (`bash` still passes), but `shell` is what the official v2 client
+//     sends, so it is what we forge.
+//   - The gate now reads the tool SCHEMAS: four declarations with empty
+//     `properties` are refused with 403 FreeTierError, and dropping the
+//     command tool from the quartet is refused too. Descriptions are not
+//     read (blanking every description still passes). FingerprintToolSchemas
+//     below carries the real declarations.
+var FingerprintTools = []string{"shell", "glob", "grep", "read"}
+
+// FingerprintTool is one official OpenCode client tool declaration, reduced to
+// the fields that reach the wire: the real description and the real parameter
+// schema. Required names the properties the official client marks required.
+type FingerprintTool struct {
+	Description string
+	Properties  map[string]any
+	Required    []string
+}
+
+// FingerprintToolSchemas are the REAL tool declarations of the official client
+// at opencode v2.0.29, read from packages/core/src/tool/plugin/{shell,glob,
+// grep,read}.ts (`name`, the `description` literal and the `Input` struct
+// annotations) with the field types from packages/core/src/filesystem.ts
+// (GlobInput/GrepInput) and tool/read-filesystem.ts (PageInput).
+//
+// KNOWN DRIFT: these track an upstream release and change with it. The gate
+// reads schemas, so a release that reshapes these can start refusing requests
+// that were accepted before — re-read the sources at the new tag and update
+// here. The field types are spelled as JSON Schema; the client derives them
+// from Effect Schema at serialize time.
+var FingerprintToolSchemas = map[string]FingerprintTool{
+	"shell": {
+		Description: "Execute a shell command and return its output. " +
+			"Quote file paths containing spaces or special characters. " +
+			"Prefer dedicated tools over shell commands when possible. " +
+			"When output is large, the full result is saved to a file and a truncated preview is returned. " +
+			"Rely on automatic truncation unless filtering the output is more useful. " +
+			"Commands accept an optional timeout, background commands have no timeout by default. " +
+			"Background commands return immediately, and you will be notified when they complete.",
+		Properties: map[string]any{
+			"command":    map[string]any{"type": "string", "description": "Shell command string to execute"},
+			"workdir":    map[string]any{"type": "string", "description": "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead."},
+			"timeout":    map[string]any{"type": "integer", "description": "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default."},
+			"background": map[string]any{"type": "boolean", "description": "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion."},
+		},
+		Required: []string{"command"},
+	},
+	"glob": {
+		Description: `Search file paths using a glob pattern (examples: "**/*.ts", "src/**/*.tsx").`,
+		Properties: map[string]any{
+			"pattern": map[string]any{"type": "string", "description": "Glob pattern to match files against"},
+			"path":    map[string]any{"type": "string", "description": "Directory to search. Defaults to the current working directory."},
+			"hidden":  map[string]any{"type": "boolean", "description": "Include hidden files and directories (default: false)."},
+			"limit":   map[string]any{"type": "integer", "description": "Maximum number of matching files to return (default: 100)"},
+		},
+		Required: []string{"pattern"},
+	},
+	"grep": {
+		Description: "Search file contents using ripgrep's regular expression syntax or literal text matching. " +
+			"Use it to locate specific code, symbols, or text patterns, and narrow searches with `path` or `include`. " +
+			"Returns matching file paths, line numbers, and line previews.",
+		Properties: map[string]any{
+			"pattern":       map[string]any{"type": "string", "description": "Regular expression or literal text to match in file contents."},
+			"path":          map[string]any{"type": "string", "description": "File or directory to search. Defaults to the current working directory."},
+			"include":       map[string]any{"type": "string", "description": `Glob pattern to filter files (for example, "*.js" or "*.{ts,tsx}")`},
+			"literal":       map[string]any{"type": "boolean", "description": "Treat `pattern` as exact text instead of a regular expression (default: false)."},
+			"caseSensitive": map[string]any{"type": "boolean", "description": "Use case-sensitive matching (default: true)."},
+			"limit":         map[string]any{"type": "integer", "description": "Maximum number of matching lines to return (default: 100)"},
+		},
+		Required: []string{"pattern"},
+	},
+	"read": {
+		Description: "Read the contents of a file or directory. Supports text files, images, and PDFs. " +
+			"Images and PDFs are presented directly to the model. " +
+			"Each text line is prefixed by its 1-based line number as <line>: <content>. " +
+			"The prefix is for reference and is not part of the file content. " +
+			"Directory entries are returned one per line. " +
+			"Use offset and limit to read large files or directories in sections. " +
+			"Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+		Properties: map[string]any{
+			"path":   map[string]any{"type": "string", "description": "File or directory to read"},
+			"offset": map[string]any{"type": "integer", "description": "The line or directory entry to start reading from (1-based)"},
+			"limit":  map[string]any{"type": "integer", "description": "The maximum number of lines or directory entries to read (defaults to and capped at 2000)"},
+		},
+		Required: []string{"path"},
+	},
+}
 
 // Wire limits (Responses API).
 const (
@@ -125,7 +225,7 @@ const (
 // The header is deliberately NOT an X-OFP-* name (issue #77 retired that
 // namespace) and NOT one of the names the session resolver consumes
 // (identity/sessionresolver.go) or the executor forges
-// (upstream/executor.go x-opencode-request). It is not in captureDownstream's
+// (upstream/executor.go x-opencode-request-id). It is not in captureDownstream's
 // forwarding allow-list either, so it is never sent upstream and cannot reach
 // session stickiness, prompt caching or the session_fp pseudonym.
 const (

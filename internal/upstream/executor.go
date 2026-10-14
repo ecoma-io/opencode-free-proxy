@@ -188,13 +188,37 @@ func BuildURL(upstreamBase, model string) string {
 // is forged. stream is always true upstream.
 func BuildHeaders(d Downstream, session string, cachedUA string) map[string]string {
 	h := map[string]string{
-		"Content-Type":       "application/json",
-		"Authorization":      "Bearer " + config.PublicBearer,
-		"x-opencode-client":  "desktop",
-		"x-opencode-session": session,
-		"x-opencode-request": identity.GenerateRequestID(time.Now()),
-		"x-opencode-project": "global",
-		"Accept":             "text/event-stream",
+		"Content-Type":      "application/json",
+		"Authorization":     "Bearer " + config.PublicBearer,
+		"x-opencode-client": "desktop",
+		// The session id travels under FOUR names upstream. Measured
+		// 2026-10-15 against the /inference/v1 gate: BOTH `x-opencode-session`
+		// and `x-opencode-session-id` are required — dropping either one alone
+		// is a deterministic 403 FreeTierError, keeping only the
+		// non-opencode mirrors is not enough either. The other two mirrors
+		// (`x-session-affinity`, `x-session-id`) are not read by the current
+		// gate but are sent by the official client, so they ride along.
+		// See docs/recon-free-tier-gate.md.
+		"x-opencode-session":    session,
+		"x-opencode-session-id": session,
+		"x-session-affinity":    session,
+		"x-session-id":          session,
+		// The per-request id travels as `x-opencode-request-id`, the v2 name.
+		// The v1-era `x-opencode-request` header is REFUSED outright by the
+		// current gate: any value under it — the forged `msg_…` id, a plain
+		// hex string, even `global` — is a deterministic 403 FreeTierError,
+		// while the identical request without it is admitted. The official
+		// v2 client sends neither (packages/core/src/session/model-request.ts
+		// at v2.0.29 builds exactly the session/UA/project/client set; the
+		// Console's own proxy reads `x-opencode-request-id ?? x-opencode-
+		// request`, packages/console/app/src/lib/inference-proxy.ts), and the
+		// gate accepts `x-opencode-request-id` with any value. So the id is
+		// forged under the name the gate and the Console both understand, and
+		// the legacy header is never emitted. Measured 2026-10-15, see
+		// docs/recon-free-tier-gate.md.
+		"x-opencode-request-id": identity.GenerateRequestID(time.Now()),
+		"x-opencode-project":    "global",
+		"Accept":                "text/event-stream",
 	}
 	downstreamUA := d.Headers["user-agent"]
 	if identity.HasValidVersion(downstreamUA) {
@@ -206,8 +230,12 @@ func BuildHeaders(d Downstream, session string, cachedUA string) map[string]stri
 	if v, has := d.Headers["x-opencode-client"]; has && v != "" {
 		h["x-opencode-client"] = v
 	}
-	if v, has := d.Headers["x-opencode-request"]; has && v != "" {
-		h["x-opencode-request"] = v
+	// Only the v2 name is passable. A downstream `x-opencode-request` is
+	// deliberately NOT forwarded: it is not merely ignored upstream, it is a
+	// free-tier rejection (see above), so echoing it would turn a caller's
+	// legacy client into a 403 this proxy could have avoided.
+	if v, has := d.Headers["x-opencode-request-id"]; has && v != "" {
+		h["x-opencode-request-id"] = v
 	}
 	if v, has := d.Headers["x-opencode-project"]; has && v != "" {
 		h["x-opencode-project"] = v

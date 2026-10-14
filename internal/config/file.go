@@ -195,8 +195,8 @@ type HealthPolicy struct {
 }
 
 // Upstream names the single upstream the proxy fronts. Base is the request
-// root: every endpoint (/zen/v1/chat/completions, /zen/v1/responses,
-// /zen/v1/models) derives from it — never a hard-coded absolute URL outside
+// root: every endpoint (config.ZenChatPath, config.ZenResponsesPath,
+// config.ZenModelsPath) derives from it — never a hard-coded absolute URL outside
 // internal/config (AGENTS.md "constants live only in internal/config").
 type UpstreamConfig struct {
 	Base string `yaml:"base,omitempty"`

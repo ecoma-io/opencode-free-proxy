@@ -20,7 +20,7 @@ var UARe = regexp.MustCompile(`(?i)opencode/(\d+)\.(\d+)(?:\.(\d+))?`)
 var TagRe = regexp.MustCompile(`^v?(\d+\.\d+\.\d+)`)
 
 // HasValidVersion reports whether ua identifies an opencode client new enough
-// for the free-tier gate (>= 1.17 — below that upstream answers 426/403).
+// for the free-tier gate (>= 1.18 — below that upstream answers 426).
 // A bare "opencode" UA has no version and fails the check.
 func HasValidVersion(ua string) bool {
 	m := UARe.FindStringSubmatch(ua)

@@ -117,8 +117,10 @@ func TranslateSessionID(sessionID, clientTool string) string {
 	// DIVERGENCE (upstream change, 2026-10-13): opencode.ai's free-tier gate
 	// no longer checks only the session id's SHAPE — it decodes the 12 hex
 	// chars back into `~(millis*0x1000 + counter)` and rejects any id whose
-	// 12-bit counter is >= 64 (measured live against both /zen/v1 endpoints,
-	// deterministic; docs/recon-free-tier-gate.md). A raw sha256 prefix
+	// 12-bit counter is >= 64 (measured live 2026-10-13 against both /zen/v1
+	// endpoints and RE-measured 2026-10-15 against /inference/v1 after the
+	// upstream moved to the inference backend — unchanged and still enforced
+	// there; deterministic; docs/recon-free-tier-gate.md). A raw sha256 prefix
 	// carries random bits there, so ~63/64 of hash-derived sessions were
 	// rejected with 403 FreeTierError on every model. The millisecond field
 	// next to it is NOT validated (+/-365 days all pass).

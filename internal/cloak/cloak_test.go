@@ -99,12 +99,12 @@ func TestURL(t *testing.T) {
 		model string
 		want  string
 	}{
-		{free12, base + "/zen/v1/responses"},
-		{free13, base + "/zen/v1/responses"},
-		{"oc/" + free12 + "(high)", base + "/zen/v1/responses"},
-		{"muse-spark-1.4-contributor-free", base + "/zen/v1/responses"},
-		{"big-pickle", base + "/zen/v1/chat/completions"},
-		{"mimo-v2.5-free", base + "/zen/v1/chat/completions"},
+		{free12, base + config.ZenResponsesPath},
+		{free13, base + config.ZenResponsesPath},
+		{"oc/" + free12 + "(high)", base + config.ZenResponsesPath},
+		{"muse-spark-1.4-contributor-free", base + config.ZenResponsesPath},
+		{"big-pickle", base + config.ZenChatPath},
+		{"mimo-v2.5-free", base + config.ZenChatPath},
 	}
 	for _, tc := range cases {
 		if got := URL(base, tc.model); got != tc.want {
@@ -190,18 +190,57 @@ func TestEnsureChatFingerprintToolsInjectsQuartet(t *testing.T) {
 	if got := body["tool_choice"]; got != "none" {
 		t.Errorf("tool_choice = %v, want \"none\" for a toolless caller", got)
 	}
-	// Declared shape: chat-shape with an empty object schema.
+	// Declared shape: chat-shape carrying the REAL client parameter schema.
+	// The gate reads these schemas — four declarations with an empty
+	// `properties` map are refused upstream (measured 2026-10-15, see
+	// config.FingerprintTools).
 	tool, _ := tools[0].(map[string]any)
 	fn, _ := tool["function"].(map[string]any)
 	if tool["type"] != "function" || fn == nil {
 		t.Fatalf("injected chat tool shape = %v", tool)
 	}
-	wantParams := map[string]any{"type": "object", "properties": map[string]any{}}
-	if !reflect.DeepEqual(fn["parameters"], wantParams) {
-		t.Errorf("parameters = %v, want %v", fn["parameters"], wantParams)
+	params, _ := fn["parameters"].(map[string]any)
+	props, _ := params["properties"].(map[string]any)
+	if params["type"] != "object" || len(props) == 0 {
+		t.Errorf("parameters = %v, want a non-empty object schema (the gate reads it)", fn["parameters"])
 	}
-	if desc, _ := fn["description"].(string); desc != "OpenCode built-in bash tool" {
-		t.Errorf("description = %q, want %q", desc, "OpenCode built-in bash tool")
+	if _, has := props["command"]; !has {
+		t.Errorf("shell parameters = %v, want the real client properties", props)
+	}
+	required, _ := params["required"].([]any)
+	if len(required) != 1 || required[0] != "command" {
+		t.Errorf("required = %v, want [command]", params["required"])
+	}
+	want := config.FingerprintToolSchemas["shell"].Description
+	if desc, _ := fn["description"].(string); desc != want {
+		t.Errorf("description = %q, want the real client text %q", desc, want)
+	}
+}
+
+// Every fingerprint name the injector reaches for must carry a real schema:
+// a missing entry would silently degrade to the empty object schema the gate
+// refuses, which is exactly the 2026-10-15 regression.
+func TestFingerprintToolsHaveSchemas(t *testing.T) {
+	for _, name := range config.FingerprintTools {
+		def, ok := config.FingerprintToolSchemas[name]
+		if !ok {
+			t.Errorf("fingerprint tool %q has no schema entry", name)
+			continue
+		}
+		if len(def.Properties) == 0 {
+			t.Errorf("fingerprint tool %q has no parameters", name)
+		}
+		if def.Description == "" {
+			t.Errorf("fingerprint tool %q has no description", name)
+		}
+		if len(def.Required) == 0 {
+			t.Errorf("fingerprint tool %q declares no required property", name)
+		}
+		for _, r := range def.Required {
+			if _, has := def.Properties[r]; !has {
+				t.Errorf("fingerprint tool %q requires %q, which is not a declared property", name, r)
+			}
+		}
 	}
 }
 
@@ -324,15 +363,19 @@ func TestEnsureResponsesFingerprintTools(t *testing.T) {
 	EnsureResponsesFingerprintTools(body)
 
 	names := toolNames(body["tools"].([]any), true)
-	if !reflect.DeepEqual(names, []string{"bash", "glob", "grep", "read"}) {
+	if !reflect.DeepEqual(names, []string{"shell", "glob", "grep", "read"}) {
 		t.Errorf("tools = %v, want the quartet in order", names)
 	}
 	if body["tool_choice"] != "auto" {
 		t.Errorf("tool_choice = %v, want \"auto\"", body["tool_choice"])
 	}
 	tool, _ := body["tools"].([]any)[0].(map[string]any)
-	if tool["type"] != "function" || tool["name"] != "bash" {
+	if tool["type"] != "function" || tool["name"] != "shell" {
 		t.Errorf("flat tool shape = %v", tool)
+	}
+	params, _ := tool["parameters"].(map[string]any)
+	if props, _ := params["properties"].(map[string]any); len(props) == 0 {
+		t.Errorf("flat tool parameters = %v, want a non-empty object schema", tool["parameters"])
 	}
 }
 
@@ -353,7 +396,7 @@ func TestEnsureResponsesFingerprintToolsCallerTools(t *testing.T) {
 	for _, tool := range tools {
 		names = append(names, anyToolName(tool))
 	}
-	want := []string{"get_weather", "read", "bash", "glob", "grep"}
+	want := []string{"get_weather", "read", "shell", "glob", "grep"}
 	if !reflect.DeepEqual(names, want) {
 		t.Errorf("tools = %v, want %v (missing members only, no duplicates)", names, want)
 	}

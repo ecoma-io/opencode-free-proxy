@@ -413,7 +413,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, sourceFormat rela
 	url := upstream.BuildURL(rt.UpstreamBase(), upstreamModel)
 	reqCtx, cancelUpstream := context.WithCancel(r.Context())
 	// base.js re-invokes transformRequest+buildHeaders on every URL attempt, so
-	// a forged x-opencode-request id is fresh each time; the closure is what
+	// a forged x-opencode-request-id id is fresh each time; the closure is what
 	// the client calls once per egress attempt.
 	buildHeaders := func() map[string]string {
 		return upstream.BuildHeaders(downstream, session, s.UA.Get())
@@ -505,7 +505,13 @@ func captureDownstream(r *http.Request) upstream.Downstream {
 	h := map[string]string{}
 	for _, name := range []string{
 		"User-Agent", "X-Opencode-Client", "X-Opencode-Session",
-		"X-Opencode-Request", "X-Opencode-Project",
+		// Only the v2 request-id name is captured: BuildHeaders forwards it,
+		// and nothing else consumes the v1-era `X-Opencode-Request` — dropping
+		// it from this list removes the last way a legacy header could reach
+		// the wire, where upstream refuses any value under it (see
+		// upstream.BuildHeaders).
+		"X-Opencode-Request-Id",
+		"X-Opencode-Project",
 		"X-Session-Id", "Session-Id", "Session_id", "X-Amp-Thread-Id",
 		"X-Claude-Code-Session-Id", "X-Client-Request-Id",
 		"X-App", // clientDetector.js x-app — claude-client detection input

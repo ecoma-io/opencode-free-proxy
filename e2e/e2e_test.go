@@ -3,10 +3,11 @@
 // Package e2e holds black-box end-to-end tests: the real server binary is
 // compiled, launched as a subprocess with its service settings (upstream
 // base) in an OCFP_CONFIG document pointing at a fake
-// OpenCode Zen upstream, and then spoken
+// OpenCode inference upstream, and then spoken
 // to over HTTP exactly like an external client. Nothing is imported from
-// internal/ except small JSON helpers and read-only config constants (test
-// budget math only, timeouts_test.go) — every assertion goes through the wire.
+// internal/ except small JSON helpers and read-only config constants (the
+// upstream path constants the fake upstream routes on, and test budget math
+// only, timeouts_test.go) — every assertion goes through the wire.
 //
 // These tests are behind the `e2e` build tag so the default `go test ./...`
 // (offline unit suite) never builds them. Run with:
@@ -35,6 +36,7 @@ import (
 	"testing"
 	"time"
 
+	"opencode-free-proxy/internal/config"
 	"opencode-free-proxy/internal/jsonx"
 )
 
@@ -78,7 +80,8 @@ const responsesSSE = "event: response.created\n" +
 	"\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n" +
 	"data: [DONE]\n\n"
 
-// fakeUpstream is a stand-in for https://opencode.ai/zen/v1: it mirrors the
+// fakeUpstream is a stand-in for the opencode inference gateway
+// (config.ZenChatPath and friends): it mirrors the
 // real free-tier gate closely enough to catch wiring regressions (stream must
 // be true, the UA must look like opencode, Bearer public auth) and records
 // every request for per-test assertions.
@@ -93,11 +96,17 @@ type fakeUpstream struct {
 	lastUA      string
 	lastSession string
 	lastClient  string
-	lastChat    map[string]any
-	lastResp    map[string]any
-	chatReply   string // settable canned chat SSE ("" = chatSSE default)
-	respReply   string // settable canned responses SSE ("" = responsesSSE default)
-	override    int    // when non-zero, chat/responses answer this status
+	// The gate-critical header set (measured 2026-10-15,
+	// docs/recon-free-tier-gate.md): both session names must travel, and the
+	// v1-era request header must NOT.
+	lastSessionID     string
+	lastLegacyRequest string
+	lastRequestID     string
+	lastChat          map[string]any
+	lastResp          map[string]any
+	chatReply         string // settable canned chat SSE ("" = chatSSE default)
+	respReply         string // settable canned responses SSE ("" = responsesSSE default)
+	override          int    // when non-zero, chat/responses answer this status
 }
 
 func (f *fakeUpstream) record(kind string, r *http.Request, body map[string]any) {
@@ -117,6 +126,9 @@ func (f *fakeUpstream) record(kind string, r *http.Request, body map[string]any)
 	f.lastUA = r.Header.Get("User-Agent")
 	f.lastSession = r.Header.Get("x-opencode-session")
 	f.lastClient = r.Header.Get("x-opencode-client")
+	f.lastSessionID = r.Header.Get("x-opencode-session-id")
+	f.lastLegacyRequest = r.Header.Get("x-opencode-request")
+	f.lastRequestID = r.Header.Get("x-opencode-request-id")
 }
 
 // setReplies swaps the canned SSE bodies (per-test); empty args keep the
@@ -172,6 +184,12 @@ func (f *fakeUpstream) upstreamHeader(t *testing.T, name string) string {
 		return f.lastSession
 	case "x-opencode-client":
 		return f.lastClient
+	case "x-opencode-session-id":
+		return f.lastSessionID
+	case "x-opencode-request":
+		return f.lastLegacyRequest
+	case "x-opencode-request-id":
+		return f.lastRequestID
 	}
 	t.Fatalf("untracked upstream header %q", name)
 	return ""
@@ -325,9 +343,9 @@ func runSuite(m *testing.M) (int, error) {
 
 	fake = &fakeUpstream{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /zen/v1/chat/completions", fake.handleGeneration("chat"))
-	mux.HandleFunc("POST /zen/v1/responses", fake.handleGeneration("responses"))
-	mux.HandleFunc("GET /zen/v1/models", fake.handleModels)
+	mux.HandleFunc("POST "+config.ZenChatPath, fake.handleGeneration("chat"))
+	mux.HandleFunc("POST "+config.ZenResponsesPath, fake.handleGeneration("responses"))
+	mux.HandleFunc("GET "+config.ZenModelsPath, fake.handleModels)
 	fake.Server = httptest.NewServer(mux)
 	defer fake.Close()
 
@@ -610,7 +628,7 @@ func TestChatNonStreaming(t *testing.T) {
 	if !officialUARe.MatchString(ua) {
 		t.Fatalf("forged upstream UA = %q, want official compound shape opencode/<v> ai-sdk/provider-utils/<v> runtime/bun/<v>", ua)
 	}
-	for _, want := range []string{"bash", "glob", "grep", "read"} {
+	for _, want := range []string{"shell", "glob", "grep", "read"} {
 		if !toolNames(up)[want] {
 			t.Fatalf("fingerprint tool %q missing from upstream tools %v", want, up["tools"])
 		}
@@ -675,7 +693,7 @@ func TestResponsesNonStreaming(t *testing.T) {
 		t.Fatalf("usage = %v, want total 4", body["usage"])
 	}
 
-	// The muse-spark request must have gone to /zen/v1/responses, streamed.
+	// The muse-spark request must have gone to the Responses path, streamed.
 	fake.mu.Lock()
 	auth := fake.lastAuth
 	fake.mu.Unlock()

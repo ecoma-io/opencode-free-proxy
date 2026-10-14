@@ -219,7 +219,7 @@ func (e *UpstreamError) Error() string {
 // body; on an error status the body is read capped, parsed
 // (parseUpstreamError), and the connection released. buildHeaders is invoked
 // at the TOP of the call, mirroring base.js:127-130, where buildHeaders runs
-// inside the attempt loop and forges a fresh x-opencode-request id per
+// inside the attempt loop and forges a fresh x-opencode-request-id id per
 // attempt — here, per executor attempt (the executor is what re-dials now
 // that the matrix is gone). The JS body re-transform on the same line is an
 // in-place no-op on the already-transformed body, so the already-serialized
@@ -266,7 +266,7 @@ func (c *Client) DoClassified(ctx context.Context, url string, buildHeaders func
 func (c *Client) DoClassifiedObserved(ctx context.Context, url string, buildHeaders func() map[string]string, bodyJSON []byte, rec *Recorder) (*http.Response, *UpstreamError, Failure) {
 	// buildHeaders runs at the TOP of the dial, including the first — mirroring
 	// base.js:127-130, where transformRequest and buildHeaders re-run per
-	// attempt, so a fresh x-opencode-request id is forged for each one.
+	// attempt, so a fresh x-opencode-request-id id is forged for each one.
 	headers := buildHeaders()
 	// One logical call, one monotonic delivery record; one trace per hop. The
 	// hop trace reaches the dialers through the request context (net/http

@@ -64,9 +64,9 @@ func TestTransformRequestChatModel(t *testing.T) {
 	if body["stream"] != true {
 		t.Fatalf("stream = %v, want true", body["stream"])
 	}
-	// ensureChatFingerprintTools: {bash, glob, grep, read} in registry order.
+	// ensureChatFingerprintTools: {shell, glob, grep, read} in registry order.
 	names := toolNames(t, body)
-	if !reflect.DeepEqual(names, []string{"bash", "glob", "grep", "read"}) {
+	if !reflect.DeepEqual(names, []string{"shell", "glob", "grep", "read"}) {
 		t.Fatalf("tools = %v, want the fingerprint quartet", names)
 	}
 	// Cloak contract: no caller tools → tool_choice "none".
@@ -81,7 +81,9 @@ func TestTransformRequestChatModel(t *testing.T) {
 
 // TestTransformRequestCallerToolsPreserved: opencode.js ensureChatFingerprintTools
 // keeps caller tools verbatim, appends only missing quartet members, and
-// leaves tool_choice alone when the caller sent tools.
+// leaves tool_choice alone when the caller sent tools. The caller's own "bash"
+// is NOT a fingerprint member any more — the v2 command tool is "shell" — so
+// the quartet is appended in full alongside it.
 func TestTransformRequestCallerToolsPreserved(t *testing.T) {
 	body := bodyFrom(t, `{
 		"messages":[{"role":"user","content":"hi"}],
@@ -91,8 +93,8 @@ func TestTransformRequestCallerToolsPreserved(t *testing.T) {
 	TransformRequest("qwen3-coder-free", body)
 
 	names := toolNames(t, body)
-	if !reflect.DeepEqual(names, []string{"bash", "glob", "grep", "read"}) {
-		t.Fatalf("tools = %v, want caller bash kept + missing quartet members appended", names)
+	if !reflect.DeepEqual(names, []string{"bash", "shell", "glob", "grep", "read"}) {
+		t.Fatalf("tools = %v, want caller bash kept + the full quartet appended", names)
 	}
 	if body["tool_choice"] != "auto" {
 		t.Fatalf("tool_choice = %v, want the caller's choice preserved", body["tool_choice"])
@@ -193,7 +195,7 @@ func TestTransformRequestMuseResponses(t *testing.T) {
 		if len(tools) != 4 {
 			t.Fatalf("tools = %d items, want the 4 fingerprints", len(tools))
 		}
-		if n := toolNames(t, body); !reflect.DeepEqual(n, []string{"bash", "glob", "grep", "read"}) {
+		if n := toolNames(t, body); !reflect.DeepEqual(n, []string{"shell", "glob", "grep", "read"}) {
 			t.Fatalf("tools = %v, want the quartet", n)
 		}
 		if tool := jsonx.AsObj(tools[0]); jsonx.AsStr(tool["function"]) != "" && jsonx.AsObj(tool["function"]) != nil {
@@ -372,20 +374,20 @@ func TestTransformRequestDeepseekReasoning(t *testing.T) {
 	}
 }
 
-// TestBuildURL: muse-spark → /zen/v1/responses, everything else →
-// /zen/v1/chat/completions (opencode.js buildUrl), independent of any Server.
+// TestBuildURL: muse-spark → the Responses path, everything else →
+// the chat path (opencode.js buildUrl), independent of any Server.
 func TestBuildURL(t *testing.T) {
 	base := "http://upstream.test"
-	if got := BuildURL(base, "muse-spark-1.3-contributor-free"); got != base+"/zen/v1/responses" {
+	if got := BuildURL(base, "muse-spark-1.3-contributor-free"); got != base+config.ZenResponsesPath {
 		t.Fatalf("muse URL = %q", got)
 	}
-	if got := BuildURL(base, "muse-spark-1.2-contributor-free(high)"); got != base+"/zen/v1/responses" {
+	if got := BuildURL(base, "muse-spark-1.2-contributor-free(high)"); got != base+config.ZenResponsesPath {
 		t.Fatalf("suffixed muse URL = %q (thinking suffix must be ignored for routing)", got)
 	}
-	if got := BuildURL(base, "qwen3-coder-free"); got != base+"/zen/v1/chat/completions" {
+	if got := BuildURL(base, "qwen3-coder-free"); got != base+config.ZenChatPath {
 		t.Fatalf("chat URL = %q", got)
 	}
-	if got := BuildURL(base, "big-pickle"); got != base+"/zen/v1/chat/completions" {
+	if got := BuildURL(base, "big-pickle"); got != base+config.ZenChatPath {
 		t.Fatalf("big-pickle URL = %q", got)
 	}
 }
@@ -427,32 +429,61 @@ func TestBuildHeaders(t *testing.T) {
 		if h["x-opencode-session"] != "ses_abc" {
 			t.Fatalf("x-opencode-session = %q, want the resolved session argument", h["x-opencode-session"])
 		}
+		// The gate reads BOTH session headers; dropping either one alone is a
+		// deterministic 403 (measured 2026-10-15, docs/recon-free-tier-gate.md).
+		if h["x-opencode-session-id"] != "ses_abc" {
+			t.Fatalf("x-opencode-session-id = %q, want the same session mirrored", h["x-opencode-session-id"])
+		}
+		for _, mirror := range []string{"x-session-affinity", "x-session-id"} {
+			if h[mirror] != "ses_abc" {
+				t.Fatalf("%s = %q, want the same session mirrored", mirror, h[mirror])
+			}
+		}
+		// The v1-era header is never emitted: ANY value under
+		// x-opencode-request is a free-tier rejection upstream.
+		if v, has := h["x-opencode-request"]; has {
+			t.Fatalf("x-opencode-request = %q, want the legacy header omitted entirely", v)
+		}
 		if h["x-opencode-client"] != "desktop" {
 			t.Fatalf("x-opencode-client = %q, want the desktop default", h["x-opencode-client"])
 		}
 		if h["x-opencode-project"] != "global" {
 			t.Fatalf("x-opencode-project = %q, want the global default", h["x-opencode-project"])
 		}
-		if !identity.RequestRE.MatchString(h["x-opencode-request"]) {
-			t.Fatalf("x-opencode-request = %q, want a generated msg_ id", h["x-opencode-request"])
+		if !identity.RequestRE.MatchString(h["x-opencode-request-id"]) {
+			t.Fatalf("x-opencode-request-id = %q, want a generated msg_ id", h["x-opencode-request-id"])
 		}
 	})
 
 	t.Run("client passthroughs win when set", func(t *testing.T) {
 		h := BuildHeaders(Downstream{Headers: map[string]string{
-			"x-opencode-client":  "cli",
-			"x-opencode-request": "msg_downstream",
-			"x-opencode-project": "proj-7",
+			"x-opencode-client":     "cli",
+			"x-opencode-request-id": "msg_downstream",
+			"x-opencode-project":    "proj-7",
 		}}, "ses_abc", identity.FallbackUA())
-		if h["x-opencode-client"] != "cli" || h["x-opencode-request"] != "msg_downstream" || h["x-opencode-project"] != "proj-7" {
+		if h["x-opencode-client"] != "cli" || h["x-opencode-request-id"] != "msg_downstream" || h["x-opencode-project"] != "proj-7" {
 			t.Fatalf("passthroughs lost: %#v", h)
 		}
 	})
 
+	// A legacy client that still sends x-opencode-request must NOT have it
+	// forwarded: the header is not ignored upstream, it is refused.
+	t.Run("legacy x-opencode-request is never forwarded", func(t *testing.T) {
+		h := BuildHeaders(Downstream{Headers: map[string]string{
+			"x-opencode-request": "msg_downstream",
+		}}, "ses_abc", identity.FallbackUA())
+		if v, has := h["x-opencode-request"]; has {
+			t.Fatalf("x-opencode-request = %q, want the legacy header dropped", v)
+		}
+		if !identity.RequestRE.MatchString(h["x-opencode-request-id"]) {
+			t.Fatalf("x-opencode-request-id = %q, want a generated msg_ id", h["x-opencode-request-id"])
+		}
+	})
+
 	t.Run("generated request ids are unique per call", func(t *testing.T) {
-		a := BuildHeaders(Downstream{}, "s", identity.FallbackUA())["x-opencode-request"]
+		a := BuildHeaders(Downstream{}, "s", identity.FallbackUA())["x-opencode-request-id"]
 		time.Sleep(time.Millisecond)
-		b := BuildHeaders(Downstream{}, "s", identity.FallbackUA())["x-opencode-request"]
+		b := BuildHeaders(Downstream{}, "s", identity.FallbackUA())["x-opencode-request-id"]
 		if a == b {
 			t.Fatalf("request ids must differ per call, got %q twice", a)
 		}

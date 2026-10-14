@@ -358,7 +358,7 @@ func TestOriginHandshakeRoundTripDirect(t *testing.T) {
 	pool.AddCert(srv.Certificate())
 	c.TLSConfig = &tls.Config{RootCAs: pool}
 
-	resp, uerr := c.Do(context.Background(), srv.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr := c.Do(context.Background(), srv.URL+config.ZenChatPath, staticHeaders(), []byte("{}"))
 	if uerr != nil {
 		t.Fatalf("the forged origin handshake must serve a real round-trip, got %v", uerr)
 	}
@@ -416,7 +416,7 @@ func TestOriginHandshakeRoundTripSocks(t *testing.T) {
 	pool.AddCert(srv.Certificate())
 	c.TLSConfig = &tls.Config{RootCAs: pool}
 
-	resp, uerr, failure := c.DoClassified(context.Background(), srv.URL+"/zen/v1/chat/completions", staticHeaders(), []byte("{}"))
+	resp, uerr, failure := c.DoClassified(context.Background(), srv.URL+config.ZenChatPath, staticHeaders(), []byte("{}"))
 
 	class := failure.Class
 	if uerr != nil || class != ClassSuccess {

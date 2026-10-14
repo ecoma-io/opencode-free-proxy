@@ -1,5 +1,14 @@
 # Recon: the free-tier gate, 2026-10-13
 
+> **SUPERSEDED IN PART (2026-10-15).** OpenCode moved Zen to a new
+> **inference** backend and re-wrote the gate. Three of the findings below are
+> now history, and the whole request shape changed with them. Read
+> [§ 2026-10-15](#2026-10-15-the-inference-backend) first if you are debugging
+> a 403 today; the 2026-10-13 material is kept because two of its findings —
+> the session-id counter rule and the UA version floor — still hold verbatim on
+> the new endpoint, and because its _method_ (bisect against the live upstream
+> one variable at a time) is what produced the replacement table.
+
 **Question.** Every free model answered `403 FreeTierError` ("OpenCode's free
 tier can only be used from within OpenCode. Download it at
 https://opencode.ai and keep building.") through this proxy on 2026-10-13,
@@ -236,6 +245,139 @@ curl -s -o /dev/null -w '%{http_code}\n' https://opencode.ai/zen/v1/chat/complet
 Live suites: `E2E_LIVE=1 go test -tags e2e ./e2e/ -run TestLive` (all three
 pass after the fix).
 
+## 2026-10-15: the inference backend
+
+**Date:** 2026-10-15 · upstream `https://opencode.ai` · official CLI v2.0.27
+(local binary, control: answered normally from the same machine and IP while
+every forged request was refused) · upstream source read at tag `v2.0.29`.
+
+**Question.** Two days after the session-counter fix, every free model through
+this proxy answered `403 FreeTierError` again, while the official CLI on the
+same machine and IP kept working. The v1 fingerprint had stopped working.
+
+**Answer: four independent things, of which only ONE is fatal on its own.** The
+belt-and-braces request this proxy forges now satisfies four conditions; the
+previous shape satisfied three of them, and the fourth is what the gate
+actually reads.
+
+### 1. The endpoint moved — `/zen/*` is dead (fatal)
+
+`/zen/v1/chat/completions` answers `403 FreeTierError` **for every identity**,
+including the official client's own header set byte for byte. Zen is now a thin
+proxy onto a separate inference service
+(`packages/console/app/src/lib/inference-proxy.ts` at v2.0.29: _"New inference
+owns authentication, model availability, free-tier access, and billing"_, with
+`paths["POST /zen/v1/chat/completions"] = "/openai/v1/chat/completions"`). The
+admitted path is **`/inference/v1/...`**, which is also what the client itself
+uses (`packages/ai/src/providers/opencode.ts`: `baseURL =
+"https://opencode.ai/inference/v1"`).
+
+| endpoint                              | status                    |
+| ------------------------------------- | ------------------------- |
+| `POST /inference/v1/chat/completions` | **200**                   |
+| `POST /inference/v1/responses`        | **200** (flat tool shape) |
+| `GET /inference/v1/models`            | 200                       |
+| `POST /zen/v1/chat/completions`       | 403, any identity         |
+
+### 2. `x-opencode-request` is refused outright (fatal)
+
+This is the change no source-reading would have predicted, and the one that
+made the diagnosis expensive: **any** value under the v1-era
+`x-opencode-request` header is a 403, and its absence is what admits the
+request. Measured against an otherwise-admitted request:
+
+| header sent                    | status  |
+| ------------------------------ | ------- |
+| _(neither)_                    | **200** |
+| `x-opencode-request-id: msg_…` | **200** |
+| `x-opencode-request-id: req_…` | 200     |
+| `x-opencode-request: msg_…`    | **403** |
+| `x-opencode-request: req_…`    | 403     |
+| `x-opencode-request: <24 hex>` | 403     |
+| `x-opencode-request: global`   | 403     |
+
+The v2 client sends **neither** (`packages/core/src/session/model-request.ts`
+at v2.0.29 builds exactly `x-opencode-session-id`, `x-opencode-parent-session-id`,
+`x-session-affinity`, `X-Session-Id`, `x-parent-session-id`, `User-Agent`,
+`x-opencode-project`, `x-opencode-session`, `x-opencode-client` — no request
+header at all), and the Console's proxy reads
+`x-opencode-request-id ?? x-opencode-request`. So the v2 name is the one both
+the gate and the Console understand, and the v1 name is a live rejection rather
+than a no-op: `BuildHeaders` now forges `x-opencode-request-id` and never emits
+the legacy header, **including when a downstream client sent one** (forwarding
+it would 403 a request this proxy could have served).
+
+### 3. The session id must travel under BOTH opencode names
+
+`x-opencode-session` alone is 403; `x-opencode-session-id` alone is 403; both
+with the same value is 200. The two non-opencode mirrors (`x-session-affinity`,
+`x-session-id`) are **not** read by the gate, but the official client sends
+them, so all four ride along. (This corrects the 9router community note, which
+lists all three mirrors as required — two of the three are not.)
+
+**The counter rule below is unchanged and still enforced:** counter ≤ 63 is
+admitted, ≥ 64 is 403, on the new endpoint exactly as on the old one.
+
+### 4. The gate reads the tool schemas
+
+`body.tools` must carry the quartet **with real parameter schemas**:
+
+| tools sent                                                 | status  |
+| ---------------------------------------------------------- | ------- |
+| the four real v2 declarations                              | **200** |
+| stub quartet `bash/glob/grep/read` with properties         | **200** |
+| real declarations, `shell` renamed `bash`                  | 200     |
+| real declarations, every **description** blanked           | 200     |
+| real declarations plus an extra client tool                | 200     |
+| real declarations, **order reversed**                      | 200     |
+| real declarations, **`shell` removed**                     | **403** |
+| real declarations, **all `parameters.properties` emptied** | **403** |
+| no tools at all                                            | **403** |
+
+So the gate reads _names_ (a command tool plus `glob`, `grep`, `read`) and it
+reads that each declaration carries a **non-empty** parameter schema; it does
+not read descriptions, order, or the exact property set. This proxy therefore
+forges the **real** v2 declarations anyway (`config.FingerprintToolSchemas`,
+read from `packages/core/src/tool/plugin/{shell,glob,grep,read}.ts` at
+v2.0.29) rather than name-only stubs: the current gate tolerates stubs, a
+stricter one need not have to be told twice, and a proxy whose entire purpose
+is client fidelity should not send a shape the real client would never send.
+
+### What did NOT move
+
+- **`stream: true` is still mandatory** on the wire, exactly as before. The
+  proxy's existing "always stream upstream, aggregate for non-streaming
+  clients" rule is load-bearing and unchanged.
+- **The UA version floor is still 1.18.0.** `opencode/1.17.x` is 426,
+  `opencode/1.18.0` and up are admitted, `opencode/latest` with no numeric
+  version is 403 (a different path from 426), and a non-opencode UA is 403.
+  `opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14` — the
+  compound form this proxy forges — is **still admitted**, so the UA is not
+  part of the regression. `ClientMinMinor` moved 17 → 18 only so a 1.17-era
+  client forges the current identity instead of having its too-old UA
+  forwarded and the 426 relayed (the deliberate call the 2026-10-13 note left
+  open).
+- **`x-opencode-project` remains unvalidated** (`global`, a real 40-hex id and
+  200 bytes of junk all pass) — do not generalise any of this into "the
+  upstream validates our identity properly".
+- **TLS is not involved.** The uTLS ClientHello forge (issue #48) was the first
+  suspect and it is exonerated: with the forged hello the request is refused,
+  with stdlib Go TLS it is refused identically, and the _same bytes_ replayed
+  by curl are admitted. `accept-encoding` was cleared the same way (gzip,
+  identity and absent all admit).
+
+### Method note
+
+The decisive step was not any single probe but replaying the proxy's **own
+captured request**: point `upstream.base` at a local plain-HTTP capture server,
+send one request through the real binary, and replay those exact bytes with
+curl. curl 200 / proxy 403 on an identical payload isolates the difference to
+the header set, which is what pointed at `x-opencode-request`. A per-IP
+cooldown is a real confound — an early bisect run returned a uniform 403 for
+every case, including a known-good baseline, because it had omitted the
+`x-opencode-session-id` mirror — so every row in every table above was
+confirmed over repeated runs with a known-good baseline interleaved.
+
 ## Caveats
 
 - The rule is characterised from **observed behaviour**, not from upstream
@@ -243,7 +385,12 @@ pass after the fix).
   ("1.18.0 or newer"), and the counter limit has no published explanation.
   Treat 64 as a measurement, not a specification.
 - The threshold may be a heuristic that changes without notice. A future gate
-  change would again present as a blanket 403 with no local signal.
+  change would again present as a blanket 403 with no local signal. **This is
+  no longer hypothetical: the rules changed completely within two days, twice
+  inside a single day according to the 9router community report.** The
+  fingerprint quartet, the endpoint and the request header are all upstream
+  policy with no published contract; treat every table in this document as a
+  measurement of one moment, not a specification.
 - Per [recon-session-continuity.md](recon-session-continuity.md) §Project id,
   the _project_ header is still unvalidated — do not generalise this finding
   into "the upstream validates our identity properly".

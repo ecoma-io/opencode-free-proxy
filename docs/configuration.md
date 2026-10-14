@@ -100,12 +100,12 @@ Events are leveled:
 
 ### `upstream`
 
-| Field  | Type   | Default               | Meaning                                                                                                                                                     |
-| ------ | ------ | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `base` | string | `https://opencode.ai` | Zen upstream base, all routes; must be an absolute http/https URL with a host (userinfo, query and fragment rejected); trailing `/` normalized at `Resolve` |
+| Field  | Type   | Default               | Meaning                                                                                                                                                           |
+| ------ | ------ | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base` | string | `https://opencode.ai` | Inference upstream base, all routes; must be an absolute http/https URL with a host (userinfo, query and fragment rejected); trailing `/` normalized at `Resolve` |
 
-Every provider endpoint (`/zen/v1/chat/completions`,
-`/zen/v1/responses`, `/zen/v1/models`) is derived from `base`. The background
+Every provider endpoint (`/inference/v1/chat/completions`,
+`/inference/v1/responses`, `/inference/v1/models`) is derived from `base`. The background
 User-Agent identity sync separately fetches OpenCode release metadata from
 GitHub; it is not a provider endpoint and never changes where provider traffic
 goes. A non-default base is how tests and self-hosted gateways redirect the

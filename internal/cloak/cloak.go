@@ -22,7 +22,7 @@ import (
 )
 
 // ResponsesModelRe matches Muse Spark models — the only free models served by
-// /zen/v1/responses. The thinking suffix "model(level)" is stripped first and
+// the Responses endpoint (config.ZenResponsesPath). The thinking suffix "model(level)" is stripped first and
 // the last "/" segment wins (mirrors isMuseSparkModel).
 var ResponsesModelRe = regexp.MustCompile(config.ResponsesURLModelsPattern)
 
@@ -45,7 +45,7 @@ func UpstreamModelID(model string) string {
 }
 
 // IsResponsesModel reports whether the model must be routed to
-// /zen/v1/responses instead of /chat/completions. The executor also keeps an
+// the Responses endpoint instead of chat completions. The executor also keeps an
 // explicit set (muse-spark-1.2/1.3-contributor-free) — both ids match the
 // regex, so the pattern alone is equivalent.
 func IsResponsesModel(model string) bool {
@@ -80,13 +80,45 @@ func toolNameOf(tool any) string {
 	return strings.TrimSpace(jsonx.AsStr(jsonx.Get(o["function"], "name")))
 }
 
+// fingerprintParams renders the REAL parameter schema for a fingerprint tool.
+// The gate reads these schemas: four declarations with an empty `properties`
+// map are refused with 403 FreeTierError (measured 2026-10-15, see
+// config.FingerprintTools). An unknown name degrades to the empty object
+// schema rather than panicking — the name comes from config.FingerprintTools,
+// which TestFingerprintToolsHaveSchemas pins against FingerprintToolSchemas.
+func fingerprintParams(name string) map[string]any {
+	def, ok := config.FingerprintToolSchemas[name]
+	if !ok || len(def.Properties) == 0 {
+		return jsonx.ObjOf("type", "object", "properties", jsonx.ObjOf())
+	}
+	params := jsonx.ObjOf("type", "object", "properties", def.Properties)
+	if len(def.Required) > 0 {
+		required := make([]any, 0, len(def.Required))
+		for _, r := range def.Required {
+			required = append(required, r)
+		}
+		params["required"] = required
+	}
+	return params
+}
+
+// fingerprintDescription renders a fingerprint tool's description: the real
+// client text when we carry the declaration, and the historical
+// "OpenCode built-in <name> tool" string for a name we have no schema for.
+func fingerprintDescription(name string) string {
+	if def, ok := config.FingerprintToolSchemas[name]; ok && def.Description != "" {
+		return def.Description
+	}
+	return "OpenCode built-in " + name + " tool"
+}
+
 func fingerprintToolChat(name string) map[string]any {
 	return jsonx.ObjOf(
 		"type", "function",
 		"function", jsonx.ObjOf(
 			"name", name,
-			"description", "OpenCode built-in "+name+" tool",
-			"parameters", jsonx.ObjOf("type", "object", "properties", jsonx.ObjOf()),
+			"description", fingerprintDescription(name),
+			"parameters", fingerprintParams(name),
 		),
 	)
 }
@@ -95,8 +127,8 @@ func fingerprintToolResponses(name string) map[string]any {
 	return jsonx.ObjOf(
 		"type", "function",
 		"name", name,
-		"description", "OpenCode built-in "+name+" tool",
-		"parameters", jsonx.ObjOf("type", "object", "properties", jsonx.ObjOf()),
+		"description", fingerprintDescription(name),
+		"parameters", fingerprintParams(name),
 	)
 }
 

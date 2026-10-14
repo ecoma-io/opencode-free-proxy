@@ -30,6 +30,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"opencode-free-proxy/internal/config"
 )
 
 // chatProxyCount is a 200-SSE fake upstream that counts what it served.
@@ -243,7 +245,7 @@ func TestSameHostRedirectFollowedE2E(t *testing.T) {
 			_, _ = io.WriteString(w, chatSSE)
 			return
 		}
-		w.Header().Set("Location", target.URL+"/zen/v1/chat/completions?redirected=1")
+		w.Header().Set("Location", target.URL+config.ZenChatPath+"?redirected=1")
 		w.WriteHeader(http.StatusFound)
 	})
 	defer moved.Close()
