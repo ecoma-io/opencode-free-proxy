@@ -199,6 +199,20 @@ func BuildHeaders(d Downstream, session string, cachedUA string) map[string]stri
 		// (`x-session-affinity`, `x-session-id`) are not read by the current
 		// gate but are sent by the official client, so they ride along.
 		// See docs/recon-free-tier-gate.md.
+		//
+		// 403 FreeTierError is now TWO distinct verdicts with the same error
+		// type (measured live 2026-10-20, docs/recon-abuse-ip-flag.md): the
+		// identity-shape gate above (session-id tail length/counter — the
+		// 14-base62 tail is enforced upstream and probed there), and a
+		// per-IP abuse ban whose message says "we've detected abusive
+		// traffic from this IP address" — deterministic per egress IP,
+		// absent from the same forgery through other IPs, and fed by its
+		// own rejected cluster. An intermittent 403 across an unchanged
+		// forged header set is the IP flag, not a header regression; the
+		// scorer lives server-side (the string appears nowhere in the OSS
+		// repo at v2.1.1). ClientHello/UA/client-field drifts were bisected
+		// and cleared the same day — do not "fix" the forge for this
+		// regression; re-examine the egress pool instead.
 		"x-opencode-session":    session,
 		"x-opencode-session-id": session,
 		"x-session-affinity":    session,
