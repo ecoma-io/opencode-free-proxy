@@ -118,9 +118,10 @@ keeps that triple fresh from GitHub (startup warm + periodic sync; the
 request hot path is a pure cache read — see
 [the UA recon record](recon-opencode-ua.md)).
 
-| Field           | Type    | Default | Meaning                                                                       |
-| --------------- | ------- | ------- | ----------------------------------------------------------------------------- |
-| `sync_interval` | int sec | `3600`  | UA identity sync cadence in SECONDS; `0` = disabled; negative is a load error |
+| Field           | Type    | Default | Meaning                                                                                                                                                                                                                                                                                                                                                    |
+| --------------- | ------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sync_interval` | int sec | `3600`  | UA identity sync cadence in SECONDS; `0` = disabled; negative is a load error                                                                                                                                                                                                                                                                              |
+| `style`         | string  | `v1`    | UA WIRE FORM the request path stamps: `v1` = the compound triple `opencode/<v> ai-sdk/provider-utils/<v> runtime/bun/<v>` (the long-measured identity); `v2` = the official 2.x channel form `opencode/latest/<v>/cli`. Both are synced in the same background round, each form failing independently; this selects what goes on the wire. Hot-reloadable. |
 
 ### `egress[]`
 

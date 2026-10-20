@@ -108,7 +108,8 @@ var stubLockRenamed = strings.Replace(stubLock,
 // swappable per-test to drive failure modes.
 type uaSyncTransport struct {
 	mu         sync.Mutex
-	release    string // body for the releases API
+	release    string // body for the releases/latest API
+	tagsList   string // body for the tags list API backing v2 sync
 	pkgJSON    string
 	lock       string
 	pkgStatus  int
@@ -119,6 +120,7 @@ type uaSyncTransport struct {
 func newUASyncTransport() *uaSyncTransport {
 	return &uaSyncTransport{
 		release:    `{"tag_name":"v2.0.1"}`,
+		tagsList:   `[{"name":"v2.0.1"},{"name":"v1.19.3"}]`,
 		pkgJSON:    stubPkgJSON,
 		lock:       stubLock,
 		pkgStatus:  http.StatusOK,
@@ -132,6 +134,9 @@ func (s *uaSyncTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	s.requests = append(s.requests, r.URL.String())
 	switch r.URL.Host {
 	case "api.github.com":
+		if r.URL.String() == config.GitHubTagsListURL {
+			return jsonResponse(http.StatusOK, s.tagsList), nil
+		}
 		return jsonResponse(http.StatusOK, s.release), nil
 	default: // raw.githubusercontent.com
 		if strings.HasSuffix(r.URL.Path, "/package.json") {
@@ -149,7 +154,9 @@ func (s *uaSyncTransport) calls() int {
 
 const stubUA = "opencode/2.0.1 ai-sdk/provider-utils/5.5.5 runtime/bun/9.9.9"
 
-// The full sync chain resolves all three segments from the right URLs.
+// The full sync chain resolves the v1 triple from the right URLs — and
+// fetches the v2 form in the SAME pass (the dual contract: both wire forms
+// are synced, never one without the other).
 func TestWarmFetchesFullTriple(t *testing.T) {
 	tr := newUASyncTransport()
 	client := &http.Client{Transport: tr}
@@ -165,6 +172,7 @@ func TestWarmFetchesFullTriple(t *testing.T) {
 		config.GitHubReleasesURL,
 		config.GitHubRawBase + "/v2.0.1/" + config.RootPackageJSONPath,
 		config.GitHubRawBase + "/v2.0.1/" + config.LockfilePath,
+		config.GitHubTagsListURL,
 	}
 	if tr.calls() != len(wantURLs) {
 		t.Fatalf("requests = %v, want exactly %v", tr.requests, wantURLs)
@@ -173,6 +181,16 @@ func TestWarmFetchesFullTriple(t *testing.T) {
 		if tr.requests[i] != want {
 			t.Errorf("request[%d] = %q, want %q", i, tr.requests[i], want)
 		}
+	}
+	// The v2 form from the same pass must be cached beside the v1 triple:
+	// select v2 and read (Get never I/Os).
+	c.SetStyleProvider(func() UAStyle { return UAStyleV2 })
+	if got, want := c.Get(), "opencode/latest/2.0.1/cli"; got != want {
+		t.Errorf("v2 Get() after warm = %q, want %q", got, want)
+	}
+	c.SetStyleProvider(func() UAStyle { return UAStyleV1 })
+	if got, want := FallbackV2(), "opencode/latest/"+config.ClientFallbackVersionV2+"/cli"; got != want {
+		t.Errorf("FallbackV2() = %q, want %q", got, want)
 	}
 }
 
@@ -212,8 +230,9 @@ func TestUASourceExtraction(t *testing.T) {
 	}
 }
 
-// All-or-nothing: a failure in ANY segment keeps the previously cached triple
-// intact — never a mix of old and new versions across releases.
+// All-or-nothing WITHIN the v1 triple: a failure in ANY segment keeps the
+// previously cached triple intact — never a mix of old and new versions
+// across releases.
 func TestWarmAllOrNothing(t *testing.T) {
 	tr := newUASyncTransport()
 	client := &http.Client{Transport: tr}
@@ -241,6 +260,54 @@ func TestWarmAllOrNothing(t *testing.T) {
 	}
 }
 
+// Per-form degradation (adversarial review F2/F3, pinned): one form's
+// failure must never freeze the other form's refresh. v1 rides
+// /releases/latest + raw files; v2 rides the tags list — different
+// endpoints, independent failure modes.
+func TestWarmFormsDegradeIndependently(t *testing.T) {
+	tr := newUASyncTransport()
+	client := &http.Client{Transport: tr}
+	c := NewUserAgentCache()
+	c.Warm(client, true)
+	// Both forms synced from the first pass.
+	if got := c.Get(); got != stubUA {
+		t.Fatalf("v1 Get() = %q, want %q", got, stubUA)
+	}
+
+	// v2 side fails (tags list down), the v1 side advances a release.
+	tr.mu.Lock()
+	tr.release = `{"tag_name":"v3.0.0"}`
+	tr.pkgJSON = strings.Replace(stubPkgJSON, "9.9.9", "10.0.0", 1)
+	tr.lock = strings.Replace(stubLock, "5.5.5", "6.0.0", 1)
+	wantV1 := "opencode/3.0.0 ai-sdk/provider-utils/6.0.0 runtime/bun/10.0.0"
+	// A v2 tag that fails the anchored scan: a prerelease-style suffix.
+	tr.tagsList = `[{"name":"v2.9.0-rc1"},{"name":"v1.19.3"}]`
+	tr.mu.Unlock()
+	if got := c.Warm(client, true); got != wantV1 {
+		t.Errorf("Warm() with broken v2 = %q, want the NEW v1 %q (v1 must not freeze)", got, wantV1)
+	}
+	// New v1 (stub v3 value) must be cached while v2 stays at the OLD value.
+	c.SetStyleProvider(func() UAStyle { return UAStyleV2 })
+	if got, want := c.Get(), "opencode/latest/2.0.1/cli"; got != want {
+		t.Errorf("v2 Get() after v2 failure = %q, want the previous %q (stale, never mixed)", got, want)
+	}
+	c.SetStyleProvider(func() UAStyle { return UAStyleV1 })
+
+	// Mirror: v1 side fails (bun.lock down), the v2 side still advances.
+	tr.mu.Lock()
+	tr.lockStatus = http.StatusInternalServerError
+	tr.tagsList = `[{"name":"v2.5.0"},{"name":"v1.19.3"}]`
+	tr.mu.Unlock()
+	if got := c.Warm(client, true); got != wantV1 {
+		t.Errorf("Warm() with broken v1 = %q, want previous v1 %q (held)", got, wantV1)
+	}
+	c.SetStyleProvider(func() UAStyle { return UAStyleV2 })
+	if got, want := c.Get(), "opencode/latest/2.5.0/cli"; got != want {
+		t.Errorf("v2 Get() after v1 failure = %q, want the NEW %q (v2 must not freeze)", got, want)
+	}
+	c.SetStyleProvider(func() UAStyle { return UAStyleV1 })
+}
+
 // Cold + failing → the compiled-in fallback (fail-open).
 func TestWarmFailsOpenCold(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -266,24 +333,24 @@ func TestWarmTTLAndForce(t *testing.T) {
 	c.now = func() time.Time { return now }
 
 	c.Warm(client, false)
-	if got := tr.calls(); got != 3 {
-		t.Fatalf("first warm requests = %d, want 3 (release + package.json + bun.lock)", got)
+	if got := tr.calls(); got != 4 {
+		t.Fatalf("first warm requests = %d, want 4 (v1 triple + v2 list)", got)
 	}
 	now = base.Add(config.VersionCacheTTL - time.Minute)
 	c.Warm(client, false)
-	if got := tr.calls(); got != 3 {
-		t.Errorf("warm inside TTL requests = %d, want 3 (throttled)", got)
+	if got := tr.calls(); got != 4 {
+		t.Errorf("warm inside TTL requests = %d, want 4 (throttled)", got)
 	}
 	now = base.Add(config.VersionCacheTTL + time.Minute)
 	if got := c.Warm(client, false); got != stubUA {
 		t.Errorf("Warm() after TTL = %q, want %q", got, stubUA)
 	}
-	if got := tr.calls(); got != 6 {
-		t.Errorf("post-TTL requests = %d, want 6", got)
+	if got := tr.calls(); got != 8 {
+		t.Errorf("post-TTL requests = %d, want 8", got)
 	}
 	c.Warm(client, true) // force: inside nothing, refreshes immediately
-	if got := tr.calls(); got != 9 {
-		t.Errorf("forced warm requests = %d, want 9", got)
+	if got := tr.calls(); got != 12 {
+		t.Errorf("forced warm requests = %d, want 12", got)
 	}
 }
 
@@ -310,8 +377,8 @@ func TestWarmSingleFlight(t *testing.T) {
 	close(release)
 	wg.Wait()
 
-	if got := tr.calls(); got != 3 {
-		t.Errorf("source requests = %d, want 3 (one full pass)", got)
+	if got := tr.calls(); got != 4 {
+		t.Errorf("source requests = %d, want 4 (v1 triple + v2 list)", got)
 	}
 	// Waiters behind the inflight gate return immediately (fail-open): the
 	// cold-cache fallback. Exactly one goroutine — the winner — returns the
@@ -443,6 +510,76 @@ func TestFetchLatestReleaseFailureModes(t *testing.T) {
 	}
 }
 
+// fetchV2Version: direct unit tests (adversarial review gap 7).
+func TestFetchV2Version(t *testing.T) {
+	t.Run("no v2 tag → errNoV2Tag", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `[{"name":"v1.19.3"},{"name":"v1.18.31"}]`), nil
+		})}
+		if _, err := fetchV2Version(client); !errors.Is(err, errNoV2Tag) {
+			t.Fatalf("err = %v, want errNoV2Tag", err)
+		}
+	})
+	t.Run("prerelease suffix rejected (not truncated)", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `[{"name":"v2.1.0-rc1"},{"name":"v1.19.3"}]`), nil
+		})}
+		if _, err := fetchV2Version(client); !errors.Is(err, errNoV2Tag) {
+			t.Fatalf("prerelease-suffixed tag must be skipped, err = %v", err)
+		}
+	})
+	t.Run("first stable v2 tag wins (newest first)", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `[{"name":"v2.1.0"},{"name":"v2.0.32"},{"name":"v1.19.3"}]`), nil
+		})}
+		got, err := fetchV2Version(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "opencode/latest/2.1.0/cli" {
+			t.Errorf("got = %q, want opencode/latest/2.1.0/cli", got)
+		}
+	})
+	t.Run("picks lower stable when newer is prerelease-suffixed", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `[{"name":"v2.9.0-rc1"},{"name":"v2.0.32"},{"name":"v1.19.3"}]`), nil
+		})}
+		got, err := fetchV2Version(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "opencode/latest/2.0.32/cli" {
+			t.Errorf("got = %q, want opencode/latest/2.0.32/cli", got)
+		}
+	})
+	t.Run("malformed body → decode error", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{"not":"a list"}`), nil
+		})}
+		if _, err := fetchV2Version(client); err == nil {
+			t.Error("non-list JSON must error")
+		}
+	})
+	t.Run("requests the tags URL with the GitHub Accept header", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.String() != config.GitHubTagsListURL {
+				t.Errorf("probe URL = %q, want %q", r.URL.String(), config.GitHubTagsListURL)
+			}
+			if got := r.Header.Get("Accept"); got != "application/vnd.github+json" {
+				t.Errorf("Accept header = %q", got)
+			}
+			return jsonResponse(http.StatusOK, `[{"name":"v2.0.1"}]`), nil
+		})}
+		got, err := fetchV2Version(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "opencode/latest/2.0.1/cli" {
+			t.Errorf("got = %q", got)
+		}
+	})
+}
+
 // The typed probe errors render human-readable statuses/messages (fail-open
 // logging surfaces Error()).
 func TestProbeErrorMessages(t *testing.T) {
@@ -475,4 +612,64 @@ func TestUserAgentCacheColdGet(t *testing.T) {
 	if got := NewUserAgentCache().Get(); got != FallbackUA() {
 		t.Errorf("cold Get() = %q, want %q", got, FallbackUA())
 	}
+}
+
+// The style provider selects which wire form Get renders. Both forms are in
+// the cache after one warm (the dual contract); the provider flips the form
+// without re-syncing, and a nil-provider cache stays v1.
+func TestStyleSelectsWireForm(t *testing.T) {
+	tr := newUASyncTransport()
+	client := &http.Client{Transport: tr}
+
+	t.Run("default v1", func(t *testing.T) {
+		c := NewUserAgentCache()
+		if got := c.Style(); got != UAStyleV1 {
+			t.Errorf("Style() = %q, want v1", got)
+		}
+		c.Warm(client, true)
+		if got := c.Get(); got != stubUA {
+			t.Errorf("Get() = %q, want v1 %q", got, stubUA)
+		}
+	})
+
+	t.Run("v2 after set", func(t *testing.T) {
+		tr2 := newUASyncTransport()
+		client2 := &http.Client{Transport: tr2}
+		c := NewUserAgentCache()
+		c.SetStyleProvider(func() UAStyle { return UAStyleV2 })
+		if got := c.Style(); got != UAStyleV2 {
+			t.Errorf("Style() = %q, want v2", got)
+		}
+		// Cold with v2 selected → the compiled-in v2 fallback, never "".
+		if got := c.Get(); got != FallbackV2() {
+			t.Errorf("cold v2 Get() = %q, want %q", got, FallbackV2())
+		}
+		c.Warm(client2, true)
+		// The synced v2 form (the transport's releases list carries a v2 tag).
+		want := "opencode/latest/2.0.1/cli"
+		if got := c.Get(); got != want {
+			t.Errorf("v2 Get() = %q, want %q", got, want)
+		}
+		// One warm fetched BOTH forms: no extra source pass afterwards.
+		if got := tr2.calls(); got != 4 {
+			t.Errorf("requests after one warm = %d, want 4", got)
+		}
+		// Flip back to v1: no re-sync needed, the cached v1 triple serves.
+		c.SetStyleProvider(func() UAStyle { return UAStyleV1 })
+		if got := c.Get(); got != stubUA {
+			t.Errorf("v1 Get() after flip = %q, want %q", got, stubUA)
+		}
+		if got := tr2.calls(); got != 4 {
+			t.Errorf("requests after style flip = %d, want still 4", got)
+		}
+	})
+
+	t.Run("nil provider resets to v1", func(t *testing.T) {
+		c := NewUserAgentCache()
+		c.SetStyleProvider(func() UAStyle { return UAStyleV2 })
+		c.SetStyleProvider(nil)
+		if got := c.Style(); got != UAStyleV1 {
+			t.Errorf("Style() after nil = %q, want v1", got)
+		}
+	})
 }

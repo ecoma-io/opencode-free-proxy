@@ -203,12 +203,15 @@ type UpstreamConfig struct {
 }
 
 // UserAgentConfig tunes the UA-identity sync loop (the free-tier gate reads
-// the User-Agent triple). SyncInterval is an integer SECONDS value; nil =
-// the 3600 s default, 0 = disabled, negative = load error. Conversion to
-// time.Duration happens only in Resolve — mirroring how every other runtime
-// duration is config-layer-owned.
+// the User-Agent) and selects the wire FORM. SyncInterval is an integer
+// SECONDS value; nil = the 3600 s default, 0 = disabled, negative = load
+// error. Style selects v1 (the compound triple — the long-measured, still
+// admitted identity) or v2 (the official 2.x channel form); empty = v1,
+// anything else = load error. Conversion to time.Duration happens only in
+// Resolve — mirroring how every other runtime duration is config-layer-owned.
 type UserAgentConfig struct {
-	SyncInterval *int `yaml:"sync_interval,omitempty"`
+	SyncInterval *int    `yaml:"sync_interval,omitempty"`
+	Style        UAStyle `yaml:"style,omitempty"`
 }
 
 // File is the OCFP_CONFIG YAML document.
@@ -260,6 +263,7 @@ type Runtime struct {
 	logLevel       string
 	upstreamBase   string
 	uaSyncInterval time.Duration
+	uaStyle        UAStyle
 }
 
 // Duration accepts Go duration strings ("30s", "1m30s"). yaml.v3 would
@@ -566,6 +570,11 @@ func (f *File) Validate() error {
 	if f.UserAgent.SyncInterval != nil && *f.UserAgent.SyncInterval < 0 {
 		return fmt.Errorf("user_agent: sync_interval must be >= 0 (0 = disabled)")
 	}
+	switch f.UserAgent.Style {
+	case "", UAStyleV1, UAStyleV2:
+	default:
+		return fmt.Errorf("user_agent: style must be v1 or v2, got %q", f.UserAgent.Style)
+	}
 	return nil
 }
 
@@ -582,6 +591,15 @@ func (rt *Runtime) UpstreamBase() string { return rt.upstreamBase }
 // value travels with the request's snapshot: a hot reload may enable,
 // disable, or rescale UA sync on the next generation (see useragent.go).
 func (rt *Runtime) UASyncInterval() time.Duration { return rt.uaSyncInterval }
+
+// UAStyle returns the User-Agent wire form the request path stamps (v1
+// compound triple or v2 channel form). Empty YAML = v1, enforced in
+// Validate; a hot reload may flip the form on the next generation. The
+// request path resolves it through the cache's live style provider, so the
+// swap takes effect without touching in-flight requests' already-captured
+// snapshots (header building reads the CURRENT generation's style, matching
+// how s.UA.Get() always reads the cache's freshest value).
+func (rt *Runtime) UAStyle() UAStyle { return rt.uaStyle }
 
 // HealthThreshold returns the effective failure threshold (default applied
 // when the field is unset; explicit 0 survives as "never cool down").
@@ -777,6 +795,10 @@ func (f *File) Resolve() (*Runtime, error) {
 	if f.UserAgent.SyncInterval != nil {
 		rt.uaSyncInterval = time.Duration(*f.UserAgent.SyncInterval) * time.Second
 	}
+	rt.uaStyle = UAStyleV1
+	if f.UserAgent.Style != "" {
+		rt.uaStyle = f.UserAgent.Style
+	}
 	return rt, nil
 }
 
@@ -808,6 +830,7 @@ func DefaultRuntime() *Runtime {
 		logLevel:       DefaultLogLevel,
 		upstreamBase:   UpstreamBase,
 		uaSyncInterval: UASyncInterval,
+		uaStyle:        UAStyleV1,
 	}
 }
 

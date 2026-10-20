@@ -109,6 +109,14 @@
 #                      disabled; negative is a load error. The request hot
 #                      path never triggers a fetch (fail-open contract).
 #                      Converted to a duration in Resolve only.
+#   style              the UA WIRE FORM the request path stamps: v1 = the
+#                      compound triple "opencode/<v> ai-sdk/provider-utils/<v>
+#                      runtime/bun/<v>" (the long-measured identity); v2 = the
+#                      official 2.x channel form "opencode/latest/<v>/cli".
+#                      Both are synced in the same background round, each
+#                      form failing independently; default v1.
+#                      Hot-reloadable — a reload flips the form immediately
+#                      without touching in-flight requests.
 #
 # log-level            process-wide JSON log threshold, hot-reloadable:
 #                      debug | info | warn | error. Default info. The reload
@@ -233,6 +241,10 @@ upstream:
 user_agent:
   # UA-triple sync cadence in SECONDS; default 3600. 0 disables the loop.
   sync_interval: 3600
+  # User-Agent wire form: v1 (compound triple, default) or v2 (official 2.x
+  # channel form). Both are synced in parallel; this picks what goes on the
+  # wire. Hot-reloadable.
+  style: v1
 
 # Process-wide JSON log threshold; default info. Hot-reloadable — edit live,
 # the poller applies it without restarting or disturbing in-flight requests.
