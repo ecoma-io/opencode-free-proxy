@@ -87,6 +87,13 @@ func main() {
 		log.Info().Str("path", cfg.ConfigPath).Str("poll", cfg.ConfigPoll.String()).Msg("config loaded")
 	}
 
+	// UA wire style (user_agent.style, v1 compound vs v2 channel form) is read
+	// LIVE from the store snapshot, so a reload can flip the style without a
+	// restart; warm/sync refresh both forms on every cycle.
+	uaCache.SetStyleProvider(func() identity.UAStyle {
+		return store.Get().UAStyle()
+	})
+
 	server := router.NewServer(store, uaCache, direct, log)
 
 	// Sync the compound UA triple (opencode version, ai-sdk provider-utils,

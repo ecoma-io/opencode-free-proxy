@@ -175,6 +175,9 @@ func TestExampleConfigLoads(t *testing.T) {
 	if rt.UASyncInterval() != 3600*time.Second {
 		t.Fatalf("UA sync interval = %v, want 3600s", rt.UASyncInterval())
 	}
+	if rt.UAStyle() != UAStyleV1 {
+		t.Fatalf("UA style = %q, want %q (the example ships the v1 default)", rt.UAStyle(), UAStyleV1)
+	}
 }
 
 // TestExampleConfigRouteSelection pins the documented matching order: the

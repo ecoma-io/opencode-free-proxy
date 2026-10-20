@@ -114,12 +114,13 @@ func TestStartSyncCadenceScalesDownToDisabled(t *testing.T) {
 	}
 	atomic.StoreInt64(&interval, 0) // reload disables sync
 	time.Sleep(1400 * time.Millisecond)
-	// Allow exactly ONE post-disable fetch: the in-flight timer for the last
-	// positive cycle may complete before the loop re-reads the cadence. The
-	// loop must then idle — an additional fetch beyond that is a disabled
-	// cadence fetching.
-	if n := fetches.Load(); n > before+1 {
-		t.Fatalf("fetches after disable = %d, want <= %d (a disabled cadence must stop fetching)", n, before+1)
+	// Allow exactly ONE post-disable fetch pass: the in-flight timer for the last
+	// positive cycle may complete before the loop re-reads the cadence. A pass
+	// now touches both sync endpoints (releases + tags) plus the v1 raw files,
+	// so up to 4 requests may land; anything beyond that is a disabled cadence
+	// still fetching.
+	if n := fetches.Load(); n > before+4 {
+		t.Fatalf("fetches after disable = %d, want <= %d (a disabled cadence must stop fetching)", n, before+4)
 	}
 	stop()
 }

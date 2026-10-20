@@ -43,10 +43,40 @@ const (
 	DeadFreeModels  = "deepseek-v4-flash-free"
 )
 
+// UAStyle selects which User-Agent WIRE FORM the request path stamps. The
+// two forms are the two client generations the free-tier gate has admitted:
+//
+//   - V1 (the compound triple, opencode/<v> ai-sdk/… runtime/bun/…): what
+//     this proxy has always forged; still admitted (measured 2026-10-15).
+//   - V2 (opencode/<channel>/<version>/<name>): what the official 2.x CLI
+//     sends since the inference backend (packages/core/src/app.ts at
+//     v2.1.0: `opencode/${app.channel}/${app.version}/${app.name}`; captured
+//     on the wire 2026-10-13 as opencode/latest/2.0.27/cli).
+//
+// Both are synced in the same background round by identity.UserAgentCache
+// (each form degrading independently on failure — never a mixed identity);
+// Style is the runtime CHOICE between them — a config knob read per request,
+// so a gate change is answered by a reload, not a rebuild.
+// Default V1: the long-measured identity. Empty YAML value = V1.
+type UAStyle string
+
+const (
+	UAStyleV1 UAStyle = "v1"
+	UAStyleV2 UAStyle = "v2"
+)
+
 // OpenCode client identity for the free-tier gate.
 const (
 	// Used when the GitHub release lookup fails or the cache is cold.
 	ClientFallbackVersion = "1.18.31"
+	// Cold-cache fallback for the v2 wire form (user_agent.style: v2). The
+	// 2.x channel form (opencode/latest/<v>/cli) has never existed in the
+	// 1.x generation, so this must be a 2.x era tag — a v1 number here would
+	// fabricate the cross-generation identity opencode/latest/1.18.31/cli,
+	// which no real client ever sent (measured 2026-10-13:
+	// opencode/latest/2.0.27/cli) and which a form/version-consistent gate
+	// would reject. Earliest stable v2 release in the repo's tag history.
+	ClientFallbackVersionV2 = "2.0.1"
 	// Upstream rejects User-Agent versions below opencode/1.18.0.
 	//
 	// MEASURED live 2026-10-15 on the /inference/v1 gate (and again on
@@ -63,6 +93,12 @@ const (
 	ClientMinMajor    = 1
 	ClientMinMinor    = 18
 	GitHubReleasesURL = "https://api.github.com/repos/anomalyco/opencode/releases/latest"
+	// GitHubTagsListURL lists the repo's git tags (newest first) and backs
+	// the v2 wire-form sync. NOT the releases list: verified by a full
+	// pagination sweep 2026-10-20, every release in the repo carries a 1.x
+	// tag (zero v2 releases exist) while stable v2 tags exist only as git
+	// tags — a releases scan would miss them entirely.
+	GitHubTagsListURL = "https://api.github.com/repos/anomalyco/opencode/tags?per_page=100"
 	VersionCacheTTL   = 12 * time.Hour
 
 	// The official CLI ships a COMPOUND User-Agent built from three distinct

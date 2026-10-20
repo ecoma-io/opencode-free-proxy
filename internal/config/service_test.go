@@ -151,6 +151,33 @@ func TestUASyncIntervalResolution(t *testing.T) {
 	}
 }
 
+func TestUAStyleResolution(t *testing.T) {
+	base := "egress:\n  - {id: direct}\nroutes:\n  - {id: default, egress: [direct]}\n"
+	// Omitted → v1 (the long-measured identity stays the default).
+	rt, err := resolveYAML(t, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.UAStyle(); got != UAStyleV1 {
+		t.Fatalf("omitted UAStyle() = %q, want %q", got, UAStyleV1)
+	}
+	// Both spellings resolve verbatim.
+	for _, s := range []UAStyle{UAStyleV1, UAStyleV2} {
+		rt, err = resolveYAML(t, "user_agent:\n  style: "+string(s)+"\n"+base)
+		if err != nil {
+			t.Fatalf("style %q rejected: %v", s, err)
+		}
+		if got := rt.UAStyle(); got != s {
+			t.Fatalf("UAStyle() = %q, want %q", got, s)
+		}
+	}
+	// Anything else is a load error at the boundary, never a silent v1.
+	if _, err := resolveYAML(t, "user_agent:\n  style: v3\n"+base); err == nil ||
+		!strings.Contains(err.Error(), `user_agent: style must be v1 or v2, got "v3"`) {
+		t.Fatalf("invalid style error = %v", err)
+	}
+}
+
 func TestStoreReloadSwapsServiceFields(t *testing.T) {
 	// The service fields ride the same immutable per-generation snapshot as
 	// egresses and routes: the live store swaps to the new values, and a
