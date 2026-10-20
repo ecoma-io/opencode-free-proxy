@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.11.2...v0.12.0) (2026-10-20)
+
+
+### Features
+
+* user_agent.style (v1/v2) with per-form dual UA sync ([#97](https://github.com/ecoma-io/opencode-free-proxy/issues/97)) ([42b0979](https://github.com/ecoma-io/opencode-free-proxy/commit/42b0979170ab6a05f5576bed72c8c5553f78a1ff))
+
 ## [0.11.2](https://github.com/ecoma-io/opencode-free-proxy/compare/v0.11.1...v0.11.2) (2026-10-14)
 
 
